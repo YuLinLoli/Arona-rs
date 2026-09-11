@@ -2,6 +2,9 @@
 name = "arona-rs"
 version = "0.2.1"
 edition = "2024"
+license = "AGPL-3.0-only"
+repository = "https://github.com/YuLinLoli/Arona-rs"
+description = "碧蓝档案 QQ 机器人 arona 的 Rust 移植版（OneBot 独立模式，无 Mirai）"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
