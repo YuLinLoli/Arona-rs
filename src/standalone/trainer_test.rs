@@ -219,6 +219,7 @@ async fn activity_command_returns_text() {
         println!("[活动] {:?}", message.segments);
     }
     assert!(!messages.is_empty(), "活动命令未返回任何消息");
+    let mut image_file: Option<String> = None;
     for message in &messages {
         match message.segments.first() {
             Some(MessageSegment::Text(text)) => {
@@ -232,9 +233,36 @@ async fn activity_command_returns_text() {
                 file: Some(file), ..
             }) => {
                 assert!(std::path::Path::new(file).exists(), "活动图不存在: {file}");
+                image_file = Some(file.clone());
                 println!("[活动] 图片: {file}");
             }
             other => println!("[活动] 其它: {other:?}"),
         }
     }
+
+    // 本地资源图片: 固定文件名 activity-<服务>.png; 再次调用命中本地图片, 文件时间不变(不重新渲染)
+    let path = crate::image::activity::image_path(crate::entity::ServerLocale::JP);
+    let Some(file) = image_file else {
+        println!("[活动] 未生成图片(可能缺少中文字体), 跳过本地图片缓存校验");
+        return;
+    };
+    assert_eq!(
+        std::path::Path::new(&file),
+        path.as_path(),
+        "活动图应为本地资源图片 arona-standalone/images/activity/activity-jp.png"
+    );
+    let before = std::fs::metadata(&path).and_then(|meta| meta.modified()).ok();
+    let handled = dispatcher
+        .dispatch(context(sender.clone(), "/活动 日服"))
+        .await;
+    assert!(handled, "调度器未识别 /活动");
+    let cached: Vec<String> = take_messages(&sender).iter().flat_map(image_files).collect();
+    assert_eq!(
+        cached,
+        vec![path.to_string_lossy().to_string()],
+        "二次调用应直接命中本地资源图片"
+    );
+    let after = std::fs::metadata(&path).and_then(|meta| meta.modified()).ok();
+    assert_eq!(before, after, "命中本地图片时不应重新渲染");
+    println!("[活动] 本地图片缓存命中: {}", path.display());
 }

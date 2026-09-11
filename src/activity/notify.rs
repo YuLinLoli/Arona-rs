@@ -2,6 +2,7 @@
 //! 每天定时向配置的群推送 国服/国际服/日服 活动日历图片（纯 Rust 渲染, 失败回退文本）；
 //! 启动与每日运行时查询活动结束预警(提前1小时/双倍掉落提前5小时)，正负10分钟内立即发送，
 //! 过期抛弃，未来添加定时任务(去重)。
+//! 1 小时预警的同时安排「到期后 5 分钟」刷新本地资源图片任务；另有每日 0 点的全量刷新任务。
 
 use crate::config::arona::NotifyConfig;
 use crate::config::standalone;
@@ -16,6 +17,8 @@ const NORMAL_ACTIVITY_NOTIFY_BEFORE_HOURS: i64 = 1;
 const DROP_ACTIVITY_NOTIFY_BEFORE_HOURS: i64 = 5;
 /// 正负 10 分钟窗口
 const ALERT_IMMEDIATE_WINDOW_MILLIS: i64 = 10 * 60 * 1000;
+/// 活动到期后刷新本地资源图片的延迟: 1 小时预警 + 1 小时 5 分钟
+const IMAGE_REFRESH_AFTER_END_MILLIS: i64 = 5 * 60 * 1000;
 
 /// 服务注册（对应原版 init/registerService）
 pub fn register_service() {
@@ -219,6 +222,10 @@ async fn schedule_alert_group(activities: &[Activity], locale: ServerLocale, bef
             insert_alert(&group, notify_at, locale, before_hours);
         }
     }
+    if before_hours == NORMAL_ACTIVITY_NOTIFY_BEFORE_HOURS {
+        // 1 小时预警同时安排「1 小时 5 分钟后」刷新本地资源图片
+        schedule_image_refresh(activities, locale);
+    }
 }
 
 /// 创建单次定时任务用于活动结束预警; 已存在同 key 任务则跳过, 避免重复
@@ -245,6 +252,45 @@ fn insert_alert(
             let activities = group.clone();
             tokio::spawn(async move {
                 send_alert(&activities, locale, before_hours).await;
+            });
+        }),
+    );
+}
+
+/// 活动到期后 5 分钟刷新本地资源图片: 对每个尚未到期的结束时刻各安排一个单次任务
+fn schedule_image_refresh(activities: &[Activity], locale: ServerLocale) {
+    let now = chrono::Utc::now().timestamp_millis();
+    let mut refresh_times: Vec<i64> = Vec::new();
+    for activity in activities {
+        if activity.end_time <= 0 || activity.activity_type == ActivityType::Birthday {
+            continue;
+        }
+        let refresh_at = activity.end_time + IMAGE_REFRESH_AFTER_END_MILLIS;
+        if refresh_at > now && !refresh_times.contains(&refresh_at) {
+            refresh_times.push(refresh_at);
+        }
+    }
+    for refresh_at in refresh_times {
+        insert_image_refresh(refresh_at, locale);
+    }
+}
+
+/// 创建单次定时任务用于刷新本地资源图片; 已存在同 key 任务则跳过, 避免重复
+fn insert_image_refresh(expected_ms: i64, locale: ServerLocale) {
+    let key = format!(
+        "AronaActivityImageRefresh-{}-{expected_ms}",
+        locale.command_name()
+    );
+    if quartz::exists(&key) {
+        return;
+    }
+    quartz::create_single_at(
+        expected_ms,
+        &key,
+        "AronaActivityImageRefresh",
+        Arc::new(move || {
+            tokio::spawn(async move {
+                crate::standalone::commands::activity::refresh_image(locale).await;
             });
         }),
     );
@@ -499,6 +545,34 @@ mod tests {
             .filter(|task| task.name == key)
             .count();
         assert_eq!(count, 1, "预警定时任务未去重");
+
+        // 1 小时预警同时安排「到期后 5 分钟」的本地资源图片刷新任务(1小时 + 5分钟)
+        let refresh_key = format!(
+            "AronaActivityImageRefresh-{}-{}",
+            ServerLocale::JP.command_name(),
+            far.end_time + IMAGE_REFRESH_AFTER_END_MILLIS
+        );
+        assert!(
+            crate::quartz::exists(&refresh_key),
+            "活动到期后未安排本地资源图片刷新任务"
+        );
+        let refresh_count = crate::quartz::list()
+            .iter()
+            .filter(|task| task.name == refresh_key)
+            .count();
+        assert_eq!(refresh_count, 1, "本地资源图片刷新任务未去重");
+        // 单次任务的下次触发时间由任务协程写入, 稍等片刻再读取
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let refresh = crate::quartz::list()
+            .into_iter()
+            .find(|task| task.name == refresh_key)
+            .expect("未找到本地资源图片刷新任务");
+        assert_eq!(
+            refresh.next_fire_ms,
+            Some(far.end_time + IMAGE_REFRESH_AFTER_END_MILLIS),
+            "本地资源图片刷新时间应为活动到期后 5 分钟"
+        );
+        crate::quartz::remove(&refresh_key);
 
         // 已过期活动 -> 抛弃，不发送也不建任务
         let expired = activity(ActivityType::Activity, now - 10 * 3600_000, "早就结束的活动");

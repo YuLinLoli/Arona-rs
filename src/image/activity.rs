@@ -3,6 +3,8 @@
 //! 底色按 activity_type.level 映射（橙/紫/蓝/红/绿 五档），白字左对齐，
 //! 右侧显示“今天/明天/后天 X点 开始/结束”的易读时间，底部标注数据来源。
 //! 字体不可用时渲染返回 Err，由命令层回退为文本日历。
+//! 产物为固定文件名 activity-<服务>.png, 属于「本地资源图片」: 由每日 0 点与活动到期后
+//! 5 分钟的定时任务刷新(见 standalone::commands::activity), /活动 命中本地图片时直接发送。
 
 use crate::data::activity::type_level;
 use crate::entity::{Activity, ServerLocale};
@@ -80,15 +82,26 @@ pub fn render(
     let footer_h = line_box(FOOTER_SIZE);
     draw_line_left(&mut img, footer, y, footer_h, FOOTER_SIZE, GRAY);
 
-    let file = paths::images_root()
-        .join("activity")
-        .join(format!("activity-{}.png", server.command_name()));
+    let file = image_path(server);
     if let Some(parent) = file.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     img.save(&file)
         .map_err(|err| format!("保存活动图片失败: {err}"))?;
     Ok(file)
+}
+
+/// 本地活动日历图路径: arona-standalone/images/activity/activity-<服务>.png
+pub fn image_path(server: ServerLocale) -> PathBuf {
+    paths::images_root()
+        .join("activity")
+        .join(format!("activity-{}.png", server.command_name()))
+}
+
+/// 本地已刷新好的活动日历图: 存在即直接复用(命令层不再重新渲染), 不存在返回 None
+pub fn cached_image(server: ServerLocale) -> Option<PathBuf> {
+    let file = image_path(server);
+    file.exists().then_some(file)
 }
 
 const INK: draw::Color = [40, 44, 52, 255];

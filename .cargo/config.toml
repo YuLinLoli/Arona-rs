@@ -26,3 +26,7 @@ smoke-notify = "test notify_logic_plan_and_alerts -- --nocapture --test-threads=
 smoke-notify-net = "test notify_daily_push_network -- --ignored --nocapture --test-threads=1"
 # 学生生日端到端自检(联网): 三服日历数据流/文本/图片均包含未来一周生日
 smoke-birthday = "test birthday -- --ignored --nocapture --test-threads=1"
+# 本地资源图片刷新自检(不联网/不需要字体): 每日 0 点任务注册时刻
+smoke-image-refresh = "test image_refresh -- --nocapture --test-threads=1"
+# 启动刷新本地资源图片自检(联网): 拉取三服活动并生成三张日历图
+smoke-image-refresh-net = "test refresh_all_images -- --ignored --nocapture --test-threads=1"

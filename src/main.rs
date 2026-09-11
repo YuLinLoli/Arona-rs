@@ -69,17 +69,20 @@ async fn main() {
     }
     util::tarot::ensure_initialized();
 
-    // 后台任务：kivo 学生数据预热 + 活动日历同步
+    // 后台任务：kivo 学生数据预热 + 启动刷新本地资源图片
     tokio::spawn(async move {
         data::kivo::init().await;
     });
     tokio::spawn(async move {
-        standalone::commands::activity::sync_all().await;
+        // 启动时刷新一次本地资源图片: 拉取三服活动 + 写入数据库 + 重新渲染活动日历图
+        standalone::commands::activity::refresh_all_images().await;
         standalone::commands::tarot::download_all_images().await;
     });
 
     // 启用每日活动推送（含启动 20 秒后的预警初始化）
     activity::notify::enable_service();
+    // 本地资源图片: 每天 0 点刷新一次(另有活动到期后 5 分钟的定向刷新)
+    standalone::commands::activity::enable_image_refresh_job();
     if test_notify {
         quartz::create_delay(
             20,

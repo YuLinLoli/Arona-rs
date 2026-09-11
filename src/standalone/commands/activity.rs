@@ -1,10 +1,14 @@
 //! /活动 命令与活动日历同步（对应原版 StandaloneActivity + StandaloneActivitySync）
 //! /活动 优先输出活动日历图片（纯 Rust 渲染, 对应原版 createActivityImage）；
 //! 字体不可用等渲染失败时自动回退为纯文本日历。
+//! 图片作为本地资源常驻 arona-standalone/images/activity/activity-<服务>.png, 只在每日 0 点与
+//! 活动到期后 5 分钟(1小时预警 + 1小时5分钟)由定时任务刷新; /活动 命中本地图片即直接发送。
+//! 刷新触发点: 程序启动时、每日 0 点、活动到期后 5 分钟。
 
 use crate::data;
 use crate::db::dao;
 use crate::entity::{Activity, ActivityType, ServerLocale};
+use crate::quartz;
 use crate::runtime::dispatcher::CommandContext;
 use crate::runtime::message::OutgoingMessage;
 use crate::util::time::calc_time;
@@ -34,6 +38,10 @@ pub async fn activity(
             Some(ServerLocale::CN) => (ServerLocale::CN, "国服"),
         },
     };
+    // 本地资源图片由定时任务(每日0点/活动到期后5分钟)刷新: 命中直接发送, 不联网也不重新渲染
+    if let Some(file) = crate::image::activity::cached_image(server) {
+        return Some(OutgoingMessage::image_file(file.to_string_lossy()));
+    }
     match fetch(server).await {
         Ok(pair) => Some(activity_message(&pair, server)),
         Err(err) => Some(OutgoingMessage::text(format!(
@@ -77,24 +85,6 @@ async fn fetch(server: ServerLocale) -> Result<(Vec<Activity>, Vec<Activity>), S
     }
 }
 
-/// 同步全部服务器的活动日历到数据库
-pub async fn sync_all() {
-    for server in ServerLocale::ALL {
-        match data::activity::fetch(server).await {
-            Ok(pair) => {
-                save_to_db(server, &pair);
-                crate::runtime::log::info(format!(
-                    "{}活动日历已更新到数据库",
-                    server.server_name()
-                ));
-            }
-            Err(err) => crate::runtime::log::warning(format!(
-                "同步{}活动日历失败: {err}",
-                server.server_name()
-            )),
-        }
-    }
-}
 
 /// 将活动写入数据库, 覆盖该服务器旧数据
 pub fn save_to_db(server: ServerLocale, pair: &(Vec<Activity>, Vec<Activity>)) {
@@ -135,4 +125,77 @@ async fn load_from_db(server: ServerLocale) -> Option<(Vec<Activity>, Vec<Activi
     pending.extend(data::birthday::upcoming_birthday_activities(server).await);
     pending.sort_by_key(|row| row.start_time);
     Some((active, pending))
+}
+
+/// 强制联网拉取最新活动并刷新本地资源图片(同时更新数据库缓存)
+/// 调用方: 每日 0 点的定时任务、活动到期后 5 分钟的定时任务(1小时预警 + 1小时5分钟)
+pub async fn refresh_image(server: ServerLocale) {
+    match data::activity::fetch(server).await {
+        Ok(pair) => {
+            save_to_db(server, &pair);
+            match crate::image::activity::render(&pair, server) {
+                Ok(file) => crate::runtime::log::info(format!(
+                    "{}本地活动图片已刷新: {}",
+                    server.server_name(),
+                    file.display()
+                )),
+                Err(err) => crate::runtime::log::warning(format!(
+                    "刷新{}本地活动图片失败: {err}",
+                    server.server_name()
+                )),
+            }
+        }
+        Err(err) => crate::runtime::log::warning(format!(
+            "刷新{}本地活动图片失败: {err}",
+            server.server_name()
+        )),
+    }
+}
+
+/// 刷新 日服/国际服/国服 三个服务器的本地资源图片
+pub async fn refresh_all_images() {
+    for server in ServerLocale::ALL {
+        refresh_image(server).await;
+    }
+}
+
+/// 注册每日 0 点刷新本地活动图片的定时任务(独立启动时调用)
+pub fn enable_image_refresh_job() {
+    quartz::create_daily(
+        0,
+        "AronaActivityImageRefreshDaily",
+        "AronaActivityImageRefresh",
+        Arc::new(|| {
+            tokio::spawn(async move {
+                refresh_all_images().await;
+            });
+        }),
+    );
+    crate::runtime::log::info("本地活动图片刷新任务已启用: 每天 0 点");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Timelike;
+
+    /// 每日 0 点刷新本地活动图片的任务: 注册成功且下次触发为 0 点整
+    #[tokio::test]
+    async fn image_refresh_job_registered_at_midnight() {
+        enable_image_refresh_job();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let info = crate::quartz::list()
+            .into_iter()
+            .find(|task| task.name == "AronaActivityImageRefreshDaily")
+            .expect("未注册每日图片刷新任务");
+        let next = info.next_fire_ms.expect("每日图片刷新任务没有下次触发时间");
+        let fire_at = chrono::DateTime::from_timestamp_millis(next)
+            .expect("时间戳无效")
+            .with_timezone(&chrono::Local);
+        assert_eq!(fire_at.hour(), 0, "刷新小时应为 0 点: {fire_at}");
+        assert_eq!(fire_at.minute(), 0);
+        assert_eq!(fire_at.second(), 0);
+        println!("[本地图片刷新] 下次触发: {fire_at}");
+        crate::quartz::remove("AronaActivityImageRefreshDaily");
+    }
 }

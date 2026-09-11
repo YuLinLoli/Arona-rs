@@ -170,3 +170,26 @@ async fn render_gacha_probe() {
     let white = count_color(&img, 255, 255, 255, 6);
     assert!(white > 1_000, "白色文字像素过少: {white}");
 }
+
+/// 启动刷新自检(联网): refresh_all_images 拉取三服活动并生成三张本地资源图片
+#[ignore = "联网自检, 运行: cargo test refresh_all_images -- --ignored --nocapture --test-threads=1"]
+#[tokio::test]
+async fn refresh_all_images_creates_local_files() {
+    assert!(crate::image::text::available(), "本机未找到可用中文字体");
+    crate::standalone::commands::activity::refresh_all_images().await;
+    let mut produced = 0;
+    for server in ServerLocale::ALL {
+        match crate::image::activity::cached_image(server) {
+            Some(file) => {
+                produced += 1;
+                assert!(file.exists(), "本地活动图片不存在: {}", file.display());
+                println!("[启动刷新] {} -> {}", server.server_name(), file.display());
+            }
+            None => println!(
+                "[启动刷新] {} 未生成图片(可能拉取活动失败)",
+                server.server_name()
+            ),
+        }
+    }
+    assert_eq!(produced, 3, "应生成 日服/国际服/国服 三张本地活动图片");
+}
