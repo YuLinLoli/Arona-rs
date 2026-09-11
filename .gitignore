@@ -1,0 +1,11 @@
+/target
+/arona-standalone
+.codex/
+
+# IDE 检查报告导出产物
+/index.html
+/script.js
+/styles.css
+# 临时/备份文件
+/Cargo.toml.bak
+/repair.py

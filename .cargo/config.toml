@@ -1,0 +1,28 @@
+# Cargo 别名配置（相当于本项目常用的“构建任务”快捷命令）
+# 用法示例：
+#   cargo build-release   # 发布构建, 产物: target/release/arona-rs[.exe]
+#   cargo dist            # 发布构建并把产物重命名为 arona-rs-<版本号>[.exe]（交付推荐）
+#   cargo run-release     # 发布构建并直接运行独立版（等价: cargo run --release）
+#   cargo smoke-image     # 生成抽卡/活动日历样例图并做像素级自检（忽略的自检用例）
+# 若需在别名后追加参数, 直接写在其后即可, 例如: cargo build-release --verbose
+
+[alias]
+# 发布构建（产物 arona-rs[.exe]）
+build-release = "build --release"
+# 发布构建 + 版本号产物: target/release/arona-rs-<version>[.exe]（最终交付推荐）
+# 注意: 本别名已带全部参数, 请不要再追加参数
+dist = "test dist_build --release -- --ignored --nocapture --test-threads=1"
+# 发布构建并立即运行
+run-release = "run --release"
+# 图片渲染冒烟自检: 生成样例 PNG 到 arona-standalone/images 并断言关键区域颜色
+smoke-image = "test render -- --ignored --nocapture"
+# /十连 端到端自检: 走完整命令链路并生成结果图到 arona-standalone/images/gacha/result
+smoke-tenpull = "test ten_pull -- --ignored --nocapture --test-threads=1"
+# /攻略 端到端自检: 拉取活动攻略/日程笔记/当期卡池/云端图片
+smoke-trainer = "test trainer_test -- --ignored --nocapture --test-threads=1"
+# 活动推送逻辑/调度自检(不联网): 5小时/1小时预警、维护文案、每日任务时刻
+smoke-notify = "test notify_logic_plan_and_alerts -- --nocapture --test-threads=1"
+# 每日活动推送端到端自检(联网): 三服日历图+文本推送到群
+smoke-notify-net = "test notify_daily_push_network -- --ignored --nocapture --test-threads=1"
+# 学生生日端到端自检(联网): 三服日历数据流/文本/图片均包含未来一周生日
+smoke-birthday = "test birthday -- --ignored --nocapture --test-threads=1"

@@ -1,0 +1,296 @@
+//! arona 业务配置（对应原版 runtime/AronaConfig + AronaConfigLoader）
+use serde::{Deserialize, Serialize};
+use std::path::Path;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NotifyConfig {
+    #[serde(default = "default_true")]
+    pub enable: bool,
+    #[serde(default = "default_hour")]
+    #[serde(rename = "every_day_hour")]
+    pub every_day_hour: i32,
+    #[serde(default = "default_true")]
+    pub jp: bool,
+    #[serde(default = "default_true")]
+    pub global: bool,
+    #[serde(default = "default_true")]
+    pub cn: bool,
+    #[serde(default)]
+    #[serde(rename = "black_groups")]
+    pub black_groups: Vec<i64>,
+    #[serde(default = "default_notify_text")]
+    #[serde(rename = "notify_text")]
+    pub notify_text: String,
+}
+
+fn default_true() -> bool {
+    true
+}
+fn default_hour() -> i32 {
+    8
+}
+fn default_notify_text() -> String {
+    "碧蓝档案预警".to_string()
+}
+
+impl Default for NotifyConfig {
+    fn default() -> Self {
+        NotifyConfig {
+            enable: true,
+            every_day_hour: 8,
+            jp: true,
+            global: true,
+            cn: true,
+            black_groups: Vec::new(),
+            notify_text: default_notify_text(),
+        }
+    }
+}
+
+/// /攻略 指令别名覆盖项（对应原版 entity/TrainerOverride）
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TrainerOverride {
+    /// IMAGE(本地图片路径) / RAW(云端图片别名) / CODE(CQ 码原文)
+    #[serde(rename = "type", default)]
+    pub override_type: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub value: String,
+}
+
+/// /攻略 指令配置（对应原版 config/AronaTrainerConfig）
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TrainerConfig {
+    /// 找不到精确匹配时是否提示模糊搜索结果
+    pub tip_when_null: bool,
+    /// 模糊搜索结果撤回时间(秒), 0 表示不撤回
+    pub tip_revoke_time: i64,
+    /// 等待用户回复数字选择的时间(秒), 0 表示关闭数字回复
+    pub tip_response_wait_time: i64,
+    /// 覆盖 /攻略 行为
+    pub r#override: Vec<TrainerOverride>,
+}
+
+impl Default for TrainerConfig {
+    fn default() -> Self {
+        TrainerConfig {
+            tip_when_null: true,
+            tip_revoke_time: 10,
+            tip_response_wait_time: 10,
+            r#override: Vec::new(),
+        }
+    }
+}
+
+/// 独立的 trainer_config.yml（对应原版 TrainerCommand.TrainerFileConfig）
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct TrainerFileConfig {
+    #[serde(default, rename = "override")]
+    pub overrides: Vec<TrainerOverride>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AronaConfig {
+    pub groups: Vec<i64>,
+    pub managers: Vec<i64>,
+    pub notify: NotifyConfig,
+    pub trainer: TrainerConfig,
+}
+
+impl Default for AronaConfig {
+    fn default() -> Self {
+        AronaConfig {
+            groups: Vec::new(),
+            managers: Vec::new(),
+            notify: NotifyConfig::default(),
+            trainer: TrainerConfig::default(),
+        }
+    }
+}
+
+fn read_text(path: &Path) -> std::io::Result<String> {
+    let bytes = std::fs::read(path)?;
+    let text = String::from_utf8_lossy(&bytes).to_string();
+    Ok(text.strip_prefix('\u{feff}').unwrap_or(&text).to_string())
+}
+
+fn write_text(path: &Path, content: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, content)
+}
+
+/// 加载 arona.yml：不存在时从旧后缀/旧 onebot.yml 迁移并生成模板
+pub fn load(file: &Path) -> Result<AronaConfig, String> {
+    if !file.exists() {
+        // 1) 旧后缀 arona.yaml 已存在则迁移
+        let old_arona = file.parent().map(|p| p.join("arona.yaml"));
+        if let Some(old) = old_arona {
+            if old.exists() {
+                if let Ok(config) = parse(&old) {
+                    save(file, &config).map_err(|e| format!("写入 arona.yml 失败: {e}"))?;
+                    crate::runtime::log::info(format!(
+                        "[Arona] 检测到旧版 arona.yaml，已迁移到 {}",
+                        file.file_name().unwrap_or_default().to_string_lossy()
+                    ));
+                    return Ok(config);
+                }
+            }
+        }
+        // 2) 从旧 onebot.yml/yaml 迁移 groups/managers/notify
+        let legacy = read_legacy_from_onebot(file);
+        let config = AronaConfig {
+            groups: legacy
+                .as_ref()
+                .map(|l| l.groups.clone())
+                .unwrap_or_default(),
+            managers: legacy
+                .as_ref()
+                .map(|l| l.managers.clone())
+                .unwrap_or_default(),
+            notify: legacy.map(|l| l.notify).unwrap_or_default(),
+            trainer: TrainerConfig::default(),
+        };
+        save(file, &config).map_err(|e| format!("写入 arona.yml 失败: {e}"))?;
+        return Ok(config);
+    }
+    parse(file)
+}
+
+fn parse(file: &Path) -> Result<AronaConfig, String> {
+    let text = read_text(file).map_err(|e| format!("读取 {} 失败: {e}", file.display()))?;
+    serde_yaml::from_str(&text)
+        .map_err(|e| format!("arona.yml 解析失败，请检查格式（参考同目录说明）: {e}"))
+}
+
+pub fn save(file: &Path, config: &AronaConfig) -> std::io::Result<()> {
+    write_text(file, &template(config))
+}
+
+pub fn default_file() -> std::path::PathBuf {
+    crate::runtime::paths::default_arona_file()
+}
+
+#[derive(Default)]
+struct LegacyExtra {
+    groups: Vec<i64>,
+    managers: Vec<i64>,
+    notify: NotifyConfig,
+}
+
+/// 旧版 onebot.yml 中可能存在的业务字段（notify.groups 为旧语义，直接丢弃）
+fn read_legacy_from_onebot(arona_file: &Path) -> Option<LegacyExtra> {
+    let parent = arona_file.parent()?;
+    let new_file = parent.join("onebot.yml");
+    let onebot = if new_file.exists() {
+        new_file
+    } else {
+        parent.join("onebot.yaml")
+    };
+    if !onebot.exists() {
+        return None;
+    }
+    let text = read_text(&onebot).ok()?;
+    let value: serde_yaml::Value = serde_yaml::from_str(&text).ok()?;
+    let map = value.as_mapping()?;
+    let mut extra = LegacyExtra::default();
+    if let Some(groups) = map
+        .get("groups")
+        .and_then(|v| serde_yaml::from_value::<Vec<i64>>(v.clone()).ok())
+    {
+        extra.groups = groups;
+    }
+    if let Some(managers) = map
+        .get("managers")
+        .and_then(|v| serde_yaml::from_value::<Vec<i64>>(v.clone()).ok())
+    {
+        extra.managers = managers;
+    }
+    if let Some(notify) = map.get("notify") {
+        if let Some(notify_map) = notify.as_mapping() {
+            let mut notify_map = notify_map.clone();
+            notify_map.remove(&serde_yaml::Value::String("groups".to_string()));
+            if let Ok(n) =
+                serde_yaml::from_value::<NotifyConfig>(serde_yaml::Value::Mapping(notify_map))
+            {
+                extra.notify = n;
+            }
+        }
+    }
+    Some(extra)
+}
+
+fn yaml_quote(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// 生成带注释的模板文本
+fn template(config: &AronaConfig) -> String {
+    let mut out = String::new();
+    out.push_str("# ==================== Arona 业务配置 ====================\n");
+    out.push_str("# Rust 移植版（arona-rs）独立运行模式使用本文件，修改后保存即自动热重载。\n");
+    out.push_str("# OneBot 协议连接配置见同目录 onebot.yml；本文件只放非 OneBot 的业务配置。\n\n");
+    out.push_str("# 允许响应的群号列表，留空表示响应所有群\n");
+    out.push_str(&format!("groups: {:?}\n", config.groups));
+    out.push_str("# 管理员 QQ 号列表，可执行管理命令\n");
+    out.push_str(&format!("managers: {:?}\n", config.managers));
+    out.push('\n');
+    out.push_str("# ==================== 每日活动推送 ====================\n");
+    out.push_str("# 每天 every_day_hour 点向目标群推送国服/国际服/日服活动日历\n");
+    out.push_str("notify:\n");
+    out.push_str(&format!(
+        "  # 是否启用每日活动防侠推送\n  enable: {}\n",
+        config.notify.enable
+    ));
+    out.push_str(&format!(
+        "  # 每日推送的小时(0-23)\n  every_day_hour: {}\n",
+        config.notify.every_day_hour
+    ));
+    out.push_str(&format!(
+        "  # 是否推送日服/国际服/国服活动\n  jp: {}\n",
+        config.notify.jp
+    ));
+    out.push_str(&format!("  global: {}\n", config.notify.global));
+    out.push_str(&format!("  cn: {}\n", config.notify.cn));
+    out.push_str(&format!(
+        "  # 不推送的群号列表（黑名单），留空表示推送到全部允许的群\n  black_groups: {:?}\n",
+        config.notify.black_groups
+    ));
+    out.push_str(&format!(
+        "  # 推送消息开头文字\n  notify_text: {}\n",
+        yaml_quote(&config.notify.notify_text)
+    ));
+    out.push('\n');
+    out.push_str("# ==================== 攻略(/攻略) ====================\n");
+    out.push_str("trainer:\n");
+    out.push_str(&format!(
+        "  # 找不到精确匹配时是否提示模糊搜索结果\n  tip_when_null: {}\n",
+        config.trainer.tip_when_null
+    ));
+    out.push_str(&format!(
+        "  # 模糊搜索结果撤回时间(秒), 0 表示不撤回\n  tip_revoke_time: {}\n",
+        config.trainer.tip_revoke_time
+    ));
+    out.push_str(&format!(
+        "  # 等待用户回复数字选择的时间(秒), 0 表示关闭数字回复\n  tip_response_wait_time: {}\n",
+        config.trainer.tip_response_wait_time
+    ));
+    out.push_str("  # 覆盖 /攻略 行为: type=IMAGE(本地图片路径)/RAW(云端图片别名)/CODE(CQ 码原文)\n");
+    if config.trainer.r#override.is_empty() {
+        out.push_str("  override: []\n");
+    } else {
+        out.push_str("  override:\n");
+        if let Ok(yaml) = serde_yaml::to_string(&config.trainer.r#override) {
+            for line in yaml.lines() {
+                out.push_str("  ");
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+    }
+    out
+}

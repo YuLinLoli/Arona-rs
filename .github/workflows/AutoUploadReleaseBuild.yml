@@ -1,0 +1,100 @@
+# 自动发布：推送 v* 标签时构建 Windows 发布版并创建 GitHub Release
+# 参考: https://github.com/YuLinLoli/arona/blob/1.2.0-testonebot/.github/workflows/AutoUploadReleaseBuild.yml
+#
+# 用法:
+#   1. 改 Cargo.toml 里的 version (例如 0.2.2)
+#   2. git tag v0.2.2 && git push origin v0.2.2
+#   3. Actions 自动构建 -> 上传工件 -> 创建 Release 并附上 arona-rs-0.2.2.exe
+# 也可以在 Actions 页面手动 Run workflow（手动触发时跳过版本校验、只构建不发布）。
+name: AutoUploadReleaseBuild
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # 1) 在 Windows 上跑单元测试并产出带版本号的 exe
+  Build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # 标签和 Cargo.toml 版本号对不上时（如 tag v0.2.2 但 Cargo.toml 还是 0.2.1）直接失败,
+      # 避免产出与 Release 名字不一致的产物。手动触发时会跳过这一步。
+      - name: Verify tag matches Cargo.toml version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          $meta = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+          $version = $meta.packages[0].version
+          $tag = "${{ github.ref_name }}".TrimStart('v')
+          if ($tag -ne $version) {
+            Write-Error "标签 ${{ github.ref_name }} 与 Cargo.toml 版本 $version 不一致"
+            exit 1
+          }
+          Write-Host "版本校验通过: $version"
+
+      # 只跑非 ignored 的离线单元测试; 联网冒烟自检(cargo smoke-*)都带 #[ignore], 不会在这里执行
+      - name: Test
+        run: cargo test --release
+
+      # 等价于 cargo dist, 这里写全命令以免依赖 .cargo/config.toml 的别名
+      # 该用例会做 cargo build --release 并把产物复制成 target/release/arona-rs-<版本号>.exe
+      - name: Build dist
+        run: cargo test dist_build --release -- --ignored --nocapture --test-threads=1
+
+      - name: Get Artifact Name
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem target/release -Filter 'arona-rs-*.exe' |
+            Where-Object { $_.BaseName -match '^arona-rs-\d' } |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1
+          if (-not $exe) { Write-Error "未找到带版本号的构建产物"; exit 1 }
+          Write-Host "构建产物: $($exe.FullName)"
+          "ARTIFACT_NAME=$($exe.BaseName)" >> $env:GITHUB_ENV
+          "ARTIFACT_PATH=$($exe.FullName)"  >> $env:GITHUB_ENV
+
+      # 上传工件
+      - name: Upload-Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ env.ARTIFACT_PATH }}
+          compression-level: 0
+
+  # 2) 取回工件并发布 Release
+  Publish:
+    needs: Build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download-Artifact
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      # 自动发布
+      - name: Publish Release
+        uses: ncipollo/release-action@v1
+        with:
+          artifacts: "dist/*"
+          prerelease: ${{ contains(github.ref, 'pre') }}
+          generateReleaseNotes: true
+          allowUpdates: true
+          token: ${{ secrets.GITHUB_TOKEN }}
