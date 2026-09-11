@@ -102,3 +102,237 @@ fn log(level: &str, message: &str) {
     // 日志文件写入前会剥离 ANSI, 保持纯文本
     append_file(&line);
 }
+
+// ==================== 实时日志缓冲（GUI 日志选项卡用） ====================
+
+/// 实时日志的一行
+#[derive(Clone, Debug)]
+pub struct LiveLine {
+    /// 本机时间 HH:MM:SS
+    pub time: String,
+    /// 行内容（不含 ANSI 转义码）
+    pub text: String,
+    /// 是否来自 stderr
+    pub stderr: bool,
+}
+
+/// 缓冲上限（超出后丢弃最旧的行）
+const LIVE_CAPACITY: usize = 3000;
+
+struct LiveLog {
+    lines: std::collections::VecDeque<LiveLine>,
+    version: u64,
+}
+
+static LIVE_LOG: OnceCell<Mutex<LiveLog>> = OnceCell::new();
+static LIVE_VERSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn live_log() -> &'static Mutex<LiveLog> {
+    LIVE_LOG.get_or_init(|| {
+        Mutex::new(LiveLog {
+            lines: std::collections::VecDeque::new(),
+            version: 0,
+        })
+    })
+}
+
+/// 记录一行到内存缓冲（由 `runtime::console` 统一调用，覆盖所有控制台输出）
+pub fn push_live(text: &str, stderr: bool) {
+    if text.is_empty() {
+        return;
+    }
+    let Ok(mut log) = live_log().lock() else {
+        return;
+    };
+    while log.lines.len() >= LIVE_CAPACITY {
+        log.lines.pop_front();
+    }
+    log.lines.push_back(LiveLine {
+        time: chrono::Local::now().format("%H:%M:%S").to_string(),
+        text: text.to_string(),
+        stderr,
+    });
+    log.version += 1;
+    LIVE_VERSION.store(log.version, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 当前缓冲版本号；GUI 用它判断是否需要重新取快照
+pub fn live_version() -> u64 {
+    LIVE_VERSION.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// 取全部实时日志快照（最多 LIVE_CAPACITY 行）
+pub fn live_lines() -> Vec<LiveLine> {
+    match live_log().lock() {
+        Ok(log) => log.lines.iter().cloned().collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// 清空实时日志缓冲
+pub fn clear_live() {
+    let Ok(mut log) = live_log().lock() else {
+        return;
+    };
+    log.lines.clear();
+    log.version += 1;
+    LIVE_VERSION.store(log.version, std::sync::atomic::Ordering::Relaxed);
+}
+
+// ==================== 三方库日志桥（log 门面） ====================
+
+/// 把 Rust 生态的 `log` 门面（wgpu / glutin / winit / naga ...）接到本项目的
+/// 控制台 + 按天日志文件 + GUI 实时日志上。
+///
+/// 不装这个的话，像「DX12 后端创建失败」这种关键诊断会被直接丢掉：wgpu-core 只在
+/// `debug` 级别记录 `Instance::new: failed to create Dx12 backend: ...`，表现出来
+/// 就是「没有可用的 wgpu 适配器」却完全不知道原因。
+pub fn install_logger() {
+    let level = std::env::var("ARONA_LOG")
+        .ok()
+        .and_then(|value| value.trim().parse::<log::LevelFilter>().ok())
+        .unwrap_or(log::LevelFilter::Debug);
+    log::set_max_level(level);
+    // 已经装过（例如测试里重复调用）时忽略错误即可
+    let _ = log::set_logger(&ARONA_LOGGER);
+}
+
+static ARONA_LOGGER: AronaLogger = AronaLogger;
+
+struct AronaLogger;
+
+/// 每个日志目标允许的最高级别。
+///
+/// `wgpu` 的「实例/适配器」阶段 debug 里带着后端创建失败与适配器枚举结果（例如
+/// `Instance::new: failed to create Dx12 backend: ...`），是排障的关键，必须放行；
+/// 「设备」阶段（`wgpu_core::device`、`wgpu_hal::*::device`）的 debug 则是着色器编译
+/// 细节，压到 info。
+/// 注意：所有致命错误都是 warn/error 级别，永远会输出，不受此规则影响。
+fn allowed_level(target: &str) -> log::Level {
+    if target.starts_with("wgpu") && !target.contains("device") {
+        log::Level::Debug
+    } else {
+        log::Level::Info
+    }
+}
+
+/// wgpu-hal 在着色器编译「成功」时也用 `Info` 级别把整段生成的着色器源码打出来
+/// （`wgpu_hal::dx12::device`、`wgpu_hal::gles::device`），对使用者是纯噪声；
+/// 编译失败走的是 `Error`，不会命中这条规则，仍会照常输出。
+fn is_noisy_shader_dump(level: log::Level, target: &str, message: &str) -> bool {
+    level == log::Level::Info
+        && target.contains("device")
+        && message.starts_with("Naga generated shader")
+}
+
+impl log::Log for AronaLogger {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.level() <= allowed_level(metadata.target())
+    }
+
+    fn log(&self, record: &log::Record) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+        if record.level() == log::Level::Info
+            && is_noisy_shader_dump(record.level(), record.target(), &record.args().to_string())
+        {
+            return;
+        }
+        let target = record.target();
+        let message = record.args();
+        // WARNING/ERROR 用原版配色规则（亮黄）渲染，其余保持原样
+        let line = match record.level() {
+            log::Level::Error => format!("[{target}] ERROR {message}"),
+            log::Level::Warn => format!("[{target}] WARNING {message}"),
+            _ => format!("[{target}] {message}"),
+        };
+        if record.level() == log::Level::Error {
+            crate::runtime::console::eprint_rule_line(&line);
+        } else {
+            crate::runtime::console::print_rule_line(&line);
+        }
+        append_file(&line);
+    }
+
+    fn flush(&self) {}
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn logger_policy_allows_wgpu_debug_only() {
+        use log::Log as _;
+        let wgpu_debug = log::Metadata::builder()
+            .level(log::Level::Debug)
+            .target("wgpu_core::instance")
+            .build();
+        let wgpu_device_debug = log::Metadata::builder()
+            .level(log::Level::Debug)
+            .target("wgpu_core::device::global")
+            .build();
+        let wgpu_hal_device_debug = log::Metadata::builder()
+            .level(log::Level::Debug)
+            .target("wgpu_hal::dx12::device")
+            .build();
+        let other_debug = log::Metadata::builder()
+            .level(log::Level::Debug)
+            .target("some_other_crate")
+            .build();
+        let other_info = log::Metadata::builder()
+            .level(log::Level::Info)
+            .target("some_other_crate")
+            .build();
+        assert!(AronaLogger.enabled(&wgpu_debug));
+        assert!(!AronaLogger.enabled(&wgpu_device_debug));
+        assert!(!AronaLogger.enabled(&wgpu_hal_device_debug));
+        assert!(!AronaLogger.enabled(&other_debug));
+        assert!(AronaLogger.enabled(&other_info));
+    }
+
+    #[test]
+    fn noisy_shader_dump_is_recognized() {
+        // wgpu-hal 编译成功时的 Info 级源码转储 -> 过滤
+        assert!(is_noisy_shader_dump(
+            log::Level::Info,
+            "wgpu_hal::dx12::device",
+            "Naga generated shader for \"main\" at Compute:\nstruct ..."
+        ));
+        // 着色器编译失败用的是同一句消息，但级别是 Error -> 必须放行
+        assert!(!is_noisy_shader_dump(
+            log::Level::Error,
+            "wgpu_hal::dx12::device",
+            "Naga generated shader for \"main\" at Compute:\nerror ..."
+        ));
+        // 其它目标/其它消息不误伤
+        assert!(!is_noisy_shader_dump(
+            log::Level::Info,
+            "wgpu_core::instance",
+            "Naga generated shader for something"
+        ));
+        assert!(!is_noisy_shader_dump(
+            log::Level::Info,
+            "wgpu_hal::dx12::device",
+            "\tCompiled shader"
+        ));
+    }
+
+    #[test]
+    fn live_log_buffer_records_and_clears() {
+        let marker = "[Arona] live-log-test-marker";
+        push_live(marker, false);
+        assert!(live_lines().iter().any(|line| line.text == marker));
+        assert!(live_version() > 0);
+        clear_live();
+        assert!(!live_lines().iter().any(|line| line.text == marker));
+    }
+
+    #[test]
+    fn live_log_buffer_is_bounded() {
+        for i in 0..(LIVE_CAPACITY + 50) {
+            push_live(&format!("[Arona] bounded-{i}"), false);
+        }
+        assert!(live_lines().len() <= LIVE_CAPACITY);
+    }
+}

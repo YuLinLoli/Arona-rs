@@ -1,6 +1,111 @@
 //! 运行期全局配置（对应原版 RuntimeConfig）
+use crate::config::arona::GroupSetting;
 use once_cell::sync::OnceCell;
+use std::collections::BTreeMap;
 use std::sync::RwLock;
+
+/// 可被分群开关控制的功能项（GUI 与配置模板共用同一份清单）
+pub struct Feature {
+    pub key: &'static str,
+    pub name: &'static str,
+    pub description: &'static str,
+}
+
+/// 功能清单：key 用于 arona.yml 的 group_settings.disabled_features
+pub const FEATURES: [Feature; 10] = [
+    Feature {
+        key: "gacha",
+        name: "抽卡",
+        description: "单抽/十连/抽卡服务器/狗叫/历史",
+    },
+    Feature {
+        key: "name",
+        name: "游戏名",
+        description: "游戏名记录/谁是/叫我",
+    },
+    Feature {
+        key: "tarot",
+        name: "塔罗牌",
+        description: "塔罗牌占卜",
+    },
+    Feature {
+        key: "activity",
+        name: "活动",
+        description: "活动日历查询与本地日历图",
+    },
+    Feature {
+        key: "trainer",
+        name: "攻略",
+        description: "活动攻略/日程笔记/当期卡池查询",
+    },
+    Feature {
+        key: "task",
+        name: "定时任务",
+        description: "查看/触发定时任务(管理员)",
+    },
+    Feature {
+        key: "backup",
+        name: "备份恢复",
+        description: "备份/恢复配置与数据库(管理员)",
+    },
+    Feature {
+        key: "config",
+        name: "配置管理",
+        description: "/config 查看与修改配置(管理员)",
+    },
+    Feature {
+        key: "emergency",
+        name: "紧急停止",
+        description: "非管理员投票制停止服务",
+    },
+    Feature {
+        key: "help",
+        name: "帮助",
+        description: "帮助与运行状态查询",
+    },
+];
+
+/// 功能清单（GUI 展示用）
+pub fn features() -> &'static [Feature] {
+    &FEATURES
+}
+
+/// 功能 key 列表文本，如 "gacha, name, tarot"
+pub fn feature_keys_text() -> String {
+    FEATURES
+        .iter()
+        .map(|feature| feature.key)
+        .collect::<Vec<&str>>()
+        .join(", ")
+}
+
+/// 群功能开关默认开启；私聊(无群号)不受分群开关限制
+pub fn feature_enabled(group_id: Option<i64>, key: &str) -> bool {
+    if key.is_empty() {
+        return true;
+    }
+    let Some(group_id) = group_id else {
+        return true;
+    };
+    match group_settings().get(&group_id.to_string()) {
+        Some(setting) => setting.feature_enabled(key),
+        None => true,
+    }
+}
+
+/// 用户是否被拉黑（管理员不参与判断，由调用方保证）
+pub fn is_blacklisted(user_id: i64, group_id: Option<i64>) -> bool {
+    if global_blacklist().contains(&user_id) {
+        return true;
+    }
+    match group_id {
+        Some(group_id) => match group_settings().get(&group_id.to_string()) {
+            Some(setting) => setting.blacklist.contains(&user_id),
+            None => false,
+        },
+        None => false,
+    }
+}
 
 pub struct RuntimeConfig {
     /// 允许响应的群号列表，留空表示响应所有群
@@ -13,6 +118,10 @@ pub struct RuntimeConfig {
     pub end_with_sensei: RwLock<String>,
     /// arona 云端鉴权用 UUID（对应原版 RuntimeConfig.uuid，独立模式默认空字符串）
     pub uuid: RwLock<String>,
+    /// 全局用户黑名单
+    pub global_blacklist: RwLock<Vec<i64>>,
+    /// 分群设置（群号 -> 功能开关/群内黑名单）
+    pub group_settings: RwLock<BTreeMap<String, GroupSetting>>,
 }
 
 static CONFIG: OnceCell<RuntimeConfig> = OnceCell::new();
@@ -24,7 +133,33 @@ fn instance() -> &'static RuntimeConfig {
         bot_id: RwLock::new(0),
         end_with_sensei: RwLock::new(String::from("老师")),
         uuid: RwLock::new(String::new()),
+        global_blacklist: RwLock::new(Vec::new()),
+        group_settings: RwLock::new(BTreeMap::new()),
     })
+}
+
+pub fn set_global_blacklist(users: Vec<i64>) {
+    *instance().global_blacklist.write().unwrap() = users;
+}
+
+pub fn global_blacklist() -> Vec<i64> {
+    instance().global_blacklist.read().unwrap().clone()
+}
+
+pub fn set_group_settings(settings: BTreeMap<String, GroupSetting>) {
+    *instance().group_settings.write().unwrap() = settings;
+}
+
+pub fn group_settings() -> BTreeMap<String, GroupSetting> {
+    instance().group_settings.read().unwrap().clone()
+}
+
+/// 取某个群的设置（不存在则返回默认值）
+pub fn group_setting(group_id: i64) -> GroupSetting {
+    group_settings()
+        .get(&group_id.to_string())
+        .cloned()
+        .unwrap_or_default()
 }
 
 pub fn set_groups(groups: Vec<i64>) {

@@ -181,7 +181,35 @@ pub fn build(config: OneBotConfig) -> Arc<SimpleCommandDispatcher> {
             }),
         ),
     ];
+    let registrations: Vec<CommandRegistration> = registrations
+        .into_iter()
+        .map(|registration| {
+            let feature = registration
+                .names
+                .first()
+                .map(|name| feature_for(name))
+                .unwrap_or("");
+            registration.with_feature(feature)
+        })
+        .collect();
     Arc::new(SimpleCommandDispatcher::new(registrations, None))
+}
+
+/// 命令 -> 分群功能开关 key（见 runtime::config::FEATURES）；空串表示不受分群开关限制
+fn feature_for(command: &str) -> &'static str {
+    match command {
+        "/单抽" | "/十连" | "/抽卡服务器" | "/狗叫" | "/历史" | "/抽卡" => "gacha",
+        "/游戏名" | "/谁是" | "/叫我" => "name",
+        "/塔罗牌" => "tarot",
+        "/活动" => "activity",
+        "/攻略" => "trainer",
+        "/任务" => "task",
+        "/备份" | "/恢复" => "backup",
+        "/config" => "config",
+        "/紧急停止" => "emergency",
+        "/帮助" | "/help" => "help",
+        _ => "",
+    }
 }
 
 /// 无守卫的命令包装器（对应 Kotlin 直接 CommandHandler 的命令）
@@ -306,7 +334,7 @@ fn connection_text(config: &OneBotConfig) -> String {
     }
     let mut lines: Vec<String> = Vec::new();
     for (index, (name, connection)) in enabled.iter().enumerate() {
-        let conn_type = ConnectionType::from_name(name).unwrap_or(ConnectionType::WebSocket);
+        let conn_type = connection.resolve_type(name).unwrap_or(ConnectionType::WebSocket);
         lines.push(format!(
             "{}. {} {}",
             index + 1,

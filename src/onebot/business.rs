@@ -9,7 +9,7 @@ use crate::onebot::protocol;
 use crate::runtime::dispatcher::{CommandContext, SimpleCommandDispatcher};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 /// 可变共享状态（群名缓存等）
@@ -30,7 +30,7 @@ impl HandlerState {
 }
 
 pub struct StandaloneBusinessHandler {
-    pub config: OneBotConfig,
+    config: RwLock<OneBotConfig>,
     pub dispatcher: Arc<SimpleCommandDispatcher>,
     pub registry: Arc<ConnectionRegistry>,
     pub state: Arc<HandlerState>,
@@ -43,11 +43,21 @@ impl StandaloneBusinessHandler {
         registry: Arc<ConnectionRegistry>,
     ) -> StandaloneBusinessHandler {
         StandaloneBusinessHandler {
-            config,
+            config: RwLock::new(config),
             dispatcher,
             registry,
             state: Arc::new(HandlerState::new()),
         }
+    }
+
+    /// 当前 OneBot 配置快照
+    pub fn config(&self) -> OneBotConfig {
+        self.config.read().unwrap().clone()
+    }
+
+    /// 热重载时更新配置（self_id / nickname 等）
+    pub fn update_config(&self, config: OneBotConfig) {
+        *self.config.write().unwrap() = config;
     }
 
     /// 收到事件
@@ -60,7 +70,7 @@ impl StandaloneBusinessHandler {
         if event.post_type != "message" {
             return;
         }
-        let self_id = self.config.self_id;
+        let self_id = self.config().self_id;
         if event.message_type.as_deref() == Some("group") && event.group_id.is_some() {
             self.print_group_message(&event, connection.clone());
         } else {
@@ -73,6 +83,10 @@ impl StandaloneBusinessHandler {
         let Some(user_id) = event.user_id else { return };
         let is_admin = crate::runtime::config::is_manager(user_id);
         if !is_admin && !self.is_allowed_group(event.group_id) {
+            return;
+        }
+        // 黑名单（全局 + 群内）：管理员不受限制
+        if !is_admin && crate::runtime::config::is_blacklisted(user_id, event.group_id) {
             return;
         }
         let sender_name = event
@@ -94,7 +108,7 @@ impl StandaloneBusinessHandler {
             });
         let sender = Arc::new(OneBotMessageSender {
             connection: Some(connection),
-            self_id: self.config.self_id,
+            self_id: self.config().self_id,
         });
         let context = Arc::new(CommandContext {
             user_id,
@@ -120,7 +134,7 @@ impl StandaloneBusinessHandler {
     }
 
     fn handle_notice(&self, event: &OneBotEvent) {
-        let self_id = self.config.self_id;
+        let self_id = self.config().self_id;
         let group_id = event.group_id;
         match event.notice_type.as_deref() {
             Some("group_increase") => {
@@ -175,7 +189,7 @@ impl StandaloneBusinessHandler {
     }
 
     fn print_group_message(&self, event: &OneBotEvent, connection: Arc<dyn OneBotConnection>) {
-        let self_id = self.config.self_id;
+        let self_id = self.config().self_id;
         let Some(group_id) = event.group_id else {
             return;
         };
@@ -221,7 +235,7 @@ impl StandaloneBusinessHandler {
 
     fn spawn_load_group_name(&self, group_id: i64, connection: Arc<dyn OneBotConnection>) {
         let state = self.state.clone();
-        let self_id = self.config.self_id;
+        let self_id = self.config().self_id;
         tokio::spawn(async move {
             let params = json!({ "group_id": group_id });
             let response = {
@@ -271,7 +285,8 @@ impl StandaloneBusinessHandler {
                 json!({ "app_name": "arona", "app_version": "standalone", "protocol_version": "11" })
             }
             "get_login_info" => {
-                json!({ "user_id": self.config.self_id, "nickname": self.config.nickname })
+                let config = self.config();
+                json!({ "user_id": config.self_id, "nickname": config.nickname })
             }
             _ => return Ok(None),
         };

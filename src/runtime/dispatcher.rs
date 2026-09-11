@@ -81,6 +81,8 @@ pub struct CommandRegistration {
     pub names: Vec<String>,
     pub description: String,
     pub command_handler: Arc<dyn CommandHandler>,
+    /// 所属分群功能开关 key（见 crate::runtime::config::FEATURES）；空串表示不受分群开关限制
+    pub feature: &'static str,
 }
 
 impl CommandRegistration {
@@ -93,7 +95,14 @@ impl CommandRegistration {
             names,
             description: description.into(),
             command_handler,
+            feature: "",
         }
+    }
+
+    /// 绑定分群功能开关
+    pub fn with_feature(mut self, feature: &'static str) -> CommandRegistration {
+        self.feature = feature;
+        self
     }
 }
 
@@ -124,9 +133,15 @@ where
     Arc::new(FnFallbackHandler { inner: f })
 }
 
+/// 命令表项：处理器 + 所属分群功能
+struct CommandEntry {
+    handler: Arc<dyn CommandHandler>,
+    feature: &'static str,
+}
+
 /// 简单命令分发器（对应 SimpleCommandDispatcher）
 pub struct SimpleCommandDispatcher {
-    commands: HashMap<String, Arc<dyn CommandHandler>>,
+    commands: HashMap<String, CommandEntry>,
     fallback: Option<Arc<dyn FallbackHandler>>,
 }
 
@@ -138,7 +153,13 @@ impl SimpleCommandDispatcher {
         let mut commands = HashMap::new();
         for registration in registrations {
             for name in registration.names {
-                commands.insert(normalize(&name), registration.command_handler.clone());
+                commands.insert(
+                    normalize(&name),
+                    CommandEntry {
+                        handler: registration.command_handler.clone(),
+                        feature: registration.feature,
+                    },
+                );
             }
         }
         SimpleCommandDispatcher { commands, fallback }
@@ -158,8 +179,12 @@ impl SimpleCommandDispatcher {
         let key = normalize(&parts[0]);
         let args = parts[1..].to_vec();
         match self.commands.get(&key) {
-            Some(cmd) => {
-                cmd.handle(context, args).await;
+            Some(entry) => {
+                // 分群功能开关：该群关闭了此功能则视为未匹配（交给兜底/数字回复）
+                if !crate::runtime::config::feature_enabled(context.group_id, entry.feature) {
+                    return false;
+                }
+                entry.handler.handle(context, args).await;
                 true
             }
             None => {

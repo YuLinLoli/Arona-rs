@@ -1,7 +1,34 @@
 //! 运行期路径（对应原版 RuntimePaths + StandaloneLogFile 的目录规划）
 //! 独立模式数据目录：可执行文件当前目录下 arona-standalone/
 
+use once_cell::sync::OnceCell;
 use std::path::PathBuf;
+
+/// 实际使用的 onebot.yml 路径（命令行 --config= 可覆盖，GUI 需要写回同一文件）
+static ONE_BOT_FILE: OnceCell<PathBuf> = OnceCell::new();
+/// 实际使用的 arona.yml 路径
+static ARONA_FILE: OnceCell<PathBuf> = OnceCell::new();
+
+pub fn set_onebot_file(path: PathBuf) {
+    let _ = ONE_BOT_FILE.set(path);
+}
+
+pub fn set_arona_file(path: PathBuf) {
+    let _ = ARONA_FILE.set(path);
+}
+
+/// 当前生效的 onebot.yml 路径
+pub fn onebot_file() -> PathBuf {
+    ONE_BOT_FILE
+        .get()
+        .cloned()
+        .unwrap_or_else(default_onebot_file)
+}
+
+/// 当前生效的 arona.yml 路径
+pub fn arona_file() -> PathBuf {
+    ARONA_FILE.get().cloned().unwrap_or_else(default_arona_file)
+}
 
 /// arona-standalone 根目录（当前工作目录下）
 pub fn standalone_root() -> PathBuf {

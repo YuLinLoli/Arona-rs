@@ -1,7 +1,9 @@
 # Cargo 别名配置（相当于本项目常用的“构建任务”快捷命令）
 # 用法示例：
-#   cargo build-release   # 发布构建, 产物: target/release/arona-rs[.exe]
-#   cargo dist            # 发布构建并把产物重命名为 arona-rs-<版本号>[.exe]（交付推荐）
+#   cargo build-release   # 发布构建(默认含 GUI), 产物: target/release/arona-rs[.exe]
+#   cargo run-nogui       # 以纯命令行(黑窗口)模式运行
+#   cargo dist            # 发布构建: 产物 arona-rs[.exe]（主程序不带版本号, 交付推荐）
+#   cargo installer       # 发布构建 + 打 Windows 安装包(需 Inno Setup 6, 安装包名带版本号)（见 installer/）
 #   cargo run-release     # 发布构建并直接运行独立版（等价: cargo run --release）
 #   cargo smoke-image     # 生成抽卡/活动日历样例图并做像素级自检（忽略的自检用例）
 # 若需在别名后追加参数, 直接写在其后即可, 例如: cargo build-release --verbose
@@ -9,9 +11,14 @@
 [alias]
 # 发布构建（产物 arona-rs[.exe]）
 build-release = "build --release"
-# 发布构建 + 版本号产物: target/release/arona-rs-<version>[.exe]（最终交付推荐）
+# 发布构建 + 整理产物: target/release/arona-rs[.exe]（主程序不带版本号, 最终交付推荐）
 # 注意: 本别名已带全部参数, 请不要再追加参数
 dist = "test dist_build --release -- --ignored --nocapture --test-threads=1"
+# 发布构建 + 打 Windows 安装包: target/release/arona-rs-<version>-setup-win-x64.exe（安装包带版本号）
+# 安装包内含程序介绍与 AGPLv3 全文; softgl/ 大依赖单独打包、安装时释放到安装目录
+# 需要 Inno Setup 6: winget install --id JRSoftware.InnoSetup
+# 注意: 本别名已带全部参数, 请不要再追加参数
+installer = "test installer_build --release -- --ignored --nocapture --test-threads=1"
 # 发布构建并立即运行
 run-release = "run --release"
 # 图片渲染冒烟自检: 生成样例 PNG 到 arona-standalone/images 并断言关键区域颜色
@@ -30,3 +37,19 @@ smoke-birthday = "test birthday -- --ignored --nocapture --test-threads=1"
 smoke-image-refresh = "test image_refresh -- --nocapture --test-threads=1"
 # 启动刷新本地资源图片自检(联网): 拉取三服活动并生成三张日历图
 smoke-image-refresh-net = "test refresh_all_images -- --ignored --nocapture --test-threads=1"
+# 发布构建(默认已含管理 GUI): 产物 target/release/arona-rs[.exe], 直接运行即打开管理面板
+build-gui = "build --release"
+# 发布构建(不含 GUI 的精简命令行版, 减小体积)
+build-nogui = "build --release --no-default-features"
+# 构建并运行(默认打开管理 GUI)
+gui = "run --release"
+# 构建并以纯命令行(黑窗口)模式运行
+run-nogui = "run --release -- --nogui"
+
+# 静态链接 MSVC 运行库：产物自带 VCRUNTIME/UCRT，服务器上无需安装
+# "Microsoft Visual C++ 2015-2022 Redistributable"（解决“缺少 VCRUNTIME140.dll”）
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.i686-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

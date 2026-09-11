@@ -4,7 +4,10 @@
 # 用法:
 #   1. 改 Cargo.toml 里的 version (例如 0.2.2)
 #   2. git tag v0.2.2 && git push origin v0.2.2
-#   3. Actions 自动构建 -> 上传工件 -> 创建 Release 并附上 arona-rs-0.2.2.exe
+#   3. Actions 自动构建 -> 上传工件 -> 创建 Release
+#      产物: arona-rs.exe（单文件, 主程序不带版本号, 便于覆盖升级）
+#            arona-rs-0.2.2-win-x64.zip（便携版, 含 softgl/, 带版本号）
+#            arona-rs-0.2.2-setup-win-x64.exe（安装包, 含程序介绍与 AGPLv3 全文）
 # 也可以在 Actions 页面手动 Run workflow（手动触发时跳过版本校验、只构建不发布）。
 name: AutoUploadReleaseBuild
 
@@ -18,7 +21,7 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # 1) 在 Windows 上跑单元测试并产出带版本号的 exe
+  # 1) 在 Windows 上跑单元测试，产出主程序 exe、便携 zip 与安装包
   Build:
     runs-on: windows-latest
     steps:
@@ -50,29 +53,78 @@ jobs:
       - name: Test
         run: cargo test --release
 
+      # CPU 软件渲染依赖(Mesa llvmpipe): 让没有显卡驱动 / 没有 DX12 的服务器也能打开管理面板。
+      # 约 62MB, 不入库(.gitignore 忽略了 /softgl/), 构建时现拉。
+      # 必须放在 dist/installer 之前: 它们会把仓库根的 softgl/ 复制到 target/release/softgl/。
+      # 安装包把它作为必装组件, 所以这里失败就直接让构建失败, 避免发布出服务器打不开 GUI 的包
+      - name: Fetch software OpenGL (softgl)
+        shell: pwsh
+        run: ./scripts/fetch-softgl.ps1
+
+      - name: Verify softgl payload
+        shell: pwsh
+        run: |
+          if (-not (Test-Path softgl/opengl32.dll)) {
+            Write-Error "softgl/ 拉取失败: 缺少 opengl32.dll"
+            exit 1
+          }
+          Write-Host "softgl OK: $((Get-ChildItem softgl | Measure-Object -Property Length -Sum).Sum / 1MB) MB"
+
       # 等价于 cargo dist, 这里写全命令以免依赖 .cargo/config.toml 的别名
-      # 该用例会做 cargo build --release 并把产物复制成 target/release/arona-rs-<版本号>.exe
+      # 该用例会做 cargo build --release, 产物主程序固定为 target/release/arona-rs.exe(不带版本号)
       - name: Build dist
         run: cargo test dist_build --release -- --ignored --nocapture --test-threads=1
 
       - name: Get Artifact Name
         shell: pwsh
         run: |
-          $exe = Get-ChildItem target/release -Filter 'arona-rs-*.exe' |
-            Where-Object { $_.BaseName -match '^arona-rs-\d' } |
-            Sort-Object LastWriteTime -Descending |
-            Select-Object -First 1
-          if (-not $exe) { Write-Error "未找到带版本号的构建产物"; exit 1 }
-          Write-Host "构建产物: $($exe.FullName)"
-          "ARTIFACT_NAME=$($exe.BaseName)" >> $env:GITHUB_ENV
-          "ARTIFACT_PATH=$($exe.FullName)"  >> $env:GITHUB_ENV
+          # 主程序固定叫 arona-rs.exe(不带版本号, 便于覆盖升级); 版本号从 Cargo.toml 读,
+          # 只用于便携 zip / 安装包的文件名
+          $exe = "target/release/arona-rs.exe"
+          if (-not (Test-Path $exe)) { Write-Error "未找到构建产物 $exe"; exit 1 }
+          $meta = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+          $version = $meta.packages[0].version
+          Write-Host "构建产物: $exe (版本 $version)"
+          "APP_VERSION=$version" >> $env:GITHUB_ENV
+          "ARTIFACT_PATH=$exe" >> $env:GITHUB_ENV
+          "ARTIFACT_NAME=arona-rs-$version" >> $env:GITHUB_ENV
 
-      # 上传工件
+      # 安装包用 Inno Setup 6 编译（installer/arona-rs.iss）: 程序介绍 + AGPLv3 全文 +
+      # 默认配置（缺失才释放）+ softgl/ 单独打包、安装时释放到安装目录
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      # 等价于 cargo installer: 调用 ISCC 生成 arona-rs-<版本号>-setup-win-x64.exe
+      - name: Build installer
+        run: cargo test installer_build --release -- --ignored --nocapture --test-threads=1
+
+      - name: Package zip
+        shell: pwsh
+        run: |
+          $paths = @($env:ARTIFACT_PATH)
+          if (Test-Path target/release/softgl) {
+            $paths += "target/release/softgl"
+          } else {
+            Write-Warning "缺少 softgl, 压缩包内不含软件 OpenGL"
+          }
+          $zip = "target/release/$($env:ARTIFACT_NAME)-win-x64.zip"
+          Compress-Archive -Path $paths -DestinationPath $zip -Force
+          Write-Host "打包完成: $zip"
+          "ZIP_PATH=$zip" >> $env:GITHUB_ENV
+
+          $setup = "target/release/arona-rs-$($env:APP_VERSION)-setup-win-x64.exe"
+          if (-not (Test-Path $setup)) { Write-Error "未找到安装包 $setup"; exit 1 }
+          "SETUP_PATH=$setup" >> $env:GITHUB_ENV
+
+      # 上传工件: 单文件 exe + 便携 zip + 安装包
       - name: Upload-Artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.ARTIFACT_NAME }}
-          path: ${{ env.ARTIFACT_PATH }}
+          path: |
+            ${{ env.ARTIFACT_PATH }}
+            ${{ env.ZIP_PATH }}
+            ${{ env.SETUP_PATH }}
           compression-level: 0
 
   # 2) 取回工件并发布 Release

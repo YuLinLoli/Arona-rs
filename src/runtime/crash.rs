@@ -1,0 +1,60 @@
+//! 致命错误上报（启动失败 / panic）
+//!
+//! 含 GUI 的 Windows 产物是 windows 子系统（没有控制台），双击启动时一旦失败
+//! 就会表现为「没反应」。这里保证错误至少能被看见：
+//! 1. 接回/新建控制台（双击也能看到）
+//! 2. 打印到 stderr
+//! 3. 写入统一日志 arona-standalone/logs/arona-yyyy-MM-dd.log
+//! 4. 兜底写入 arona-standalone/logs/startup-error.log
+
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
+/// 上报一个致命/启动错误（本身绝不 panic）
+pub fn report(context: &str, message: &str) {
+    let text = format!("{context}: {message}");
+
+    // 1) 接回控制台：GUI 子系统双击启动时也能看到错误
+    crate::runtime::console::attach_console();
+    // 2) 控制台输出 + 统一日志落盘（log::error 内部两者都会做）
+    crate::runtime::log::error(&text);
+    // 3) 兜底：写一份固定的启动错误文件（日志目录尚未就绪时也能留下线索）
+    let path = startup_error_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    append_error_file(&path, &text);
+}
+
+/// 启动错误文件路径
+pub fn startup_error_path() -> PathBuf {
+    crate::runtime::paths::logs_dir().join("startup-error.log")
+}
+
+/// 追加一行到指定错误文件（时间戳 + 内容）
+fn append_error_file(path: &Path, text: &str) {
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    else {
+        return;
+    };
+    let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+    let _ = writeln!(file, "{timestamp} {text}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn appends_timestamped_error_line() {
+        let path = std::env::temp_dir().join("arona-crash-report-test.log");
+        let _ = std::fs::remove_file(&path);
+        append_error_file(&path, "测试错误信息");
+        let content = std::fs::read_to_string(&path).expect("错误文件应已写入");
+        assert!(content.contains("测试错误信息"));
+        let _ = std::fs::remove_file(&path);
+    }
+}

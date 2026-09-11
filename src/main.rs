@@ -1,7 +1,17 @@
 //! arona-rs：Arona 的 Rust 移植版（onebot 独立模式，完全剥离 mirai）
 //! 对应原版 standalone/AronaStandalone 的启动流程。
+//!
+//! 启动模式：默认打开管理 GUI；加 `--nogui` 只启动命令行(黑窗口)模式。
+//! 含 GUI 的 Windows 构建使用 windows 子系统（GUI 模式不弹控制台），`--nogui`
+//! 时会由 runtime::console::attach_console() 接回上级终端或新建控制台。
+
+// 含 GUI 时用 windows 子系统，避免 GUI 模式多出一个控制台窗口；测试目标保持控制台。
+#![cfg_attr(all(windows, feature = "gui", not(test)), windows_subsystem = "windows")]
 
 mod activity;
+mod admin;
+#[cfg(feature = "gui")]
+mod gui;
 mod config;
 mod data;
 mod db;
@@ -28,9 +38,97 @@ fn find_arg(args: &[String], prefix: &str) -> Option<String> {
         .map(|arg| arg[prefix.len()..].to_string())
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     let args: Vec<String> = std::env::args().collect();
+
+    // 第一件事就是接上 log 门面：wgpu/glutin 的失败原因（比如 DX12 后端创建失败）
+    // 只在 debug 级别记录，不装 logger 会完全看不到，GUI 起不来时等于两眼一抹黑
+    runtime::log::install_logger();
+
+    // 申请管理员权限（UAC）：需要时用提权实例重新拉起自己并立刻退出。
+    // 放在最前面，保证后面所有初始化（含 GUI、OneBot 监听）都在提权进程里完成。
+    if runtime::elevate::request_admin(&args) {
+        runtime::console::print_safe(
+            "[Arona] 正在以管理员身份重新启动，请在 UAC 弹窗中选择“是”...",
+        );
+        return;
+    }
+
+    // 软件 OpenGL 模式（--softgl / ARONA_SOFTGL=1）：必须在任何 eframe/glutin 调用之前
+    // 把 softgl 目录塞进 DLL 搜索路径，否则系统那份 OpenGL 1.1 会先被加载
+    #[cfg(feature = "gui")]
+    if runtime::softgl::requested(&args) {
+        runtime::softgl::activate();
+    }
+
+    // 任何 panic 都要留下痕迹：GUI 子系统没有控制台，双击启动时默认会表现成“没反应”
+    std::panic::set_hook(Box::new(|info| {
+        runtime::crash::report("程序异常(panic)", &info.to_string());
+    }));
+
+    // 默认 GUI 模式；--nogui 只启动命令行(黑窗口)
+    let nogui = args.iter().any(|arg| arg == "--nogui");
+
+    if !nogui {
+        #[cfg(feature = "gui")]
+        {
+            match gui::run(args.clone()) {
+                Ok(()) => return,
+                Err(err) => {
+                    // 窗口创建失败（服务器/虚拟机常见：缺少可用的 OpenGL）时回退到命令行模式，
+                    // 保证机器人仍能工作，并且错误能在接回的控制台/日志里看到
+                    runtime::crash::report("GUI 启动失败", &err);
+                    // 所有渲染后端都失败：若本地带了软件 OpenGL(softgl)，用 --softgl 重启自己再试一次。
+                    // 必须另起进程：glutin_wgl_sys 静态导入 opengl32.dll，本进程里已经试过系统 GL，
+                    // 系统那份 DLL 已经加载，再改搜索路径也不会生效。
+                    if err.contains("后端启动失败")
+                        && !runtime::softgl::requested(&args)
+                        && runtime::softgl::dir().is_some()
+                        && runtime::softgl::relaunch(&args)
+                    {
+                        runtime::console::eprint_safe(
+                            "[Arona] 已用软件 OpenGL(llvmpipe) 模式重新启动管理面板",
+                        );
+                        return;
+                    }
+                    runtime::console::eprint_safe("[Arona] 已回退到命令行模式继续运行（下次可直接加 --nogui 跳过 GUI）");
+                    if crate::runtime::softgl::dir().is_none() {
+                        runtime::console::eprint_safe(
+                            "[Arona] 提示: 无显卡驱动/无 DX12 的服务器上可先运行 scripts/fetch-softgl.ps1 获取软件 OpenGL",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // 精简构建(--no-default-features)不含 GUI：显式请求 --gui 时给出提示
+    #[cfg(not(feature = "gui"))]
+    if args.iter().any(|arg| arg == "--gui") {
+        runtime::console::eprint_safe("[Arona] 当前构建未包含 GUI（使用了 --no-default-features 构建）。");
+    }
+
+    // 含 GUI 的 Windows 构建是 windows 子系统：命令行模式先接回控制台，保证日志/颜色正常
+    #[cfg(all(windows, feature = "gui"))]
+    runtime::console::attach_console();
+
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            runtime::console::eprint_safe(&format!("[Arona] 创建 tokio 运行时失败: {err}"));
+            return;
+        }
+    };
+    if let Err(err) = runtime.block_on(run_bot(args, None)) {
+        runtime::console::eprint_safe(&format!("[Arona] 运行失败: {err}"));
+    }
+}
+
+/// 机器人主流程；shutdown 为 GUI 关闭窗口时触发的退出信号
+pub(crate) async fn run_bot(
+    args: Vec<String>,
+    shutdown: Option<tokio::sync::oneshot::Receiver<()>>,
+) -> Result<(), String> {
     // 提前探测终端能力(Windows 开启 VT 处理), 保证横幅/日志颜色正常渲染
     runtime::console::init();
     if std::env::var_os("ARONA_CONSOLE_DEBUG").is_some() {
@@ -56,10 +154,12 @@ async fn main() {
     let onebot_config = match config::onebot::load(&config_file) {
         Ok(config) => config,
         Err(err) => {
-            eprintln!("[Arona] onebot.yml 加载失败: {err}");
+            runtime::console::eprint_safe(&format!("[Arona] onebot.yml 加载失败: {err}"));
             std::process::exit(1);
         }
     };
+    runtime::paths::set_onebot_file(config_file.clone());
+    runtime::paths::set_arona_file(arona_config_file.clone());
     runtime::config::set_bot_id(onebot_config.self_id);
     runtime::config::set_end_with_sensei("老师".to_string());
 
@@ -109,6 +209,8 @@ async fn main() {
         business.clone(),
         registry.clone(),
     ));
+    // 发布全局句柄：GUI 管理面板与连接热重载使用
+    onebot::application::set_global(application.clone());
     application.start();
 
     // 就绪后设置全局消息发送器（活动推送/预警使用首个可用连接）
@@ -118,21 +220,35 @@ async fn main() {
     });
     runtime::services::set_message_sender(sender);
 
-    println!("Arona standalone started");
-    println!("Config: {}", config_file.to_string_lossy());
-    println!("Arona 业务配置: {}", arona_config_file.to_string_lossy());
-    println!(
+    runtime::console::print_rule_line("Arona standalone started");
+    runtime::console::print_rule_line(&format!("Config: {}", config_file.to_string_lossy()));
+    runtime::console::print_rule_line(&format!(
+        "Arona 业务配置: {}",
+        arona_config_file.to_string_lossy()
+    ));
+    runtime::console::print_rule_line(&format!(
         "日志文件: {}",
         runtime::paths::logs_dir()
             .join("arona-yyyy-MM-dd.log")
             .to_string_lossy()
-    );
+    ));
 
-    // 优雅关闭：停止 OneBot 连接、定时任务与数据库
-    tokio::signal::ctrl_c().await.ok();
+    // 优雅关闭：Ctrl+C 或 GUI 窗口关闭
+    match shutdown {
+        Some(receiver) => {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = receiver => {}
+            }
+        }
+        None => {
+            tokio::signal::ctrl_c().await.ok();
+        }
+    }
     runtime::log::info("正在关闭 Arona...");
     application.stop();
     quartz::pause_all();
     db::close();
-    println!("Arona standalone stopped");
+    runtime::console::print_rule_line("Arona standalone stopped");
+    Ok(())
 }

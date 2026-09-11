@@ -87,6 +87,20 @@ fn stderr_mode() -> Mode {
     *STDERR_MODE.get_or_init(|| resolve(Stream::Err))
 }
 
+/// 让 GUI 子系统(`windows_subsystem = "windows"`)的进程也能在命令行模式输出：
+/// 优先附加到上级终端(cmd/PowerShell/cargo run)，失败则新建控制台，然后把
+/// 标准输入/输出/错误接到 CONIN$/CONOUT$。若标准流本就有效(IDE 管道等)则保持不动。
+///
+/// 必须在任何 stdout/stderr 输出之前调用（`--nogui` 启动时由 main 调用）。
+#[cfg(windows)]
+pub fn attach_console() {
+    win::attach_console();
+}
+
+/// 非 Windows 平台无需处理
+#[cfg(not(windows))]
+pub fn attach_console() {}
+
 /// 当前染色方式摘要（`ARONA_CONSOLE_DEBUG=1` 时打印，便于排查终端差异）
 pub fn mode_summary() -> String {
     fn name(mode: Mode) -> &'static str {
@@ -193,6 +207,23 @@ fn is_warning_line(line: &str) -> bool {
     })
 }
 
+/// 安全输出一行到 stdout：GUI 子系统没有控制台时写句柄可能无效，
+/// 这里忽略写入错误，绝不让“记日志”本身触发 panic（println! 写失败会 panic）。
+pub fn print_safe(line: &str) {
+    use std::io::Write;
+    let mut out = std::io::stdout();
+    let _ = writeln!(out, "{line}");
+    let _ = out.flush();
+}
+
+/// 安全输出一行到 stderr（同上）
+pub fn eprint_safe(line: &str) {
+    use std::io::Write;
+    let mut err = std::io::stderr();
+    let _ = writeln!(err, "{line}");
+    let _ = err.flush();
+}
+
 /// 按原版规则给一行上色后输出到 stdout
 pub fn print_rule_line(line: &str) {
     write_line(stdout_mode(), Stream::Out, color_for_line(line), line);
@@ -208,16 +239,37 @@ pub fn print_colored_line(color: Color, line: &str) {
     write_line(stdout_mode(), Stream::Out, Some(color), line);
 }
 
+/// 用指定颜色一次性输出多行到 stdout（启动横幅等）。
+///
+/// 与逐行调用 `print_colored_line` 的区别：整批在同一个写锁里完成，多线程下
+/// （GUI 主线程的输出与机器人后台线程的日志）不会被别的行从中间切开，
+/// 等宽艺术字因此不会错位；每行仍然单独进入 GUI「实时日志」缓冲。
+pub fn print_colored_lines(color: Color, lines: &[String]) {
+    if lines.is_empty() {
+        return;
+    }
+    for line in lines {
+        crate::runtime::log::push_live(line, false);
+    }
+    match (stdout_mode(), color) {
+        (Mode::Native, _) => native_write(Stream::Out, color, &lines.join("\n")),
+        (Mode::Ansi, _) => print_safe(&format!("{}{}{RESET}", color.ansi(), lines.join("\n"))),
+        _ => print_safe(&lines.join("\n")),
+    }
+}
+
 fn write_line(mode: Mode, stream: Stream, color: Option<Color>, line: &str) {
+    // 所有控制台输出统一进内存缓冲，供 GUI「实时日志」选项卡展示
+    crate::runtime::log::push_live(line, matches!(stream, Stream::Err));
     match (mode, color) {
         (Mode::Native, Some(color)) => native_write(stream, color, line),
         (Mode::Ansi, Some(color)) => match stream {
-            Stream::Out => println!("{}{line}{RESET}", color.ansi()),
-            Stream::Err => eprintln!("{}{line}{RESET}", color.ansi()),
+            Stream::Out => print_safe(&format!("{}{line}{RESET}", color.ansi())),
+            Stream::Err => eprint_safe(&format!("{}{line}{RESET}", color.ansi())),
         },
         _ => match stream {
-            Stream::Out => println!("{line}"),
-            Stream::Err => eprintln!("{line}"),
+            Stream::Out => print_safe(line),
+            Stream::Err => eprint_safe(line),
         },
     }
 }
@@ -230,8 +282,8 @@ fn native_write(stream: Stream, color: Color, line: &str) {
     let _guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let Some(handle) = win::std_handle(stream) else {
         match stream {
-            Stream::Out => println!("{line}"),
-            Stream::Err => eprintln!("{line}"),
+            Stream::Out => print_safe(line),
+            Stream::Err => eprint_safe(line),
         }
         return;
     };
@@ -239,20 +291,14 @@ fn native_write(stream: Stream, color: Color, line: &str) {
     let restore = win::attributes(handle).unwrap_or(win::DEFAULT_ATTRIBUTES);
     if !win::set_attribute(handle, color.win_attribute()) {
         match stream {
-            Stream::Out => println!("{line}"),
-            Stream::Err => eprintln!("{line}"),
+            Stream::Out => print_safe(line),
+            Stream::Err => eprint_safe(line),
         }
         return;
     }
     match stream {
-        Stream::Out => {
-            println!("{line}");
-            let _ = std::io::Write::flush(&mut std::io::stdout());
-        }
-        Stream::Err => {
-            eprintln!("{line}");
-            let _ = std::io::Write::flush(&mut std::io::stderr());
-        }
+        Stream::Out => print_safe(line),
+        Stream::Err => eprint_safe(line),
     }
     win::set_attribute(handle, restore);
 }
@@ -261,8 +307,8 @@ fn native_write(stream: Stream, color: Color, line: &str) {
 #[cfg(not(windows))]
 fn native_write(stream: Stream, color: Color, line: &str) {
     match stream {
-        Stream::Out => println!("{}{line}{RESET}", color.ansi()),
-        Stream::Err => eprintln!("{}{line}{RESET}", color.ansi()),
+        Stream::Out => print_safe(&format!("{}{line}{RESET}", color.ansi())),
+        Stream::Err => eprint_safe(&format!("{}{line}{RESET}", color.ansi())),
     }
 }
 
@@ -312,8 +358,28 @@ mod win {
         maximum_window_size: Coord,
     }
 
+    const STD_INPUT_HANDLE: u32 = 0xFFFF_FFF6; // (DWORD)-10
+    const ATTACH_PARENT_PROCESS: u32 = 0xFFFF_FFFF; // (DWORD)-1
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    const OPEN_EXISTING: u32 = 3;
+
     unsafe extern "system" {
         fn GetStdHandle(n_std_handle: u32) -> *mut core::ffi::c_void;
+        fn SetStdHandle(n_std_handle: u32, h_handle: *mut core::ffi::c_void) -> i32;
+        fn AttachConsole(dw_process_id: u32) -> i32;
+        fn AllocConsole() -> i32;
+        fn CreateFileW(
+            lp_file_name: *const u16,
+            dw_desired_access: u32,
+            dw_share_mode: u32,
+            lp_security_attributes: *mut core::ffi::c_void,
+            dw_creation_disposition: u32,
+            dw_flags_and_attributes: u32,
+            h_template_file: *mut core::ffi::c_void,
+        ) -> *mut core::ffi::c_void;
         fn GetConsoleMode(h_console_handle: *mut core::ffi::c_void, lp_mode: *mut u32) -> i32;
         fn GetFileType(h_file: *mut core::ffi::c_void) -> u32;
         fn GetConsoleScreenBufferInfo(
@@ -324,6 +390,56 @@ mod win {
             h_console_output: *mut core::ffi::c_void,
             w_attributes: u16,
         ) -> i32;
+    }
+
+    /// 附加/新建控制台，并把标准流接到 CONIN$/CONOUT$（详见 `super::attach_console`）
+    pub fn attach_console() {
+        // SAFETY: 仅调用 Win32 控制台 API，句柄在进程生命周期内保持有效
+        unsafe {
+            if AttachConsole(ATTACH_PARENT_PROCESS) == 0 {
+                AllocConsole();
+            }
+            if !std_handle_valid(STD_OUTPUT_HANDLE) {
+                rebind("CONOUT$", STD_OUTPUT_HANDLE);
+            }
+            if !std_handle_valid(STD_ERROR_HANDLE) {
+                rebind("CONOUT$", STD_ERROR_HANDLE);
+            }
+            if !std_handle_valid(STD_INPUT_HANDLE) {
+                rebind("CONIN$", STD_INPUT_HANDLE);
+            }
+        }
+    }
+
+    /// 标准句柄是否已有效（IDE 管道等场景保持原样）
+    fn std_handle_valid(std_handle: u32) -> bool {
+        // SAFETY: 仅查询 Win32 标准句柄
+        let handle = unsafe { GetStdHandle(std_handle) };
+        !handle.is_null() && handle as isize != INVALID_HANDLE_VALUE
+    }
+
+    /// 打开 `name`(CONOUT$/CONIN$) 并把它设为指定标准流的句柄；句柄故意不关闭
+    unsafe fn rebind(name: &str, std_handle: u32) {
+        let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+        // SAFETY: 调用方保证运行在 Windows 下，wide 以 NUL 结尾
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null_mut(),
+                OPEN_EXISTING,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle.is_null() || handle as isize == INVALID_HANDLE_VALUE {
+            return;
+        }
+        // SAFETY: handle 由 CreateFileW 返回且有效
+        unsafe {
+            SetStdHandle(std_handle, handle);
+        }
     }
 
     /// 取标准流句柄（不判断是否为控制台）

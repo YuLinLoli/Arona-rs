@@ -1,7 +1,11 @@
-//! 构建脚本：为 Windows 产物嵌入程序图标。
+//! 构建脚本：为 Windows 产物嵌入程序图标与应用程序清单。
 //!
-//! 流程：`assets/arona.ico` -> 生成一行 `.rc` -> 用 Windows SDK 的 `rc.exe` 编译为 `.res`
-//!       -> 通过 `cargo:rustc-link-arg` 交给链接器。
+//! 流程：`assets/arona.ico` + `assets/arona.manifest` -> 生成 `.rc` -> 用 Windows SDK 的
+//!       `rc.exe` 编译为 `.res` -> 通过 `cargo:rustc-link-arg` 交给链接器。
+//!
+//! 清单（RT_MANIFEST, 资源 id 1）里声明的是 `asInvoker`（保持系统默认的启动级别），
+//! 管理员权限由程序在运行期通过 `src/runtime/elevate.rs` 自提权（弹 UAC）获得，
+//! 这样 cargo test 等从同一 bin 目标构建的测试进程不会被强制要求提权。
 //!
 //! `rc.exe` 的查找顺序：
 //!   1. 环境变量 `ARONA_RC`（显式指定，便于特殊环境或 CI 覆盖）
@@ -17,20 +21,41 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const ICON_FILE: &str = "assets/arona.ico";
+/// 应用程序清单：声明 requireAdministrator（管理员权限）等
+const MANIFEST_FILE: &str = "assets/arona.manifest";
 
 fn main() {
     println!("cargo:rerun-if-changed={ICON_FILE}");
+    println!("cargo:rerun-if-changed={MANIFEST_FILE}");
     println!("cargo:rerun-if-changed=build.rs");
 
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
     }
-    if let Err(err) = embed_icon() {
-        println!("cargo:warning=嵌入程序图标失败(不影响编译): {err}");
+
+    // 静态 DXC 已经编进 exe，运行期固定走 StaticDxc、永不调用 FXC，因此把
+    // d3dcompiler_47.dll 改成“延迟加载”：exe 启动时不再强依赖它（Windows Server /
+    // 精简系统上常常没有这个 DLL），只有真的调用 D3DCompile 时才去加载。
+    // 注意：只有带 GUI(即启用 wgpu/dx12) 的构建才会有 d3dcompiler_47.dll 导入，
+    // 无 GUI 构建加上 /DELAYLOAD 反而会让链接器报 LNK4199，所以这里按特性门控。
+    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc")
+        && std::env::var_os("CARGO_FEATURE_GUI").is_some()
+    {
+        println!("cargo:rustc-link-arg=/DELAYLOAD:d3dcompiler_47.dll");
+        // glutin_wgl_sys 用 #[link(name = "opengl32")] 静态导入 opengl32.dll，进程启动
+        // 就会去加载系统那份（服务器上往往只有 GDI 的 OpenGL 1.1）。改成延迟加载后，
+        // 只要在第一次调用 GL 之前 SetDllDirectory 指向 softgl 目录，就能换成 Mesa 的
+        // 软件 OpenGL(llvmpipe)，见 src/runtime/softgl.rs。
+        println!("cargo:rustc-link-arg=/DELAYLOAD:opengl32.dll");
+        println!("cargo:rustc-link-lib=delayimp");
+    }
+
+    if let Err(err) = embed_resources() {
+        println!("cargo:warning=嵌入图标/清单失败(不影响编译): {err}");
     }
 }
 
-fn embed_icon() -> Result<(), String> {
+fn embed_resources() -> Result<(), String> {
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").map_err(|e| e.to_string())?);
     let icon = manifest_dir.join(ICON_FILE);
     if !icon.is_file() {
@@ -39,11 +64,22 @@ fn embed_icon() -> Result<(), String> {
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").map_err(|e| e.to_string())?);
 
     // .rc 里路径要用双反斜杠转义
-    let rc_file = out_dir.join("arona-icon.rc");
-    let escaped = icon.display().to_string().replace('\\', "\\\\");
-    std::fs::write(&rc_file, format!("1 ICON \"{escaped}\"\n")).map_err(|e| e.to_string())?;
+    let rc_file = out_dir.join("arona-res.rc");
+    let escaped_icon = icon.display().to_string().replace('\\', "\\\\");
+    let mut rc = format!("1 ICON \"{escaped_icon}\"\n");
 
-    let res_file = out_dir.join("arona-icon.res");
+    // 应用程序清单：1 = CREATEPROCESS_MANIFEST_RESOURCE_ID，24 = RT_MANIFEST。
+    // 清单保持 asInvoker，管理员权限由 src/runtime/elevate.rs 在启动时自提权申请。
+    let manifest = manifest_dir.join(MANIFEST_FILE);
+    if manifest.is_file() {
+        let escaped_manifest = manifest.display().to_string().replace('\\', "\\\\");
+        rc.push_str(&format!("1 24 \"{escaped_manifest}\"\n"));
+    } else {
+        println!("cargo:warning=找不到清单文件 {}，产物不会申请管理员权限", manifest.display());
+    }
+    std::fs::write(&rc_file, rc).map_err(|e| e.to_string())?;
+
+    let res_file = out_dir.join("arona-res.res");
     let rc = find_rc().ok_or_else(|| {
         "未找到 rc.exe（可设置环境变量 ARONA_RC 指向 Windows SDK 的 rc.exe）".to_string()
     })?;
@@ -64,7 +100,9 @@ fn embed_icon() -> Result<(), String> {
     if !res_file.is_file() {
         return Err(format!("rc.exe 未生成 {}", res_file.display()));
     }
-    println!("cargo:rustc-link-arg={}", res_file.display());
+    // 只给 bin 目标挂资源：`rustc-link-arg` 会连测试/示例二进制一起带上，
+    // 那样 cargo test 出来的测试进程也会要求管理员权限，CI 里跑不起来。
+    println!("cargo:rustc-link-arg-bins={}", res_file.display());
     Ok(())
 }
 

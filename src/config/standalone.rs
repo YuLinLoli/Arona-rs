@@ -204,6 +204,8 @@ pub fn reload() {
 fn apply(new_config: AronaConfig) {
     crate::runtime::config::set_groups(new_config.groups.clone());
     crate::runtime::config::set_managers(new_config.managers.clone());
+    crate::runtime::config::set_global_blacklist(new_config.global_blacklist.clone());
+    crate::runtime::config::set_group_settings(new_config.group_settings.clone());
     let hour = new_config.notify.every_day_hour as i64;
     {
         let mut st = state().write().unwrap();
@@ -354,6 +356,101 @@ pub fn remove_from_list(key: &str, value: i64, show_value: bool) -> String {
     } else {
         format!("配置已更新: {key}")
     }
+}
+
+// ==================== GUI 用的配置读写接口 ====================
+
+/// 配置文件路径
+pub fn config_file() -> Option<PathBuf> {
+    state().read().unwrap().file.clone()
+}
+
+/// 写回 arona.yml 并立即应用到运行期（GUI 保存用）
+fn persist(config: &AronaConfig) -> Result<(), String> {
+    let path = state()
+        .read()
+        .unwrap()
+        .file
+        .clone()
+        .ok_or_else(|| "配置文件尚未初始化".to_string())?;
+    super::arona::save(&path, config).map_err(|err| format!("写入 arona.yml 失败: {err}"))?;
+    apply(config.clone());
+    Ok(())
+}
+
+/// 清理空的分群设置
+fn normalize_group_settings(config: &mut AronaConfig) {
+    config.group_settings.retain(|_, setting| {
+        !(setting.disabled_features.is_empty() && setting.blacklist.is_empty())
+    });
+}
+
+/// 启用/停用某个群（启用 = 加入 groups，停用 = 移出 groups）
+pub fn set_group_enabled(group_id: i64, enabled: bool) -> Result<(), String> {
+    let mut config = config();
+    if enabled {
+        if !config.groups.contains(&group_id) {
+            config.groups.push(group_id);
+            config.groups.sort();
+        }
+    } else {
+        config.groups.retain(|group| *group != group_id);
+    }
+    persist(&config)
+}
+
+/// 开启/关闭某个群的某项功能
+pub fn set_group_feature(group_id: i64, feature: &str, enabled: bool) -> Result<(), String> {
+    let mut config = config();
+    {
+        let setting = config
+            .group_settings
+            .entry(group_id.to_string())
+            .or_default();
+        setting.disabled_features.retain(|key| key != feature);
+        if !enabled {
+            setting.disabled_features.push(feature.to_string());
+            setting.disabled_features.sort();
+        }
+    }
+    normalize_group_settings(&mut config);
+    persist(&config)
+}
+
+/// 群成员黑名单：加入或移出
+pub fn set_group_blacklist(group_id: i64, user_id: i64, blacklisted: bool) -> Result<(), String> {
+    let mut config = config();
+    {
+        let setting = config
+            .group_settings
+            .entry(group_id.to_string())
+            .or_default();
+        setting.blacklist.retain(|id| *id != user_id);
+        if blacklisted {
+            setting.blacklist.push(user_id);
+            setting.blacklist.sort();
+        }
+    }
+    normalize_group_settings(&mut config);
+    persist(&config)
+}
+
+/// 全局黑名单：加入或移出
+pub fn set_global_blacklist(user_id: i64, blacklisted: bool) -> Result<(), String> {
+    let mut config = config();
+    config.global_blacklist.retain(|id| *id != user_id);
+    if blacklisted {
+        config.global_blacklist.push(user_id);
+        config.global_blacklist.sort();
+    }
+    persist(&config)
+}
+
+/// 清空某个群的全部设置（功能开关与群内黑名单）
+pub fn clear_group_setting(group_id: i64) -> Result<(), String> {
+    let mut config = config();
+    config.group_settings.remove(&group_id.to_string());
+    persist(&config)
 }
 
 /// 轮询监听 arona.yml 修改（每 2 秒），触发热重载

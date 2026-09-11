@@ -1,5 +1,6 @@
 //! arona 业务配置（对应原版 runtime/AronaConfig + AronaConfigLoader）
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::Path;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -31,6 +32,22 @@ fn default_hour() -> i32 {
 }
 fn default_notify_text() -> String {
     "碧蓝档案预警".to_string()
+}
+
+/// 单个群的业务设置（群号 -> 设置）
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GroupSetting {
+    /// 该群关闭的功能 key（见 runtime::config::FEATURES），未列出的功能保持开启
+    pub disabled_features: Vec<String>,
+    /// 该群内的用户黑名单（这些 QQ 在本群不触发机器人）
+    pub blacklist: Vec<i64>,
+}
+
+impl GroupSetting {
+    pub fn feature_enabled(&self, key: &str) -> bool {
+        !self.disabled_features.iter().any(|item| item == key)
+    }
 }
 
 impl Default for NotifyConfig {
@@ -94,10 +111,16 @@ pub struct TrainerFileConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AronaConfig {
+    /// 允许响应的群号列表，留空表示响应所有群
     pub groups: Vec<i64>,
+    /// 管理员 QQ 号列表
     pub managers: Vec<i64>,
     pub notify: NotifyConfig,
     pub trainer: TrainerConfig,
+    /// 全局用户黑名单：这些 QQ 在任何群/私聊都不触发机器人（管理员不受限）
+    pub global_blacklist: Vec<i64>,
+    /// 分群设置：群号(字符串) -> 功能开关 / 群内成员黑名单
+    pub group_settings: BTreeMap<String, GroupSetting>,
 }
 
 impl Default for AronaConfig {
@@ -107,6 +130,8 @@ impl Default for AronaConfig {
             managers: Vec::new(),
             notify: NotifyConfig::default(),
             trainer: TrainerConfig::default(),
+            global_blacklist: Vec::new(),
+            group_settings: BTreeMap::new(),
         }
     }
 }
@@ -154,6 +179,8 @@ pub fn load(file: &Path) -> Result<AronaConfig, String> {
                 .unwrap_or_default(),
             notify: legacy.map(|l| l.notify).unwrap_or_default(),
             trainer: TrainerConfig::default(),
+            global_blacklist: Vec::new(),
+            group_settings: BTreeMap::new(),
         };
         save(file, &config).map_err(|e| format!("写入 arona.yml 失败: {e}"))?;
         return Ok(config);
@@ -264,6 +291,33 @@ fn template(config: &AronaConfig) -> String {
         "  # 推送消息开头文字\n  notify_text: {}\n",
         yaml_quote(&config.notify.notify_text)
     ));
+    out.push('\n');
+    out.push_str("# ==================== 黑名单与分群功能开关 ====================\n");
+    out.push_str("# 全局用户黑名单：这些 QQ 在任何群/私聊都不触发机器人（管理员不受限）\n");
+    out.push_str(&format!(
+        "global_blacklist: {:?}\n",
+        config.global_blacklist
+    ));
+    out.push_str("# 分群设置：群号 -> 关闭的功能(disabled_features) / 群内成员黑名单(blacklist)\n");
+    out.push_str("# 可用功能 key: ");
+    out.push_str(&crate::runtime::config::feature_keys_text());
+    out.push('\n');
+    if config.group_settings.is_empty() {
+        out.push_str("# group_settings:\n");
+        out.push_str("#   \"123456789\":\n");
+        out.push_str("#     disabled_features: [tarot]\n");
+        out.push_str("#     blacklist: [10001]\n");
+        out.push_str("group_settings: {}\n");
+    } else {
+        out.push_str("group_settings:\n");
+        if let Ok(yaml) = serde_yaml::to_string(&config.group_settings) {
+            for line in yaml.lines() {
+                out.push_str("  ");
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+    }
     out.push('\n');
     out.push_str("# ==================== 攻略(/攻略) ====================\n");
     out.push_str("trainer:\n");

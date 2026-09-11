@@ -106,6 +106,11 @@ impl ConnectionRegistry {
         self.connections.read().unwrap().clone()
     }
 
+    /// 清空注册表（连接热重载时使用）
+    pub fn clear(&self) {
+        self.connections.write().unwrap().clear();
+    }
+
     /// 广播事件给其它连接（对应 broadcastExcept）
     pub fn broadcast_except(&self, event: &Value, except_id: u64) {
         let payload = event.to_string();

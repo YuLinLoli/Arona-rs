@@ -7,6 +7,10 @@ use std::path::Path;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct ConnectionConfig {
+    /// 连接类型（ws-forward / ws-reverse / http / http-reverse）；
+    /// 旧配置留空时回退用连接键名判断，便于一个类型配置多个实例
+    #[serde(default, rename = "type")]
+    pub connection_type: String,
     #[serde(default)]
     pub enable: bool,
     #[serde(default = "default_host")]
@@ -41,6 +45,7 @@ fn default_reconnect() -> u64 {
 impl Default for ConnectionConfig {
     fn default() -> Self {
         ConnectionConfig {
+            connection_type: String::new(),
             enable: false,
             host: default_host(),
             port: 0,
@@ -118,28 +123,69 @@ impl ConnectionType {
     }
 }
 
+/// 某种连接类型的默认配置
+pub fn default_connection(conn_type: ConnectionType) -> ConnectionConfig {
+    let mut conn = ConnectionConfig::default();
+    conn.connection_type = conn_type.key().to_string();
+    match conn_type {
+        ConnectionType::WebSocket => {
+            conn.host = "127.0.0.1".into();
+            conn.url = "ws://127.0.0.1:6700".into();
+        }
+        ConnectionType::WebSocketReverse => {
+            conn.port = 6701;
+            conn.path = "/onebot/v11".into();
+        }
+        ConnectionType::Http => {
+            conn.port = 5700;
+            conn.path = "/".into();
+        }
+        ConnectionType::HttpReverse => {
+            conn.url = "http://127.0.0.1:5701/onebot".into();
+        }
+    }
+    conn
+}
+
+impl ConnectionConfig {
+    /// 连接类型：优先取本项的 type 字段，缺省回退到连接键名（兼容旧配置）
+    pub fn resolve_type(&self, key: &str) -> Result<ConnectionType, String> {
+        let name = self.connection_type.trim();
+        let name = if name.is_empty() { key } else { name };
+        ConnectionType::from_name(name)
+    }
+
+    /// 展示用地址
+    pub fn address(&self, conn_type: ConnectionType) -> String {
+        match conn_type {
+            ConnectionType::WebSocket | ConnectionType::HttpReverse => self.url.clone(),
+            _ => format!("{}:{}{}", self.host, self.port, self.path),
+        }
+    }
+}
+
+impl OneBotConfig {
+    /// 生成不冲突的连接键名：ws-forward、ws-forward-2、ws-forward-3 ...
+    pub fn unique_connection_key(&self, base: &str) -> String {
+        if !self.connections.contains_key(base) {
+            return base.to_string();
+        }
+        for index in 2..1000 {
+            let candidate = format!("{base}-{index}");
+            if !self.connections.contains_key(&candidate) {
+                return candidate;
+            }
+        }
+        format!("{base}-{}", chrono::Utc::now().timestamp())
+    }
+}
+
 impl Default for OneBotConfig {
     fn default() -> Self {
         let mut connections = BTreeMap::new();
-        let mut ws_forward = ConnectionConfig::default();
-        ws_forward.host = "127.0.0.1".into();
-        ws_forward.url = "ws://127.0.0.1:6700".into();
-        connections.insert("ws-forward".into(), ws_forward);
-
-        let mut ws_reverse = ConnectionConfig::default();
-        ws_reverse.port = 6701;
-        ws_reverse.path = "/onebot/v11".into();
-        connections.insert("ws-reverse".into(), ws_reverse);
-
-        let mut http = ConnectionConfig::default();
-        http.port = 5700;
-        http.path = "/".into();
-        connections.insert("http".into(), http);
-
-        let mut http_reverse = ConnectionConfig::default();
-        http_reverse.url = "http://127.0.0.1:5701/onebot".into();
-        connections.insert("http-reverse".into(), http_reverse);
-
+        for conn_type in ConnectionType::all() {
+            connections.insert(conn_type.key().to_string(), default_connection(conn_type));
+        }
         OneBotConfig {
             self_id: 0,
             nickname: default_nickname(),
@@ -226,6 +272,7 @@ fn connection_block(key: &str, conn: &ConnectionConfig, comment: &str) -> String
     let mut out = String::new();
     out.push_str(&format!("  # {comment}\n"));
     out.push_str(&format!("  {key}:\n"));
+    out.push_str(&format!("    type: {}\n", conn.connection_type));
     out.push_str(&format!("    enable: {}\n", conn.enable));
     out.push_str(&format!("    host: \"{}\"\n", conn.host));
     out.push_str(&format!("    port: {}\n", conn.port));
@@ -248,8 +295,9 @@ fn template(config: &OneBotConfig) -> String {
     let mut out = String::new();
     out.push_str("# ==================== Arona OneBot 配置文件 ====================\n");
     out.push_str("# Rust 移植版（arona-rs）独立运行模式使用本文件。\n");
-    out.push_str("# 文件位置：与可执行文件同级的 arona-standalone/onebot.yml，修改后重启生效。\n");
-    out.push_str("# 连接类型由键名区分：ws-forward / ws-reverse / http / http-reverse。\n\n");
+    out.push_str("# 文件位置：与可执行文件同级的 arona-standalone/onebot.yml，保存后热重载生效。\n");
+    out.push_str("# 每个连接的 type 取值：ws-forward / ws-reverse / http / http-reverse；\n");
+    out.push_str("# 同一类型可以配置多个实例（键名任意，例如 ws-reverse-2）。\n\n");
     out.push_str(&format!(
         "# 机器人 QQ 号，用于 get_login_info 等 API 的返回\nself_id: {}\n",
         config.self_id
@@ -259,18 +307,24 @@ fn template(config: &OneBotConfig) -> String {
         config.nickname
     ));
     out.push_str("\nconnections:\n");
+    // 配置里的全部连接 + 四种标准连接（缺失时补默认值）
+    let mut connections = config.connections.clone();
     for conn_type in ConnectionType::all() {
-        let key = conn_type.key();
-        let conn = config.connections.get(key).cloned().unwrap_or_default();
-        let comment = match conn_type {
-            ConnectionType::WebSocket => "正向 WebSocket：主动连接 OneBot 实现（填写 url）",
-            ConnectionType::WebSocketReverse => {
+        connections
+            .entry(conn_type.key().to_string())
+            .or_insert_with(|| default_connection(conn_type));
+    }
+    for (key, conn) in &connections {
+        let comment = match conn.resolve_type(key) {
+            Ok(ConnectionType::WebSocket) => "正向 WebSocket：主动连接 OneBot 实现（填写 url）",
+            Ok(ConnectionType::WebSocketReverse) => {
                 "反向 WebSocket：监听端口等待 OneBot 实现连接（填写 host/port/path）"
             }
-            ConnectionType::Http => "正向 HTTP：开放 API 端口，供 OneBot 实现调用",
-            ConnectionType::HttpReverse => "反向 HTTP：主动向 url 推送动作（不支持接收事件）",
+            Ok(ConnectionType::Http) => "正向 HTTP：开放 API 端口，供 OneBot 实现调用",
+            Ok(ConnectionType::HttpReverse) => "反向 HTTP：主动向 url 推送动作（不支持接收事件）",
+            Err(_) => "自定义连接（type 字段无效）",
         };
-        out.push_str(&connection_block(key, &conn, comment));
+        out.push_str(&connection_block(key, conn, comment));
         out.push('\n');
     }
     out

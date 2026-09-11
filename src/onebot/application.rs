@@ -1,4 +1,5 @@
 //! OneBot 应用（对应原版 OneBotApplication）
+//! 支持热重载：修改 onebot.yml 后调用 reload 会停止全部连接/服务并按新配置重新启动。
 use crate::config::onebot::{ConnectionConfig, ConnectionType, OneBotConfig};
 use crate::onebot::business::StandaloneBusinessHandler;
 use crate::onebot::connection::{ConnectionCore, ConnectionRegistry, OneBotConnection};
@@ -6,10 +7,11 @@ use crate::onebot::http_api::HttpApiServer;
 use crate::onebot::http_reverse::{HttpReverseConnection, HttpReverseState};
 use crate::onebot::ws_forward::{RunState, WsForwardConnection};
 use crate::onebot::ws_reverse::{WsReverseConnection, WsReverseState};
-use std::sync::{Arc, Mutex};
+use once_cell::sync::OnceCell;
+use std::sync::{Arc, Mutex, RwLock};
 
 pub struct OneBotApplication {
-    pub config: OneBotConfig,
+    config: RwLock<OneBotConfig>,
     pub business: Arc<StandaloneBusinessHandler>,
     pub registry: Arc<ConnectionRegistry>,
     connections: Mutex<Vec<Arc<dyn OneBotConnection>>>,
@@ -23,7 +25,7 @@ impl OneBotApplication {
         registry: Arc<ConnectionRegistry>,
     ) -> OneBotApplication {
         OneBotApplication {
-            config,
+            config: RwLock::new(config),
             business,
             registry,
             connections: Mutex::new(Vec::new()),
@@ -31,28 +33,30 @@ impl OneBotApplication {
         }
     }
 
+    /// 当前 OneBot 配置快照
+    pub fn config(&self) -> OneBotConfig {
+        self.config.read().unwrap().clone()
+    }
+
     pub fn start(&self) {
         let enabled: Vec<(String, ConnectionConfig)> = self
-            .config
+            .config()
             .connections
             .iter()
             .filter(|(_, conn)| conn.enable)
             .map(|(name, conn)| (name.clone(), conn.clone()))
             .collect();
         for (name, endpoint) in enabled {
-            let conn_type = match ConnectionType::from_name(&name) {
+            let conn_type = match endpoint.resolve_type(&name) {
                 Ok(t) => t,
                 Err(err) => {
                     crate::runtime::log::warning(format!("[OneBot] 连接 {name} 类型无效: {err}"));
                     continue;
                 }
             };
-            let address = match conn_type {
-                ConnectionType::WebSocket | ConnectionType::HttpReverse => endpoint.url.clone(),
-                _ => format!("{}:{}{}", endpoint.host, endpoint.port, endpoint.path),
-            };
+            let address = endpoint.address(conn_type);
             crate::runtime::log::info(format!(
-                "[OneBot] 启动连接 {}: {address}",
+                "[OneBot] 启动连接 {} ({name}): {address}",
                 conn_type.display_name()
             ));
             match conn_type {
@@ -96,20 +100,51 @@ impl OneBotApplication {
         }
     }
 
+    /// 停止全部连接与 HTTP 服务，并清空注册表
     pub fn stop(&self) {
-        let connections = self.connections.lock().unwrap();
+        let connections: Vec<Arc<dyn OneBotConnection>> = {
+            let mut guard = self.connections.lock().unwrap();
+            std::mem::take(&mut *guard)
+        };
         for connection in connections.iter() {
             connection.stop();
         }
-        drop(connections);
-        let http_servers = self.http_servers.lock().unwrap();
-        for server in http_servers.iter() {
+        let servers: Vec<Arc<HttpApiServer>> = {
+            let mut guard = self.http_servers.lock().unwrap();
+            std::mem::take(&mut *guard)
+        };
+        for server in servers.iter() {
             server.stop();
         }
+        self.registry.clear();
+    }
+
+    /// 热重载：按新配置重启全部连接（必须在 tokio 运行期内调用）
+    pub fn reload(&self, new_config: OneBotConfig) {
+        crate::runtime::log::info("[OneBot] 正在应用新配置（热重载连接）...");
+        self.stop();
+        {
+            let mut guard = self.config.write().unwrap();
+            *guard = new_config.clone();
+        }
+        self.business.update_config(new_config.clone());
+        self.start();
+        crate::runtime::log::info("[OneBot] 连接热重载完成");
     }
 
     /// 当前首个可用连接（对应 firstConnection）
     pub fn first_connection(&self) -> Option<Arc<dyn OneBotConnection>> {
         self.registry.first()
     }
+}
+
+/// 全局 OneBot 应用句柄（GUI 管理面板与热重载使用）
+static GLOBAL: OnceCell<Arc<OneBotApplication>> = OnceCell::new();
+
+pub fn set_global(application: Arc<OneBotApplication>) {
+    let _ = GLOBAL.set(application);
+}
+
+pub fn global() -> Option<Arc<OneBotApplication>> {
+    GLOBAL.get().cloned()
 }

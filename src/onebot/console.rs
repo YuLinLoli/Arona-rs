@@ -16,13 +16,22 @@ const BANNER: [&str; 6] = [
 ];
 
 pub fn print_banner(version: &str) {
-    let mut lines: Vec<String> = BANNER.iter().map(|s| s.to_string()).collect();
-    let last = lines.last_mut().unwrap();
-    last.push_str("     v");
-    last.push_str(version);
-    let text = lines.join("\n");
     // 原版 OneBotConsole.printBanner: 启动横幅统一黄色(33)
-    color::print_colored_line(color::Color::Yellow, &text);
+    // 整批一次性输出：横幅在 GUI 主线程与后台机器人线程之间不会被日志行切开而错位；
+    // 同时每行仍单独进入 GUI「实时日志」，等宽艺术字在日志选项卡里也不会被折成一行
+    let last_index = BANNER.len() - 1;
+    let lines: Vec<String> = BANNER
+        .iter()
+        .enumerate()
+        .map(|(index, line)| {
+            if index == last_index {
+                format!("{line}     v{version}")
+            } else {
+                (*line).to_string()
+            }
+        })
+        .collect();
+    color::print_colored_lines(color::Color::Yellow, &lines);
 }
 
 pub fn emoji_supported() -> bool {
@@ -128,7 +137,7 @@ pub fn format_message(self_id: i64, event: &OneBotEvent, group_name: Option<&str
 }
 
 pub fn print_message(self_id: i64, event: &OneBotEvent, group_name: Option<&str>) {
-    println!("{}", format_message(self_id, event, group_name));
+    color::print_rule_line(&format_message(self_id, event, group_name));
 }
 
 fn format_segment(segment: &MessageSegment) -> String {
@@ -166,8 +175,8 @@ pub fn print_outgoing(self_id: i64, target: MessageTarget, message: &OutgoingMes
 }
 
 pub fn print_notice(self_id: i64, text: &str) {
-    println!(
+    color::print_rule_line(&format!(
         "{} V/Bot.{self_id}: {text}",
         Local::now().format("%Y-%m-%d %H:%M:%S")
-    );
+    ));
 }
