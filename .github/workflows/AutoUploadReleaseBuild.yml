@@ -5,9 +5,10 @@
 #   1. 改 Cargo.toml 里的 version (例如 0.2.2)
 #   2. git tag v0.2.2 && git push origin v0.2.2
 #   3. Actions 自动构建 -> 上传工件 -> 创建 Release
-#      产物: arona-rs.exe（单文件, 主程序不带版本号, 便于覆盖升级）
-#            arona-rs-0.2.2-win-x64.zip（便携版, 含 softgl/, 带版本号）
+#      产物: arona-rs-0.2.2-win-x64.zip（便携版, 内含 arona-rs.exe + softgl/, 带版本号）
 #            arona-rs-0.2.2-setup-win-x64.exe（安装包, 含程序介绍与 AGPLv3 全文）
+#      裸 exe 不上传: 要单文件就用安装包（或自己解压 zip）, 这样 Release 里不会有
+#      名字相同、无法区分版本的 arona-rs.exe
 # 也可以在 Actions 页面手动 Run workflow（手动触发时跳过版本校验、只构建不发布）。
 name: AutoUploadReleaseBuild
 
@@ -137,13 +138,12 @@ jobs:
           if (-not (Test-Path $setup)) { Write-Error "未找到安装包 $setup"; exit 1 }
           "SETUP_PATH=$setup" >> $env:GITHUB_ENV
 
-      # 上传工件: 单文件 exe + 便携 zip + 安装包
+      # 上传工件: 便携 zip + 安装包（裸 exe 只用于打包 zip/安装包，不单独上传）
       - name: Upload-Artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.ARTIFACT_NAME }}
           path: |
-            ${{ env.ARTIFACT_PATH }}
             ${{ env.ZIP_PATH }}
             ${{ env.SETUP_PATH }}
           compression-level: 0

@@ -93,8 +93,8 @@ HKEY_CURRENT_USER\Software\YuLinLoli\Arona-rs      # 选「为所有用户安装
 
 ### 方式二：便携版
 
-1. 从 [Releases](https://github.com/YuLinLoli/Arona-rs/releases) 下载 `arona-rs.exe`（单文件，**名字不带版本号**）
-   或 `arona-rs-<版本号>-win-x64.zip`（`arona-rs.exe` + `softgl/`）。
+1. 从 [Releases](https://github.com/YuLinLoli/Arona-rs/releases) 下载 `arona-rs-<版本号>-win-x64.zip`
+   解压（里面是 `arona-rs.exe` 与 `softgl/`；裸 exe 不再单独发布，需要单文件就用安装包）。
 2. 在你想作为数据目录的位置运行一次，会在**当前工作目录**下自动生成 `arona-standalone/`（`arona.yml`、`onebot.yml`、`data/`、`logs/`、`images/`、`backups/`）。
 3. 编辑 `onebot.yml` 填机器人账号和连接方式，编辑 `arona.yml` 填服务群和管理员。
 4. 重新启动。
@@ -221,13 +221,15 @@ pwsh -File scripts/make-icon.ps1     # 从 assets/source 的立绘取上半部�
 ```
 
 找不到 `rc.exe` 时只输出 `cargo:warning`，不影响编译（产物只是没有图标）；非 Windows 目标自动跳过。
-推送 `v*` 标签会触发 [`.github/workflows/AutoUploadReleaseBuild.yml`](.github/workflows/AutoUploadReleaseBuild.yml)：在 Windows 上跑测试、拉取 `softgl`、构建主程序 exe，再用 Inno Setup 编译安装包，最终发布三样东西并自动创建 GitHub Release：
+推送 `v*` 标签会触发 [`.github/workflows/AutoUploadReleaseBuild.yml`](.github/workflows/AutoUploadReleaseBuild.yml)：在 Windows 上跑测试、拉取 `softgl`、构建主程序 exe，再用 Inno Setup 编译安装包，最终发布两样东西并自动创建 GitHub Release：
 
 | 产物 | 说明 |
 | --- | --- |
-| `arona-rs.exe` | 单文件裸 exe（主程序固定不带版本号） |
-| `arona-rs-<版本号>-win-x64.zip` | 便携版：`arona-rs.exe` + `softgl/` |
+| `arona-rs-<版本号>-win-x64.zip` | 便携版：`arona-rs.exe`（主程序固定不带版本号）+ `softgl/` |
 | `arona-rs-<版本号>-setup-win-x64.exe` | 安装包：程序介绍 + AGPLv3 全文 + 默认配置 + 可选 `softgl/` 组件 |
+
+裸 `arona-rs.exe` 只是构建中间产物（本地 `cargo dist` 产出、安装包与 zip 都从它取材），
+不再单独上传到 Release——否则 Release 里会躺着一个不带版本号、下载下来分不清版本的 exe。
 
 ## 自检
 
