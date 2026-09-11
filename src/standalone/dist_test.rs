@@ -130,13 +130,23 @@ fn installer_build() {
     });
     println!("[installer] 使用 Inno Setup: {}", iscc.display());
 
+    // ISCC 必须在 installer/ 目录下运行：.iss 里的 Source: "intro.txt" 都是相对路径。
+    // 这个目录曾经漏提交过（没被 .gitignore 忽略，只是没 git add），CI 干净检出里没有它，
+    // 结果 Command 只报一句难懂的 "The directory name is invalid"，这里先给出明确原因。
+    let installer_dir = root.join("installer");
+    assert!(
+        installer_dir.join("arona-rs.iss").is_file(),
+        "找不到安装包脚本 {}：installer/ 必须一起提交到仓库（git add installer）",
+        installer_dir.display()
+    );
+
     // 宏值里可能有空格，Command 会自动加引号
     let mut command = Command::new(&iscc);
     command
         .arg(format!("/DAppVersion={version}"))
         .arg(format!("/DAppSourceDir={}", release_dir.display()))
         .arg(format!("/DOutputDir={}", release_dir.display()))
-        .current_dir(root.join("installer"));
+        .current_dir(&installer_dir);
     if has_softgl {
         command.arg("/DHasSoftgl=1");
     }

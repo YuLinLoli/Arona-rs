@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  Arona-rs 应用程序清单：随 exe 一起嵌入（build.rs 里作为 RT_MANIFEST 资源编译进 .res）。
+
+  requestedExecutionLevel = asInvoker
+    这里故意保持 asInvoker，不要求系统在启动时强制提权。原因见 src/runtime/elevate.rs：
+    这份资源是通过 cargo:rustc-link-arg-bins 挂到 bin 目标上的，而 cargo 的测试运行器
+    也从同一个 bin 目标构建，一旦声明为强制管理员权限，测试进程会一起要求提权，
+    cargo test 就跑不起来了。管理员权限改在运行期申请，效果一样是启动即弹 UAC。
+
+  compatibility/supportedOS
+    告诉 Windows 本程序支持这些系统；不写的话系统会把进程当成老版本 Windows，
+    影响 GetVersionEx 之类的能力探测。
+
+  longPathAware
+    允许超过 260 字符的路径。
+-->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <assemblyIdentity type="win32" name="YuLinLoli.Arona-rs" version="1.0.0.0" processorArchitecture="*"/>
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>
+      <supportedOS Id="{1f676c76-80e1-4239-95bb-83d0f6d0da78}"/>
+      <supportedOS Id="{4a2f28e3-53b9-4441-ba9c-d69d4a4a6e38}"/>
+      <supportedOS Id="{35138b9a-5d96-4fbd-8e2d-a2440225f93a}"/>
+    </application>
+  </compatibility>
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>
+    </windowsSettings>
+  </application>
+</assembly>

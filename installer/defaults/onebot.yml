@@ -1,0 +1,54 @@
+# ==================== Arona OneBot 配置文件 ====================
+# Rust 移植版（arona-rs）独立运行模式使用本文件。
+# 文件位置：与可执行文件同级的 arona-standalone/onebot.yml，修改后重启生效。
+# 连接类型由键名区分：ws-forward / ws-reverse / http / http-reverse。
+
+# 机器人 QQ 号，用于 get_login_info 等 API 的返回
+self_id: 0
+# 机器人昵称
+nickname: "Arona"
+
+connections:
+  # 正向 WebSocket：主动连接 OneBot 实现（填写 url）
+  ws-forward:
+    enable: false
+    host: "127.0.0.1"
+    port: 0
+    url: "ws://127.0.0.1:6700"
+    path: "/"
+    token: ""
+    heartbeat_interval: 30000
+    reconnect_interval: 5000
+
+  # 反向 WebSocket：监听端口等待 OneBot 实现连接（填写 host/port/path）
+  ws-reverse:
+    enable: false
+    host: "0.0.0.0"
+    port: 6701
+    url: ""
+    path: "/onebot/v11"
+    token: ""
+    heartbeat_interval: 30000
+    reconnect_interval: 5000
+
+  # 正向 HTTP：开放 API 端口，供 OneBot 实现调用
+  http:
+    enable: false
+    host: "0.0.0.0"
+    port: 5700
+    url: ""
+    path: "/"
+    token: ""
+    heartbeat_interval: 30000
+    reconnect_interval: 5000
+
+  # 反向 HTTP：主动向 url 推送动作（不支持接收事件）
+  http-reverse:
+    enable: false
+    host: "0.0.0.0"
+    port: 0
+    url: "http://127.0.0.1:5701/onebot"
+    path: "/"
+    token: ""
+    heartbeat_interval: 30000
+    reconnect_interval: 5000

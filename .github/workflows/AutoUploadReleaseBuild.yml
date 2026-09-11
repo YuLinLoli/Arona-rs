@@ -28,6 +28,27 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # 打包阶段要用 installer/ 里的脚本与文案，构建阶段要用 assets/ 里的图标与清单。
+      # 这些文件曾经漏提交过，CI 上只会得到一句 "The directory name is invalid"，
+      # 所以这里先检查一遍，失败信息更直白。
+      - name: Check required files
+        shell: pwsh
+        run: |
+          $required = @(
+            'installer/arona-rs.iss',
+            'installer/intro.txt',
+            'installer/defaults',
+            'installer/languages',
+            'assets/arona.ico',
+            'assets/arona.manifest'
+          )
+          $missing = @($required | Where-Object { -not (Test-Path $_) })
+          if ($missing.Count -gt 0) {
+            Write-Error "仓库缺少以下必需文件（记得 git add 后提交）: $($missing -join ', ')"
+            exit 1
+          }
+          Write-Host "必需文件检查通过"
+
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
 
