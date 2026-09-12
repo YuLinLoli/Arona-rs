@@ -1,12 +1,21 @@
 # ==================== Arona OneBot 配置文件 ====================
 # Rust 移植版（arona-rs）独立运行模式使用本文件。
 # 文件位置：与可执行文件同级的 arona-standalone/onebot.yml，修改后重启生效。
-# 连接类型由键名区分：ws-forward / ws-reverse / http / http-reverse。
+# 连接类型由连接项里的 type 字段决定：ws-forward / ws-reverse / http / http-reverse。
+# 键名任意（例如 ws-reverse-2），同一类型可以配置多个实例。
 
 # 机器人 QQ 号，用于 get_login_info 等 API 的返回
 self_id: 0
 # 机器人昵称
 nickname: "Arona"
+
+# ==================== 消息发送 ====================
+# 本地图片(抽卡结果图/活动日历/攻略图等)是否改用 file:// 路径直传 OneBot 实现。
+# 开启后上行消息不再内嵌十几 MB 的 base64，发送更快；图片按原始文件上传，不做任何压缩。
+# 注意：仅当 OneBot 实现(如 NapCat)与机器人部署在同一台机器/可直接访问相同磁盘时才能开启，
+#       跨机器/容器部署开启会导致图片发不出去。默认 false(内嵌 base64, 兼容所有部署方式)。
+# 也可以在管理面板「OneBot 连接」页的「发送设置」里勾选，勾选后立即写盘并热生效。
+send_image_as_file: false
 
 connections:
   # 正向 WebSocket：主动连接 OneBot 实现（填写 url）

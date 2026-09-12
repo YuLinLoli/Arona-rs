@@ -72,7 +72,7 @@ fn do_restore(zip_file: &Path, temp_dir: &Path, name: &str) -> OutgoingMessage {
     if let Err(err) = restore_data_dir(&temp_dir.join("data")) {
         return fail_restore(format!("恢复数据目录失败: {err}"));
     }
-    config::standalone::init(arona_file);
+    let _ = config::standalone::init(arona_file);
     let _ = db::start();
     let _ = quartz::resume_all();
     let notice = if restored_onebot.is_file() {

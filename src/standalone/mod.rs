@@ -7,6 +7,8 @@ pub mod dispatcher;
 mod dist_test;
 
 #[cfg(test)]
+mod onebot_print_test;
+#[cfg(test)]
 mod ten_pull_test;
 
 #[cfg(test)]

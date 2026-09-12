@@ -113,7 +113,7 @@ async fn push_server(server: ServerLocale, prefix: &str, targets: &[i64]) {
             return;
         }
     };
-    let message = match crate::image::activity::render(&pair, server) {
+    let message = match crate::image::activity::render_async(pair.clone(), server).await {
         Ok(file) => {
             OutgoingMessage::text(format!("{prefix}\n"))
                 + OutgoingMessage::image_file(file.to_string_lossy())
@@ -443,7 +443,7 @@ mod tests {
     #[tokio::test]
     async fn notify_logic_plan_and_alerts() {
         crate::runtime::config::set_bot_id(10000);
-        crate::config::standalone::init(write_test_config());
+        crate::config::standalone::init(write_test_config()).expect("测试配置应能加载");
         let sender = Arc::new(CaptureSender::new());
         crate::runtime::services::set_message_sender(sender.clone());
 
@@ -610,7 +610,7 @@ mod tests {
     #[tokio::test]
     async fn notify_daily_push_network() {
         crate::runtime::config::set_bot_id(10000);
-        crate::config::standalone::init(write_test_config());
+        crate::config::standalone::init(write_test_config()).expect("测试配置应能加载");
         let sender = Arc::new(CaptureSender::new());
         crate::runtime::services::set_message_sender(sender.clone());
 

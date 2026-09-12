@@ -188,10 +188,43 @@ pub fn load(file: &Path) -> Result<AronaConfig, String> {
     parse(file)
 }
 
+/// arona.yml 允许出现的顶层键，其它键一律提示（避免写错后静默失效）
+const KNOWN_TOP_KEYS: [&str; 6] = [
+    "groups",
+    "managers",
+    "notify",
+    "trainer",
+    "global_blacklist",
+    "group_settings",
+];
+
+/// 曾经写在 arona.yml、现已迁到 onebot.yml 的键：单独提示，避免和普通笔误混在一条日志里
+const MOVED_TOP_KEYS: [&str; 1] = ["send_image_as_file"];
+
 fn parse(file: &Path) -> Result<AronaConfig, String> {
     let text = read_text(file).map_err(|e| format!("读取 {} 失败: {e}", file.display()))?;
-    serde_yaml::from_str(&text)
-        .map_err(|e| format!("arona.yml 解析失败，请检查格式（参考同目录说明）: {e}"))
+    let value: serde_yaml::Value = serde_yaml::from_str(&text)
+        .map_err(|e| format!("arona.yml 解析失败，请检查格式（参考同目录说明）: {e}"))?;
+    // 未知顶层键：serde 默认静默忽略（例如把 onebot.yml 的 connections 写进本文件），
+    // 用户会以为配置生效了，这里逐个写进日志提示。
+    if let Some(map) = value.as_mapping() {
+        for key in map.keys() {
+            let Some(name) = key.as_str() else { continue };
+            if MOVED_TOP_KEYS.contains(&name) {
+                crate::runtime::log::warning(format!(
+                    "arona.yml 的「{name}」已移动到 onebot.yml（本项已忽略），请在 onebot.yml 里设置，或用管理面板「OneBot 连接」页的「发送设置」勾选"
+                ));
+            } else if !KNOWN_TOP_KEYS.contains(&name) {
+                crate::runtime::log::warning(format!(
+                    "arona.yml 存在无法识别的配置项「{name}」，已忽略；可用配置项: {}",
+                    KNOWN_TOP_KEYS.join(" / ")
+                ));
+            }
+        }
+    }
+    let config: AronaConfig = serde_yaml::from_value(value)
+        .map_err(|e| format!("arona.yml 解析失败，请检查格式（参考同目录说明）: {e}"))?;
+    Ok(config)
 }
 
 pub fn save(file: &Path, config: &AronaConfig) -> std::io::Result<()> {
@@ -319,6 +352,8 @@ fn template(config: &AronaConfig) -> String {
         }
     }
     out.push('\n');
+    out.push_str("# 提示: 本地图片的发送方式(send_image_as_file)属于 onebot.yml，在那里配置。\n");
+    out.push('\n');
     out.push_str("# ==================== 攻略(/攻略) ====================\n");
     out.push_str("trainer:\n");
     out.push_str(&format!(
@@ -347,4 +382,37 @@ fn template(config: &AronaConfig) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 回归：不认识的顶层键只记日志、不报错（例如把 onebot.yml 的 connections 写进 arona.yml），
+    /// 一个笔误不该让程序起不来。
+    #[test]
+    fn unknown_top_level_keys_are_ignored() {
+        let file = std::env::temp_dir().join("arona-arona-parse-test.yml");
+        std::fs::write(
+            &file,
+            "groups: [10001]\nconnections:\n  ws-forward:\n    enable: false\nmanagers: [20002]\n",
+        )
+        .expect("写入测试配置失败");
+        let config = load(&file).expect("未知顶层键不应导致加载失败");
+        assert_eq!(config.groups, vec![10001]);
+        assert_eq!(config.managers, vec![20002]);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    /// 回归：send_image_as_file 已经搬到 onebot.yml，旧 arona.yml 里残留的写法
+    /// 只提示、不报错，也不该让程序起不来
+    #[test]
+    fn moved_send_image_as_file_key_is_tolerated() {
+        let file = std::env::temp_dir().join("arona-arona-parse-test2.yml");
+        std::fs::write(&file, "send_image_as_file: true\ngroups: [10001]\n")
+            .expect("写入测试配置失败");
+        let config = load(&file).expect("已迁移的旧键不应导致加载失败");
+        assert_eq!(config.groups, vec![10001]);
+        let _ = std::fs::remove_file(&file);
+    }
 }

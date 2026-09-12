@@ -139,25 +139,42 @@ async fn send_forward(
             echo: protocol::new_echo(),
         })
         .await;
-    let ok = response.as_ref().map(|r| r.success()).unwrap_or(false);
-    if ok {
-        let message_id = response
-            .and_then(|r| r.data)
-            .and_then(|d| d.as_object().cloned())
-            .and_then(|o| o.get("message_id").cloned())
-            .and_then(|v| v.as_i64());
-        return MessageReceipt { message_id };
+    // 合并转发节点常含大图 base64，实现端上传处理可能超过 15 秒才响应；
+    // 只有实现端明确报错才降级为平铺发送，超时/异步受理时转发往往已实际发出，再发会重复
+    match response {
+        Some(response) if response.success() => {
+            let message_id = response
+                .data
+                .and_then(|d| d.as_object().cloned())
+                .and_then(|o| o.get("message_id").cloned())
+                .and_then(|v| v.as_i64());
+            MessageReceipt { message_id }
+        }
+        // retcode=1 / status=async：已提交处理，消息会随后发出
+        Some(response) if response.async_accepted() => MessageReceipt { message_id: None },
+        Some(response) => {
+            crate::runtime::log::warning(format!(
+                "发送合并转发失败(status={}, retcode={})，降级为平铺消息重发",
+                response.status, response.retcode
+            ));
+            let flat_segments: Vec<MessageSegment> = messages
+                .iter()
+                .flat_map(|node| node.content.clone())
+                .collect();
+            let flat = OutgoingMessage {
+                segments: flat_segments,
+                revoke_after_millis: None,
+            };
+            send_normal(connection, target, &flat).await
+        }
+        // 超时/连接中断：无法确认转发是否已发出，不能再平铺重发一遍
+        None => {
+            crate::runtime::log::warning(
+                "发送合并转发后未收到响应(可能超时)，为避免重复消息不再平铺重发",
+            );
+            MessageReceipt { message_id: None }
+        }
     }
-    // 降级：平铺节点内容作为普通消息发送
-    let flat_segments: Vec<MessageSegment> = messages
-        .iter()
-        .flat_map(|node| node.content.clone())
-        .collect();
-    let flat = OutgoingMessage {
-        segments: flat_segments,
-        revoke_after_millis: None,
-    };
-    send_normal(connection, target, &flat).await
 }
 
 fn schedule_revoke(

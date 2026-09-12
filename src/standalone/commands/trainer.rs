@@ -302,13 +302,20 @@ async fn gacha_pool_forward(server: GachaServer) -> OutgoingMessage {
     let image_dir = crate::runtime::paths::images_root()
         .join("gacha-pool")
         .join(server.display_name());
+    // 并行解析每个角色的卡池图：命中缓存直接用，未命中才下载
+    let image_dir_ref = &image_dir;
+    let images: Vec<Option<PathBuf>> = futures_util::future::join_all(characters.iter().map(
+        |character| async move {
+            match game_kee::find_cached_image(character.id, image_dir_ref) {
+                Some(path) => Some(path),
+                None => game_kee::download_character_image(character, image_dir_ref).await,
+            }
+        },
+    ))
+    .await;
     let uin = runtime_config::bot_id();
     let mut nodes: Vec<ForwardMessage> = Vec::new();
-    for character in &characters {
-        let image_file = match game_kee::find_cached_image(character.id, &image_dir) {
-            Some(path) => Some(path),
-            None => game_kee::download_character_image(character, &image_dir).await,
-        };
+    for (character, image_file) in characters.iter().zip(images) {
         let mut content: Vec<MessageSegment> = Vec::new();
         if let Some(path) = image_file {
             content.push(image_segment(&path));

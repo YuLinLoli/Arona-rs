@@ -53,7 +53,12 @@ pub fn message_to_json(message: &OutgoingMessage) -> Value {
                     let encoded = base64::engine::general_purpose::STANDARD.encode(data);
                     value = format!("base64://{encoded}");
                 } else if let Some(file) = file {
-                    if let Ok(bytes) = std::fs::read(file) {
+                    // 同机部署时可配置直传 file:// 路径：免去大图 base64，实现端按原始文件上传不压缩
+                    if crate::runtime::config::send_image_as_file()
+                        && std::path::Path::new(file).is_file()
+                    {
+                        value = local_file_uri(file);
+                    } else if let Ok(bytes) = std::fs::read(file) {
                         use base64::Engine;
                         let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
                         value = format!("base64://{encoded}");
@@ -66,6 +71,32 @@ pub fn message_to_json(message: &OutgoingMessage) -> Value {
         }
     }
     Value::Array(segments)
+}
+
+/// 本地路径转 file:// URI：`\` 归一为 `/`，非安全字节按 UTF-8 百分号编码（含中文路径）。
+/// 盘符冒号保持原样（file:///C:/... 为 RFC 8089 标准形式，实现端兼容性最好）
+fn local_file_uri(path: &str) -> String {
+    let normalized = path.replace('\\', "/");
+    // 绝对路径自带前导 /（Linux），盘符路径(C:/)则补第三条斜杠
+    let mut uri = if normalized.starts_with('/') {
+        String::from("file://")
+    } else {
+        String::from("file:///")
+    };
+    for (index, part) in normalized.split('/').enumerate() {
+        if index > 0 {
+            uri.push('/');
+        }
+        for byte in part.as_bytes() {
+            match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b':' => {
+                    uri.push(*byte as char)
+                }
+                other => uri.push_str(&format!("%{other:02X}")),
+            }
+        }
+    }
+    uri
 }
 
 pub fn format_face(id: Option<&str>) -> String {
@@ -321,4 +352,33 @@ pub fn forward_messages_to_json(messages: &[ForwardMessage]) -> Value {
         })
         .collect();
     Value::Array(nodes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::local_file_uri;
+
+    #[test]
+    fn local_file_uri_encodes_windows_path() {
+        assert_eq!(
+            local_file_uri("C:\\Users\\cheng\\images\\a b.png"),
+            "file:///C:/Users/cheng/images/a%20b.png"
+        );
+    }
+
+    #[test]
+    fn local_file_uri_encodes_non_ascii() {
+        assert_eq!(
+            local_file_uri("D:\\arona\\images\\gacha-pool\\日服\\2980.webp"),
+            "file:///D:/arona/images/gacha-pool/%E6%97%A5%E6%9C%8D/2980.webp"
+        );
+    }
+
+    #[test]
+    fn local_file_uri_keeps_plain_unix_path() {
+        assert_eq!(
+            local_file_uri("/home/arona/images/1.png"),
+            "file:///home/arona/images/1.png"
+        );
+    }
 }

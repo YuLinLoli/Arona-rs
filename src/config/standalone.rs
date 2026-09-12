@@ -76,13 +76,16 @@ pub fn default_file() -> PathBuf {
     super::arona::default_file()
 }
 
-pub fn init(path: PathBuf) {
+/// 初始化业务配置并启动热重载监听。
+/// 返回 Err 表示 arona.yml 本身有问题（调用方负责提示用户，程序仍会按默认配置继续运行）
+pub fn init(path: PathBuf) -> Result<(), String> {
     {
         let mut st = state().write().unwrap();
         st.file = Some(path);
     }
-    reload();
+    let result = reload_inner();
     spawn_watcher();
+    result
 }
 
 /// 当前配置快照
@@ -179,25 +182,34 @@ fn expect_list(value: ConfigValue, key: &str) -> Result<Vec<i64>, String> {
     }
 }
 
-/// 重新从磁盘读取 arona.yml 并同步到运行期配置
+/// 重新从磁盘读取 arona.yml 并同步到运行期配置（热重载路径：失败只记日志、保留当前配置）
 pub fn reload() {
+    if let Err(err) = reload_inner() {
+        crate::runtime::log::warning(format!("arona.yml 热重载失败，保留当前配置: {err}"));
+    }
+}
+
+/// 重新读取并应用配置；返回 Err 表示文件有问题（此时不会改动运行期配置）
+fn reload_inner() -> Result<(), String> {
     let (path, current) = {
         let st = state().read().unwrap();
         (st.file.clone(), st.config.clone())
     };
-    let path = match path {
-        Some(p) => p,
-        None => return,
+    let Some(path) = path else {
+        return Ok(());
     };
-    let new_config = match super::arona::load(&path) {
-        Ok(c) => c,
-        Err(err) => {
-            crate::runtime::log::warning(format!("arona.yml 热重载失败，保留当前配置: {err}"));
-            return;
-        }
-    };
+    // 记下本次读到的修改时间：热重载监听据此判断文件是否又变了（少了这一步，启动后
+    // 监听的第一个 tick 会认为「从没见过这个文件」，把整份配置再重载一次）
+    let modified = std::fs::metadata(&path)
+        .ok()
+        .and_then(|meta| meta.modified().ok());
+    let new_config = super::arona::load(&path)?;
     let _ = current;
+    if let Some(modified) = modified {
+        state().write().unwrap().last_modified = Some(modified);
+    }
     apply(new_config);
+    Ok(())
 }
 
 /// 将配置同步到运行期（groups/managers/notify 与活动推送定时）
@@ -452,6 +464,7 @@ pub fn clear_group_setting(group_id: i64) -> Result<(), String> {
     config.group_settings.remove(&group_id.to_string());
     persist(&config)
 }
+
 
 /// 轮询监听 arona.yml 修改（每 2 秒），触发热重载
 fn spawn_watcher() {

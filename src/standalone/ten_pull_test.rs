@@ -44,6 +44,7 @@ async fn ten_pull_outputs_image_into_standalone() {
     let config = crate::config::onebot::OneBotConfig {
         self_id: 10000,
         nickname: "Arona".to_string(),
+        send_image_as_file: false,
         connections: std::collections::BTreeMap::new(),
     };
     let dispatcher = crate::standalone::dispatcher::build(config);

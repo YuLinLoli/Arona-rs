@@ -120,8 +120,10 @@ Root: HKA; Subkey: "{#RegSubKey}"; ValueType: string; ValueName: "UninstallStrin
 Root: HKA; Subkey: "{#RegSubKey}"; ValueType: dword;  ValueName: "SoftglInstalled"; ValueData: "{code:SoftglInstalledFlag}"
 
 [Files]
-; ---- 主程序：带版本号的 exe（与命令行版 cargo dist 的产物命名保持一致）----
-Source: "{#AppSourceDir}\{#AppExeName}"; DestDir: "{app}"; Flags: ignoreversion; Components: main
+; ---- 主程序 ----
+; restartreplace: 万一 exe 还被别的进程占着（Inno 删不掉旧文件时会在「重命名临时文件」
+; 一步报 MoveFile 183「文件已存在」），改为安排到下次重启替换，而不是直接中断安装
+Source: "{#AppSourceDir}\{#AppExeName}"; DestDir: "{app}"; Flags: ignoreversion restartreplace; Components: main
 ; ---- 协议与说明 ----
 Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion; Components: main
 Source: "..\LICENSE.zh-CN.md"; DestDir: "{app}"; Flags: ignoreversion; Components: main
@@ -135,7 +137,7 @@ Source: "defaults\trainer_config.yml"; DestDir: "{app}\arona-standalone"; Flags:
 ; ---- CPU 软件渲染依赖（大体积依赖与 exe 分开存储，安装时释放到 {app}\softgl）----
 ;      程序在 exe 同级目录寻找 softgl\，找不到就跳过软渲染，不影响机器人功能
 #ifdef HasSoftgl
-Source: "{#AppSourceDir}\softgl\*"; DestDir: "{app}\softgl"; Flags: ignoreversion recursesubdirs createallsubdirs; Components: softgl
+Source: "{#AppSourceDir}\softgl\*"; DestDir: "{app}\softgl"; Flags: ignoreversion restartreplace recursesubdirs createallsubdirs; Components: softgl
 #endif
 
 [Icons]
@@ -159,6 +161,8 @@ var
   IsUpdateInstall: Boolean;
   // 注册表里记录的旧安装目录
   RecordedDir: String;
+  // 安装前是否结束过正在运行的 Arona-rs（旧 exe / softgl 的 DLL 被占用时替换会失败）
+  KilledRunningApp: Boolean;
 
 // 命令行里是否出现某个参数（前缀匹配，大小写不敏感）：/UPDATE、/DIR=...、/SILENT ...
 function CmdLineParamExists(const Name: String): Boolean;
@@ -293,5 +297,123 @@ begin
         DelTree(DataDir, True, True, True);
       end;
     end;
+  end;
+end;
+
+// ============================ 安装前的“关闭正在运行的程序” ============================
+//
+// 为什么必须自己关：正在运行的 arona-rs.exe（以及它加载的 softgl\*.dll）会被 Windows
+// 以共享读方式占住，谁都删不掉也改不了名。Inno 处理这种情况的顺序是
+//   1) 删掉旧文件（删不掉时它只是重试 4 次，然后**默默放过**继续往下走）
+//   2) 把解压出来的临时文件改名成目标名
+// 第 2 步会因为目标文件还在而失败，弹出「MoveFile 失败；错误代码 183。当文件已存在时，
+// 无法创建该文件。」——用户看到的就是这个莫名其妙的报错。
+//
+// Inno 自带的 CloseApplications（Restart Manager）只认“有窗口/在交互会话里”的程序，
+// 命令行(--nogui)启动的机器人、或提权实例经常识别不到，所以这里自己结束进程。
+//
+// 另外，[Files] 上的 restartreplace 是最后一道兜底：万一还是没关掉，它会把替换安排到
+// 下次开机而不是直接中断安装；代价就是安装向导最后一步会出现「重启计算机」。
+// 正常路径下不应该走到那里（下面 StopRunningApp 会先验证 exe 能不能独占打开）。
+
+// 关程序的结果
+const
+  APP_NONE = 0;    // 安装目录里本来就没有正在运行的实例
+  APP_KILLED = 1;  // 找到并结束了正在运行的实例
+  APP_STUCK = 2;   // exe 仍被占用且结束不掉（多为提权实例 / 其它会话 / 权限不足）
+
+// 结束安装目录里正在运行的 Arona-rs（含它加载的 softgl\*.dll）。
+//
+// 为什么不能只用 Get-Process 的 .Path 过滤：主程序 arona-rs.exe 启动时会自己 UAC 提权，
+// 而未提权的安装程序读不到提权进程的 .Path（本机实测 286 个进程里 143 个读不到）。
+// 老逻辑于是得出「安装目录里没有正在运行的程序」，安装照常继续；等到写 exe 时文件仍被占用，
+// 而 [Files] 上带着 restartreplace，Inno 就把替换推迟到下次开机 —— 用户看到的就是最后一步
+// 莫名其妙要求「重启计算机」，而且重启前装上的其实还是旧版本。
+//
+// 所以这里分两轮：
+//   1) 先按 .Path 精确结束安装目录里的进程（不会误伤开发目录里的同名程序）
+//   2) 再用「独占打开 {app}\arona-rs.exe」验证是否真的没人占用；仍被占用时，
+//      才按镜像名结束「本会话」里的 arona-rs（覆盖读不到 .Path 的提权实例）
+function StopRunningApp(): Integer;
+var
+  ResultCode: Integer;
+  Script: String;
+begin
+  Script :=
+    '$ErrorActionPreference=''SilentlyContinue''; ' +
+    '$dir=''' + LowerCase(ExpandConstant('{app}')) + '''; ' +
+    '$exe=Join-Path $dir ''{#AppExeName}''; ' +
+    '$me=(Get-Process -Id $PID).SessionId; ' +
+    'function TestLocked { if (-not (Test-Path $exe)) { return $false }; ' +
+      'try { $f=[IO.File]::Open($exe,''Open'',''ReadWrite'',''None''); $f.Close(); return $false } ' +
+      'catch { return $true } }; ' +
+    '$killed=$false; ' +
+    '$targets=@(Get-Process | Where-Object { $_.Path -and $_.Path.ToLower().StartsWith($dir) }); ' +
+    'if ($targets.Count -gt 0) { $killed=$true; $targets | Stop-Process -Force; Start-Sleep -Milliseconds 800 }; ' +
+    'if (TestLocked) { $more=@(Get-Process -Name ''arona-rs'' | Where-Object { $_.SessionId -eq $me -and -not ($_.Path -and $_.Path.ToLower().StartsWith($dir)) }); ' +
+      'if ($more.Count -gt 0) { $killed=$true; $more | Stop-Process -Force; Start-Sleep -Milliseconds 800 } }; ' +
+    'if (TestLocked) { exit 2 } elseif ($killed) { exit 1 } else { exit 0 }';
+
+  if Exec('powershell.exe',
+          '-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "' + Script + '"',
+          '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+  begin
+    Log('检查/结束正在运行的 Arona-rs: 退出码 ' + IntToStr(ResultCode));
+    if ResultCode = 0 then
+      Result := APP_NONE
+    else if ResultCode = 1 then
+      Result := APP_KILLED
+    else
+      Result := APP_STUCK;
+  end
+  else
+  begin
+    // 没有 PowerShell（极少见）时退回按镜像名结束，尽力而为；128 = 没有找到进程
+    Log('PowerShell 不可用，改用 taskkill 结束 arona-rs.exe');
+    Exec('taskkill.exe', '/F /IM arona-rs.exe /T', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    if ResultCode = 128 then
+      Result := APP_NONE
+    else if ResultCode = 0 then
+      Result := APP_KILLED
+    else
+      Result := APP_STUCK;
+  end;
+end;
+
+// 安装真正开始前调用：返回空串继续安装，返回文字则把它显示给用户并停在这一步
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  Result := '';
+  KilledRunningApp := False;
+
+  if not DirExists(ExpandConstant('{app}')) then
+    Exit;
+
+  case StopRunningApp() of
+    APP_KILLED:
+      begin
+        KilledRunningApp := True;
+        Log('安装前已结束正在运行的 Arona-rs');
+      end;
+    APP_STUCK:
+      Result := '检测到 Arona-rs 正在运行，并且无法自动结束它。' + #13#10 + #13#10 +
+        '请先手动退出程序（包括命令行黑窗口），再点「上一步」→「下一步」重试；' + #13#10 +
+        '也可以右键安装包选「以管理员身份运行」后重装。' + #13#10 + #13#10 +
+        '直接继续的话，轻则报「MoveFile 失败；错误代码 183」，重则把文件替换推迟到下次开机、' + #13#10 +
+        '在最后一步要求你「重启计算机」——而重启之前装的仍然是旧版本。';
+  end;
+end;
+
+// 静默安装（/SILENT、/VERYSILENT，例如自动更新）时没有「完成」页可以勾「启动 Arona-rs」，
+// 而安装前又把正在跑的机器人关掉了，这里补一次自动重启，免得服务器上机器人停了没人发现
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  ResultCode: Integer;
+begin
+  if (CurStep = ssPostInstall) and KilledRunningApp and WizardSilent then
+  begin
+    Log('静默安装：自动重新启动 Arona-rs');
+    Exec(ExpandConstant('{app}\{#AppExeName}'), '', ExpandConstant('{app}'),
+         SW_SHOWNORMAL, ewNoWait, ResultCode);
   end;
 end;

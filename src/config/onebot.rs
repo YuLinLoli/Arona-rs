@@ -9,7 +9,7 @@ use std::path::Path;
 pub struct ConnectionConfig {
     /// 连接类型（ws-forward / ws-reverse / http / http-reverse）；
     /// 旧配置留空时回退用连接键名判断，便于一个类型配置多个实例
-    #[serde(default, rename = "type")]
+    #[serde(default, rename = "type", deserialize_with = "deserialize_connection_type")]
     pub connection_type: String,
     #[serde(default)]
     pub enable: bool,
@@ -27,6 +27,26 @@ pub struct ConnectionConfig {
     pub heartbeat_interval: u64,
     #[serde(default = "default_reconnect")]
     pub reconnect_interval: u64,
+}
+
+/// `type` 字段容错：缺失或空值(null)一律当空串，之后回退用连接键名判断类型。
+///
+/// 老版本模板/手工编辑会写出 `type:`（值为 null），严格按 `String` 解析会直接让整份
+/// onebot.yml 加载失败——表现就是启动时弹「配置错误」、程序起不来。
+fn deserialize_connection_type<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_yaml::Value>::deserialize(deserializer)?;
+    Ok(match value {
+        None | Some(serde_yaml::Value::Null) => String::new(),
+        Some(serde_yaml::Value::String(text)) => text,
+        // 顺手容错：写成数字/布尔等标量时按字面量处理，交给 resolve_type 报「类型未知」
+        Some(serde_yaml::Value::Number(number)) => number.to_string(),
+        Some(serde_yaml::Value::Bool(flag)) => flag.to_string(),
+        // 列表/映射等非法写法一律当空，回退用键名判断（避免把多行内容写回配置文件）
+        Some(_) => String::new(),
+    })
 }
 
 fn default_host() -> String {
@@ -65,6 +85,10 @@ pub struct OneBotConfig {
     pub self_id: i64,
     #[serde(default = "default_nickname")]
     pub nickname: String,
+    /// 本地图片(抽卡结果/活动日历/攻略图等)改用 `file://` 路径直传 OneBot 实现，不再内嵌 base64。
+    /// 仅当 OneBot 实现(如 NapCat)与机器人同机部署、能访问相同磁盘时开启；默认 false(内嵌 base64)。
+    #[serde(default)]
+    pub send_image_as_file: bool,
     #[serde(default)]
     pub connections: BTreeMap<String, ConnectionConfig>,
 }
@@ -189,6 +213,7 @@ impl Default for OneBotConfig {
         OneBotConfig {
             self_id: 0,
             nickname: default_nickname(),
+            send_image_as_file: false,
             connections,
         }
     }
@@ -206,6 +231,11 @@ fn write_text(path: &Path, content: &str) -> std::io::Result<()> {
     }
     std::fs::write(path, content)
 }
+
+/// onebot.yml 允许出现的顶层键，其它键一律提示（避免写错文件后静默失效）
+const KNOWN_TOP_KEYS: [&str; 4] = ["self_id", "nickname", "send_image_as_file", "connections"];
+/// 旧版本曾写在本文件、现已迁到 arona.yml 的业务字段（下面会清理并单独提示）
+const LEGACY_TOP_KEYS: [&str; 3] = ["groups", "managers", "notify"];
 
 /// 加载 onebot.yml：不存在时生成模板；兼容旧后缀 onebot.yaml 迁移；清理业务字段残留
 pub fn load(file: &Path) -> Result<OneBotConfig, String> {
@@ -235,9 +265,21 @@ fn parse(file: &Path) -> Result<OneBotConfig, String> {
     let text = read_text(file).map_err(|e| format!("读取 {} 失败: {e}", file.display()))?;
     let mut value: serde_yaml::Value =
         serde_yaml::from_str(&text).map_err(|e| format!("onebot.yml 解析失败，请检查格式: {e}"))?;
+    // 未知顶层键：serde 默认会静默忽略，用户以为配置生效了其实没有（例如把
+    // arona.yml 的 notify / groups 写进了本文件），这里逐个提示。
+    if let Some(map) = value.as_mapping() {
+        for key in map.keys() {
+            let Some(name) = key.as_str() else { continue };
+            if !KNOWN_TOP_KEYS.contains(&name) && !LEGACY_TOP_KEYS.contains(&name) {
+                crate::runtime::log::warning(format!(
+                    "[OneBot] onebot.yml 存在无法识别的配置项「{name}」，已忽略；本文件只支持 self_id / nickname / send_image_as_file / connections，业务设置(如 notify、groups、trainer)请写在 arona.yml"
+                ));
+            }
+        }
+    }
     let mut legacy_removed = false;
     if let Some(map) = value.as_mapping_mut() {
-        for key in ["groups", "managers", "notify"] {
+        for key in LEGACY_TOP_KEYS {
             if map
                 .remove(serde_yaml::Value::String(key.to_string()))
                 .is_some()
@@ -246,10 +288,21 @@ fn parse(file: &Path) -> Result<OneBotConfig, String> {
             }
         }
     }
-    let config: OneBotConfig = serde_yaml::from_value(value)
-        .map_err(|e| format!("onebot.yml 解析失败，请检查格式（参考同目录说明）: {e}"))?;
-    for name in config.connections.keys() {
-        ConnectionType::from_name(name)?;
+    let config: OneBotConfig = serde_yaml::from_value(value).map_err(|e| {
+        format!(
+            "onebot.yml 解析失败，请检查格式（参考同目录说明）: {e}；\
+             常见原因：冒号后忘了写值（例如 `type:` 后面是空的）或缩进不一致"
+        )
+    })?;
+    // 连接类型由 type 字段决定，键名任意（模板里就是这么写的）。无法识别的连接以前会让
+    // 整份文件加载失败（GUI 子系统下双击启动=毫无反应且不进日志），现在只警告：
+    // 未启用的直接跳过，已启用的由 OneBotApplication::start 忽略，一处笔误不再毁掉整份配置。
+    for (name, conn) in &config.connections {
+        if let Err(err) = conn.resolve_type(name) {
+            crate::runtime::log::warning(format!(
+                "[OneBot] onebot.yml 的连接「{name}」无法识别类型（{err}）；该项已忽略，请补上 type: ws-forward / ws-reverse / http / http-reverse"
+            ));
+        }
     }
     if legacy_removed {
         save(file, &config).map_err(|e| format!("重写 onebot.yml 失败: {e}"))?;
@@ -272,7 +325,14 @@ fn connection_block(key: &str, conn: &ConnectionConfig, comment: &str) -> String
     let mut out = String::new();
     out.push_str(&format!("  # {comment}\n"));
     out.push_str(&format!("  {key}:\n"));
-    out.push_str(&format!("    type: {}\n", conn.connection_type));
+    // 一定要写出「解析后的类型」：老配置的连接没有 type 字段（靠键名判断类型），
+    // 直接写 conn.connection_type 会写出空的 `type:`（YAML null），下次启动就解析失败。
+    // 认不出类型时写空串（合法 YAML 字符串），避免再生成坏配置。
+    let type_name = conn
+        .resolve_type(key)
+        .map(|conn_type| conn_type.key().to_string())
+        .unwrap_or_else(|_| conn.connection_type.trim().to_string());
+    out.push_str(&format!("    type: \"{type_name}\"\n"));
     out.push_str(&format!("    enable: {}\n", conn.enable));
     out.push_str(&format!("    host: \"{}\"\n", conn.host));
     out.push_str(&format!("    port: {}\n", conn.port));
@@ -306,6 +366,15 @@ fn template(config: &OneBotConfig) -> String {
         "# 机器人昵称\nnickname: \"{}\"\n",
         config.nickname
     ));
+    out.push_str("\n# ==================== 消息发送 ====================\n");
+    out.push_str("# 本地图片(抽卡结果图/活动日历/攻略图等)是否改用 file:// 路径直传 OneBot 实现。\n");
+    out.push_str("# 开启后上行消息不再内嵌十几 MB 的 base64，发送更快；图片按原始文件上传，不做任何压缩。\n");
+    out.push_str("# 注意：仅当 OneBot 实现(如 NapCat)与机器人部署在同一台机器/可直接访问相同磁盘时才能开启，\n");
+    out.push_str("#       跨机器/容器部署开启会导致图片发不出去。默认 false(内嵌 base64, 兼容所有部署方式)。\n");
+    out.push_str(&format!(
+        "send_image_as_file: {}\n",
+        config.send_image_as_file
+    ));
     out.push_str("\nconnections:\n");
     // 配置里的全部连接 + 四种标准连接（缺失时补默认值）
     let mut connections = config.connections.clone();
@@ -328,4 +397,126 @@ fn template(config: &OneBotConfig) -> String {
         out.push('\n');
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 回归：连接键名与类型无关（模板里就写着「键名任意，例如 ws-reverse-2」）。
+    /// 以前拿键名逐个 `from_name` 校验，任何自定义键名、或误写进 connections 的业务
+    /// 字段（例如把图片发送方式 send_image_as_file 写在这里）都会让整份 onebot.yml
+    /// 加载失败；含 GUI 的构建是 windows 子系统，双击启动时表现为「毫无反应且不进日志」。
+    #[test]
+    fn custom_connection_keys_do_not_break_config_load() {
+        let file = std::env::temp_dir().join("arona-onebot-parse-test.yml");
+        let text = r#"self_id: 123
+nickname: "Arona"
+send_image_as_file: true
+connections:
+  arona-1482580133-6701:
+    type: ws-reverse
+    enable: false
+    port: 6701
+  send_image_as_file:
+    enable: false
+"#;
+        std::fs::write(&file, text).expect("写入测试配置失败");
+        let config = load(&file).expect("自定义键名不应导致加载失败");
+        let custom = config
+            .connections
+            .get("arona-1482580133-6701")
+            .expect("自定义键名的连接应保留");
+        assert_eq!(
+            custom.resolve_type("arona-1482580133-6701").unwrap(),
+            ConnectionType::WebSocketReverse
+        );
+        assert!(config.connections.contains_key("send_image_as_file"));
+        // 顶层 send_image_as_file 是本文件的正式配置项（GUI「发送设置」写这里）
+        assert!(config.send_image_as_file);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    /// 图片发送方式存在 onebot.yml：解析 -> 保存 -> 再解析 必须原样保留，
+    /// 且新生成的模板里带这一项（GUI 勾选框读写的就是这个字段）
+    #[test]
+    fn send_image_as_file_round_trips_through_onebot_yml() {
+        let file = std::env::temp_dir().join("arona-onebot-send-image-test.yml");
+        std::fs::write(&file, "send_image_as_file: true\n").expect("写入测试配置失败");
+        let config = load(&file).expect("send_image_as_file 应可解析");
+        assert!(config.send_image_as_file);
+
+        save(&file, &config).expect("写回配置失败");
+        let text = std::fs::read_to_string(&file).expect("读取配置失败");
+        assert!(text.contains("send_image_as_file: true"), "模板应带上该配置项");
+        assert!(load(&file).expect("重新解析失败").send_image_as_file);
+        let _ = std::fs::remove_file(&file);
+
+        // 默认值必须是 false（内嵌 base64，兼容所有部署方式）
+        let fresh = std::env::temp_dir().join("arona-onebot-send-image-test2.yml");
+        let _ = std::fs::remove_file(&fresh);
+        let config = load(&fresh).expect("生成默认模板失败");
+        assert!(!config.send_image_as_file);
+        let text = std::fs::read_to_string(&fresh).expect("读取模板失败");
+        assert!(text.contains("send_image_as_file: false"));
+        let _ = std::fs::remove_file(&fresh);
+    }
+
+    /// 回归：老配置的连接项没有 type 字段（靠键名判断类型），GUI「保存并热重载」
+    /// 曾经把它写成空的 `type:`（YAML null），下次启动直接解析失败、程序起不来。
+    /// 现在空 type 当作「用键名判断类型」，保存后也必须写出合法值。
+    #[test]
+    fn null_type_field_is_tolerated_and_saved_back_as_a_real_type() {
+        let file = std::env::temp_dir().join("arona-onebot-null-type-test.yml");
+        // 与用户现场一致：type 冒号后为空 + 靠键名判断类型
+        let text = r#"self_id: 1493074321
+nickname: "樱兰羽枫"
+send_image_as_file: true
+connections:
+  http:
+    type: 
+    enable: false
+    port: 5700
+  ws-forward:
+    type: 
+    enable: true
+    url: "ws://127.0.0.1:3001"
+"#;
+        std::fs::write(&file, text).expect("写入测试配置失败");
+        let config = load(&file).expect("type 为空不应导致加载失败");
+        assert_eq!(config.connections["http"].connection_type, "");
+        assert_eq!(
+            config.connections["ws-forward"].resolve_type("ws-forward").unwrap(),
+            ConnectionType::WebSocket
+        );
+        assert!(config.send_image_as_file);
+
+        // 保存后必须写出真实类型，不能再产出空 type（否则下次启动又会坏）
+        save(&file, &config).expect("写回配置失败");
+        let saved = std::fs::read_to_string(&file).expect("读取配置失败");
+        assert!(saved.contains("type: \"http\""), "{saved}");
+        assert!(saved.contains("type: \"ws-forward\""), "{saved}");
+        assert!(
+            !saved.lines().any(|line| line.trim() == "type:"),
+            "不应再写出空的 type:\n{saved}"
+        );
+        let reloaded = load(&file).expect("重新解析失败");
+        assert_eq!(
+            reloaded.connections["http"].resolve_type("http").unwrap(),
+            ConnectionType::Http
+        );
+        assert!(reloaded.send_image_as_file, "保存后图片发送方式不应丢失");
+        let _ = std::fs::remove_file(&file);
+    }
+
+    /// 类型完全无法识别的连接也只是被忽略（OneBotApplication::start 会跳过它），不再报错
+    #[test]
+    fn unresolvable_connection_type_is_tolerated() {
+        let file = std::env::temp_dir().join("arona-onebot-parse-test2.yml");
+        std::fs::write(&file, "connections:\n  whatever:\n    enable: false\n")
+            .expect("写入测试配置失败");
+        let config = load(&file).expect("无法识别类型的连接不应导致加载失败");
+        assert!(config.connections.contains_key("whatever"));
+        let _ = std::fs::remove_file(&file);
+    }
 }

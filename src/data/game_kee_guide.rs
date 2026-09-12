@@ -129,7 +129,8 @@ fn get_cached_images(directory: &Path, content_id: i64) -> Option<Vec<PathBuf>> 
     Some(files)
 }
 
-/// 下载一组图片到目录，文件名 `<contentId>-<序号>.<后缀>`（对应原版 downloadImages）
+/// 下载一组图片到目录，文件名 `<contentId>-<序号>.<后缀>`（对应原版 downloadImages）。
+/// 全部图片并行下载，任一失败则清理已写入的文件并返回错误
 async fn download_images(
     image_urls: &[String],
     content_id: i64,
@@ -144,27 +145,30 @@ async fn download_images(
             }
         }
     }
-    let headers = super::http::game_kee_image_headers(referer);
-    let mut files: Vec<PathBuf> = Vec::new();
-    for (index, image_url) in image_urls.iter().enumerate() {
-        let suffix = crate::data::game_kee::image_suffix(image_url);
-        let image_file = directory.join(format!("{}-{}{}", content_id, index + 1, suffix));
-        match super::http::get_bytes_with(image_url, &headers).await {
-            Ok(bytes) if !bytes.is_empty() => {
-                if let Err(err) = std::fs::write(&image_file, bytes) {
-                    for file in &files {
-                        let _ = std::fs::remove_file(file);
-                    }
-                    return Err(format!("写入攻略图片失败: {err}"));
-                }
-                files.push(image_file);
+    let tasks = image_urls.iter().enumerate().map(|(index, image_url)| {
+        let image_url = image_url.clone();
+        let image_file = directory.join(format!(
+            "{}-{}{}",
+            content_id,
+            index + 1,
+            crate::data::game_kee::image_suffix(&image_url)
+        ));
+        let headers = super::http::game_kee_image_headers(referer);
+        async move {
+            match super::http::get_bytes_with(&image_url, &headers).await {
+                Ok(bytes) if !bytes.is_empty() => std::fs::write(&image_file, &bytes)
+                    .map(|_| image_file)
+                    .map_err(|err| format!("写入攻略图片失败: {err}")),
+                Ok(_) => Err(format!("下载攻略图片为空: {image_url}")),
+                Err(err) => Err(err),
             }
-            Ok(_) => {
-                for file in &files {
-                    let _ = std::fs::remove_file(file);
-                }
-                return Err(format!("下载攻略图片为空: {image_url}"));
-            }
+        }
+    });
+    let results = futures_util::future::join_all(tasks).await;
+    let mut files: Vec<PathBuf> = Vec::with_capacity(results.len());
+    for result in results {
+        match result {
+            Ok(file) => files.push(file),
             Err(err) => {
                 for file in &files {
                     let _ = std::fs::remove_file(file);

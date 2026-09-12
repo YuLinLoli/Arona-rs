@@ -42,11 +42,24 @@ fn result_dir() -> PathBuf {
     paths::images_root().join("gacha").join("result")
 }
 
-/// 渲染抽卡结果图并保存为 PNG，返回文件路径
+/// 渲染抽卡结果图并保存为 PNG，返回文件路径。
+///
+/// 头像加载（未命中本地缓存时联网）留在异步侧；绘制 + PNG 编码是纯 CPU 的重活，
+/// 交给阻塞线程池执行，避免占住 tokio 工作线程让日志/收消息卡住（见 `image::cpu_bound`）。
 pub async fn render_result(report: &DrawReport) -> Result<PathBuf, String> {
     if report.results.is_empty() || report.results.len() > 10 {
         return Err(format!("抽卡结果数量异常: {}", report.results.len()));
     }
+    let mut avatars = Vec::with_capacity(report.results.len());
+    for result in &report.results {
+        avatars.push(load_avatar(result).await);
+    }
+    let report = report.clone();
+    crate::image::cpu_bound(move || draw_report(&report, &avatars)).await
+}
+
+/// 纯 CPU 部分：渐变背景 + 卡片网格 + 保底计数块 + PNG 落盘
+fn draw_report(report: &DrawReport, avatars: &[Option<RgbaImage>]) -> Result<PathBuf, String> {
     let mut img = RgbaImage::new(CANVAS_WIDTH as u32, CANVAS_HEIGHT as u32);
     // 背景: 上(160,213,246) -> 下(250,241,241) 垂直渐变
     draw::fill_rect_vgrad(
@@ -58,12 +71,8 @@ pub async fn render_result(report: &DrawReport) -> Result<PathBuf, String> {
         draw::rgb(160, 213, 246),
         draw::rgb(250, 241, 241),
     );
-    let mut avatars = Vec::with_capacity(report.results.len());
-    for result in &report.results {
-        avatars.push(load_avatar(result).await);
-    }
     for (index, result) in report.results.iter().enumerate() {
-        draw_cell(&mut img, index, result, avatars[index].as_ref());
+        draw_cell(&mut img, index, result, avatars.get(index).and_then(|it| it.as_ref()));
     }
     draw_count_block(&mut img, report.pity_count);
     let file = new_result_file();

@@ -43,23 +43,23 @@ pub async fn activity(
         return Some(OutgoingMessage::image_file(file.to_string_lossy()));
     }
     match fetch(server).await {
-        Ok(pair) => Some(activity_message(&pair, server)),
+        Ok(pair) => Some(activity_message(pair, server).await),
         Err(err) => Some(OutgoingMessage::text(format!(
             "获取{failure_prefix}活动失败: {err}"
         ))),
     }
 }
 
-/// 生成活动日历消息: 优先渲染图片, 失败回退文本
-fn activity_message(
-    pair: &(Vec<Activity>, Vec<Activity>),
+/// 生成活动日历消息: 优先渲染图片, 失败回退文本（渲染 + PNG 编码在阻塞线程池里跑）
+async fn activity_message(
+    pair: (Vec<Activity>, Vec<Activity>),
     server: ServerLocale,
 ) -> OutgoingMessage {
-    match crate::image::activity::render(pair, server) {
+    match crate::image::activity::render_async(pair.clone(), server).await {
         Ok(file) => OutgoingMessage::image_file(file.to_string_lossy()),
         Err(err) => {
             crate::runtime::log::warning(format!("活动图片生成失败, 回退文本: {err}"));
-            OutgoingMessage::text(data::activity::format_calendar(pair, server))
+            OutgoingMessage::text(data::activity::format_calendar(&pair, server))
         }
     }
 }
@@ -133,7 +133,7 @@ pub async fn refresh_image(server: ServerLocale) {
     match data::activity::fetch(server).await {
         Ok(pair) => {
             save_to_db(server, &pair);
-            match crate::image::activity::render(&pair, server) {
+            match crate::image::activity::render_async(pair, server).await {
                 Ok(file) => crate::runtime::log::info(format!(
                     "{}本地活动图片已刷新: {}",
                     server.server_name(),

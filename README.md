@@ -60,7 +60,7 @@
 1. 从 [Releases](https://github.com/YuLinLoli/Arona-rs/releases) 下载 `arona-rs-<版本号>-setup-win-x64.exe` 并运行。
    安装向导会先展示程序介绍与 AGPLv3 许可证全文，同意后才能继续。
 2. 默认的**完整安装**会一并装上 CPU 软件渲染依赖 `softgl\`（约 62 MB，Mesa llvmpipe）。
-   服务器 / 虚拟机 / 没有显卡驱动或没有 DX12 的机器上，硬件渲染后端会全部失败，
+   服务器 / 虚拟机 / 没有显卡驱动或没有 DX12 的机器上，硬件渲染后端会全部失败甚至**静默卡住**，
    程序会自动切到这套 CPU 渲染把管理面板画出来，所以服务器上也能正常开 GUI；
    正常带显卡的机器会优先用硬件渲染，这份依赖平时不会被加载。
    只在正常带显卡的机器上用的话，安装时选「自定义安装」可以把这项取消，省下 62 MB。
@@ -125,6 +125,10 @@ HKEY_CURRENT_USER\Software\YuLinLoli\Arona-rs      # 选「为所有用户安装
 self_id: 123456789          # 机器人 QQ 号
 nickname: "Arona"
 
+# 本地图片（抽卡结果图/活动日历/攻略图）改用 file:// 路径直传 OneBot 实现，
+# 不再内嵌十几 MB 的 base64；仅当 OneBot 实现与机器人同机部署时开启
+send_image_as_file: false
+
 connections:
   # 反向 WebSocket：本程序监听，OneBot 实现（如 NapCat）连过来
   ws-reverse:
@@ -137,6 +141,15 @@ connections:
 ```
 
 `ws-forward`（主动连 OneBot 端）、`http`、`http-reverse` 三种方式同理，按需 `enable`。
+连接的**类型由 `type:` 字段决定**，键名随意（`ws-reverse-2`、`my-bot` 都行），同一类型可以配多个实例。
+
+> `onebot.yml` 只放 `self_id` / `nickname` / `send_image_as_file` / `connections` 四项。
+> 业务设置（`notify`、`groups`、`managers`、`trainer` …）属于 `arona.yml`，写到 `onebot.yml`
+> 会被忽略，程序会在日志里逐条提示「存在无法识别的配置项」。
+
+`send_image_as_file` 也可以在管理面板「OneBot 连接」页的「发送设置」里勾选：
+勾选后立即写入 `onebot.yml` 并热生效（不需要点「保存并热重载」，也不用重启）。点击勾选框会同步内存中的
+连接配置，因此之后再点「保存并热重载」不会把它覆盖回去。
 
 ### arona.yml
 
@@ -166,9 +179,12 @@ trainer:
 
 - `--gui`（默认）：打开管理面板（群功能开关 / 群成员黑名单 / OneBot 连接配置与热重载）
 - `--nogui`：不打开面板，只启动命令行(黑窗口)模式
-- `--renderer=glow|wgpu`：只试指定的渲染后端（默认自动：glow → wgpu 多种配置 → 软件 OpenGL 兜底）
+- `--renderer=glow|wgpu|softgl`：只试指定的渲染后端（默认自动：硬件 `glow` → `wgpu` 多种配置 → 软件 OpenGL 兜底）
 - `--softgl`：强制用 Mesa 软件 OpenGL(llvmpipe) 渲染（见下文「Windows Server / 虚拟机」）
 - `ARONA_SOFTGL=1` / `ARONA_SOFTGL_DIR=<目录>`：等价开关 / 指定 softgl 目录
+- `ARONA_RENDERER=glow|wgpu|softgl`：等价于 `--renderer=`（方便在服务器上固定后端）
+- `ARONA_GUI_TIMEOUT=<秒>`：某个渲染后端多久没出窗口就判定为卡死并换下一个（支持小数；
+  默认 wgpu 6 秒、glow/软渲染 20 秒，设 `0` 关闭看门狗）
 - `ARONA_LOG=info|debug|trace|off`：三方库(wgpu/glutin 等)的日志级别，默认 `debug` 但只对 wgpu* 生效
 - `--config=<路径>`：指定 `onebot.yml` 路径
 - `--arona-config=<路径>`：指定 `arona.yml` 路径
@@ -278,8 +294,13 @@ target/release/arona-rs --gui    # 显式打开面板（默认行为，等价于
 Windows 上含 GUI 的产物使用 windows 子系统，GUI 模式不会多出控制台窗口；`--nogui`
 会自动附加上级终端（cmd/PowerShell）或新建控制台，日志与颜色照常输出。
 
-渲染后端默认自动：先试 `glow`（OpenGL），失败再试 `wgpu`（DX12/Vulkan，含 WARP 软件渲染）。
-可用 `--renderer=glow` / `--renderer=wgpu` 强制指定。
+渲染后端默认自动：有硬件 OpenGL 时先试 `glow`，之后是 `wgpu`（DX12/Vulkan，含 WARP 软件渲染），
+最后是随程序附带的软件 OpenGL(llvmpipe)。可用 `--renderer=glow` / `--renderer=wgpu` /
+`--renderer=softgl` 强制指定。
+
+每个后端都带**看门狗**：规定时间内没出窗口就判定为卡死（wgpu 在部分 Windows Server 上会
+静默卡住 —— 不报错、不出窗口、也没有任何日志），自动换下一个后端重启自己；实在不行就退回
+命令行模式，保证机器人不会一起停摆。
 
 若需要不含 GUI 的精简命令行产物：`cargo build --release --no-default-features`（或 `cargo build-nogui`）。
 
@@ -320,12 +341,18 @@ Windows 上含 GUI 的产物使用 windows 子系统，GUI 模式不会多出控
 
 | 顺序 | 后端 | 说明 |
 | --- | --- | --- |
-| 1 | `glow`（OpenGL） | 桌面上最快；只有 OpenGL 1.1 的系统会失败 |
+| 1 | `glow`（硬件 OpenGL） | 桌面上最快；注册表里没有 OpenGL ICD 时跳过（只有 GDI 的 1.1 必然失败） |
 | 2 | `wgpu`（DX12/Vulkan） | DX12 之下有 **WARP 软件渲染**（Microsoft Basic Render Driver），无显卡驱动也能画 |
 | 3 | `wgpu`（全部后端 / DX12+FXC） | 备用配置；万一静态 DXC 容器创建失败、或需要 GL 后端时兜底 |
-| 4 | `glow` + 软件 OpenGL(llvmpipe) | 前三步都失败时**自动用 `--softgl` 重启自己**，改走 Mesa 的 CPU 软件渲染 |
+| 4 | `glow` + 软件 OpenGL(llvmpipe) | 前几步**卡死或失败**时自动换到它，改走 Mesa 的 CPU 软件渲染 |
 
-- 强制指定：`--renderer=wgpu` / `--renderer=glow`（不加则按上表自动）。
+- **卡死看门狗**：每个后端最多等一段时间（wgpu 默认 6 秒、glow/软渲染 20 秒，可用
+  `ARONA_GUI_TIMEOUT=<秒>` 调整）。超时即判定它卡死 —— 卡死在 wgpu 里的线程没法在进程内干掉，
+  所以程序会**另起一个进程**换下一个后端（子进程继承管理员令牌，不会二次弹 UAC；带 1.5 秒
+  启动延迟，避免和旧进程抢端口/数据库）。四个后端都不行时退回命令行模式重启，机器人继续跑。
+  日志里能看到 `判定为卡死` 与 `已用下一个渲染后端重新启动管理面板`。
+- 强制指定：`--renderer=wgpu` / `--renderer=glow` / `--renderer=softgl`（不加则按上表自动）。
+  `--renderer=glow` 在没有 ICD 但带了 `softgl\` 时会自动落到软件 OpenGL，而不是必然失败。
 - 日志里会打印全部候选适配器与最终选中的那个，例如
   `wgpu 适配器: Microsoft Basic Render Driver（Cpu, Dx12）` 说明正在用 WARP 软件渲染。
 
@@ -338,7 +365,7 @@ Windows 上含 GUI 的产物使用 windows 子系统，GUI 模式不会多出控
 ```powershell
 # 拉取依赖（约 62MB，不入库；需要时可重新跑）
 powershell -ExecutionPolicy Bypass -File scripts/fetch-softgl.ps1
-# 显式以软渲染启动（不加 --softgl 时，前三个后端全失败会自动切到它）
+# 显式以软渲染启动（不加 --softgl 时，前几个后端卡死或失败会自动切到它）
 arona-rs.exe --softgl
 ```
 
@@ -374,15 +401,28 @@ arona-rs.exe --softgl
 - 如果存在 `softgl\`，先自动用软件 OpenGL 重启一次；
 - 仍然失败才**回退到命令行模式**继续运行机器人（下次可直接加 `--nogui` 跳过 GUI）。
 
+配置文件写错时也**不会静默退出**：
+
+- YAML 语法错误等硬错误会在启动阶段把原因写进当天的 `arona-yyyy-MM-dd.log` 与
+  `startup-error.log`，GUI 模式再弹一个「Arona 配置错误」消息框（`--nogui` 不弹框，看控制台即可）；
+- `arona.yml` 坏掉时按默认配置继续运行（不会连机器人一起停掉），`onebot.yml` 坏掉时连不上任何
+  OneBot 实现，会在提示后退出并保留现场；
+- 软错误（不认识的配置项、连接类型无法识别等）只记 `WARNING`，程序照常启动，
+  对应的配置项被忽略——`onebot.yml` 只认 `self_id` / `nickname` / `send_image_as_file` /
+  `connections`，其余请写进 `arona.yml`（`arona.yml` 里的 `send_image_as_file` 会提示已迁移）；
+- 想看程序实际用了哪份配置：启动参数 `--config=` / `--arona-config=` 可以指定路径。
+
 排查清单：
 
 - 直接跑 `arona-rs.exe --nogui`：能起机器人说明只是 GUI 的问题，用命令行模式即可；
+- 双击毫无反应：看 `arona-standalone/logs/startup-error.log`，配置/渲染/panic 的原因都在里面；
 - 面板起不来：先看日志里的后端失败原因；实在不行跑一次 `scripts/fetch-softgl.ps1` 走软渲染；
 - 用远程桌面（RDP）登录通常也能直接开面板；
 - Windows Server Core（无桌面体验）不支持 GUI，请只用 `--nogui`。
 ### 配置结构
 
-GUI 的改动都落在 `arona.yml` 里，可手工编辑，程序与面板都会读取：
+GUI「OneBot 连接」页里的「发送设置」（`send_image_as_file`）落在 `onebot.yml`，勾选后立即写盘并热生效；
+其余业务配置都在 `arona.yml` 里：
 
 ```yaml
 # 全局用户黑名单：这些 QQ 在任何群/私聊都不触发机器人（管理员不受限）

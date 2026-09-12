@@ -120,6 +120,8 @@ pub struct RuntimeConfig {
     pub uuid: RwLock<String>,
     /// 全局用户黑名单
     pub global_blacklist: RwLock<Vec<i64>>,
+    /// 本地图片改用 file:// 路径直传 OneBot 实现
+    pub send_image_as_file: RwLock<bool>,
     /// 分群设置（群号 -> 功能开关/群内黑名单）
     pub group_settings: RwLock<BTreeMap<String, GroupSetting>>,
 }
@@ -134,6 +136,7 @@ fn instance() -> &'static RuntimeConfig {
         end_with_sensei: RwLock::new(String::from("老师")),
         uuid: RwLock::new(String::new()),
         global_blacklist: RwLock::new(Vec::new()),
+        send_image_as_file: RwLock::new(false),
         group_settings: RwLock::new(BTreeMap::new()),
     })
 }
@@ -148,6 +151,14 @@ pub fn global_blacklist() -> Vec<i64> {
 
 pub fn set_group_settings(settings: BTreeMap<String, GroupSetting>) {
     *instance().group_settings.write().unwrap() = settings;
+}
+
+pub fn set_send_image_as_file(enabled: bool) {
+    *instance().send_image_as_file.write().unwrap() = enabled;
+}
+
+pub fn send_image_as_file() -> bool {
+    *instance().send_image_as_file.read().unwrap()
 }
 
 pub fn group_settings() -> BTreeMap<String, GroupSetting> {

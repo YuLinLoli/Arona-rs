@@ -62,10 +62,18 @@ fn env_flag(name: &str) -> bool {
     )
 }
 
+/// activate 的结果（幂等：多次调用只生效一次，也只记一条日志）
+static ACTIVATED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
 /// 把 softgl 目录加入 DLL 搜索路径，并强制 Mesa 走 llvmpipe 软件光栅化。
 ///
-/// 必须在任何 opengl32 调用（eframe/glutin 创建上下文）之前调用，即 main 的最开头。
+/// 必须在任何 opengl32 调用（eframe/glutin 创建上下文）之前调用：main 最开头（--softgl）
+/// 或 gui::run 创建线程之前。重复调用是安全的（幂等）。
 pub fn activate() -> bool {
+    *ACTIVATED.get_or_init(activate_once)
+}
+
+fn activate_once() -> bool {
     let Some(dir) = dir() else {
         crate::runtime::console::eprint_safe(
             "[Arona] 请求了软件 OpenGL 模式，但没找到 softgl 目录（应含有 opengl32.dll）",
@@ -96,7 +104,7 @@ pub fn activate() -> bool {
 /// 设置环境变量（仅当用户没自己指定时）
 fn set_default_env(key: &str, value: &str) {
     if std::env::var_os(key).is_none() {
-        // SAFETY: 只在 main 最开头（尚未创建任何线程）调用，不存在并发读写环境变量的风险
+        // SAFETY: 只在启动阶段（main 最开头或 gui::run 创建线程之前）调用，此后不再改动环境
         unsafe { std::env::set_var(key, value) };
     }
 }
@@ -105,19 +113,20 @@ fn set_default_env(key: &str, value: &str) {
 ///
 /// 成功返回 true，调用方应立即退出：此时机器人随后会在子进程里启动，避免两个实例同时跑。
 pub fn relaunch(args: &[String]) -> bool {
-    let Ok(exe) = std::env::current_exe() else {
-        return false;
-    };
-    let rest = args
-        .iter()
-        .skip(1)
-        .filter(|arg| arg.as_str() != "--softgl")
-        .cloned();
-    let mut command = std::process::Command::new(exe);
-    command.args(rest).arg("--softgl");
-    command.env("ARONA_SOFTGL", "1");
-    match command.spawn() {
-        Ok(_) => true,
+    // 带上 --softgl 与 ARONA_SOFTGL 双保险；已试过的后端进度(--gui-attempt=)一并丢弃，
+    // 让新进程从「软件 OpenGL」这条候选重新开始
+    let extra = vec!["--softgl".to_string()];
+    let envs = [("ARONA_SOFTGL", "1")];
+    let remove_envs = ["ARONA_RENDERER"];
+    match crate::runtime::relaunch::spawn_self(
+        args,
+        &extra,
+        &envs,
+        &remove_envs,
+        &["--softgl", "--renderer="],
+        &["--gui-attempt=", "--gui-handoff=", "--renderer="],
+    ) {
+        Ok(()) => true,
         Err(err) => {
             crate::runtime::log::warning(format!("以软件 OpenGL 模式重新启动失败: {err}"));
             false

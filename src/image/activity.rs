@@ -26,6 +26,14 @@ const PAD_Y: i32 = 34;
 const MIN_WIDTH: i32 = 620;
 const MAX_WIDTH: i32 = 1800;
 
+/// 渲染某服务器活动日历并保存 PNG（在阻塞线程池里跑，避免占住 tokio 工作线程）
+pub async fn render_async(
+    pair: (Vec<Activity>, Vec<Activity>),
+    server: ServerLocale,
+) -> Result<PathBuf, String> {
+    crate::image::cpu_bound(move || render(&pair, server)).await
+}
+
 /// 渲染某服务器活动日历并保存 PNG，返回文件路径
 pub fn render(
     pair: &(Vec<Activity>, Vec<Activity>),

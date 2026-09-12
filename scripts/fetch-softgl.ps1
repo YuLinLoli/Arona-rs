@@ -111,7 +111,7 @@ try {
 
     $total = [math]::Round(((Get-ChildItem $Dest -File | Measure-Object Length -Sum).Sum / 1MB), 1)
     Write-Host "[softgl] 完成: $Dest (共 $total MB)" -ForegroundColor Green
-    Write-Host "[softgl] 之后运行 arona-rs 时, 所有渲染后端都失败会自动用 llvmpipe 重启; 也可显式加 --softgl"
+    Write-Host "[softgl] 之后运行 arona-rs 时, 前几个渲染后端卡死或失败会自动切到 llvmpipe; 也可显式加 --softgl"
 }
 finally {
     Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue

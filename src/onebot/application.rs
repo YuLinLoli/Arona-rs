@@ -24,6 +24,16 @@ impl OneBotApplication {
         business: Arc<StandaloneBusinessHandler>,
         registry: Arc<ConnectionRegistry>,
     ) -> OneBotApplication {
+        // 图片发送方式(内嵌 base64 / file:// 直传)存在 onebot.yml，启动时同步到运行期开关
+        crate::runtime::config::set_send_image_as_file(config.send_image_as_file);
+        crate::runtime::log::info(format!(
+            "[OneBot] 图片发送方式: {}",
+            if config.send_image_as_file {
+                "file:// 直传(原图上传, 不压缩)"
+            } else {
+                "内嵌 base64(兼容所有部署方式)"
+            }
+        ));
         OneBotApplication {
             config: RwLock::new(config),
             business,
@@ -31,6 +41,23 @@ impl OneBotApplication {
             connections: Mutex::new(Vec::new()),
             http_servers: Mutex::new(Vec::new()),
         }
+    }
+
+    /// 图片发送方式热生效：同步到内存配置与运行期开关（GUI「发送设置」勾选后立即调用）
+    pub fn apply_send_image_as_file(&self, enabled: bool) {
+        {
+            let mut guard = self.config.write().unwrap();
+            guard.send_image_as_file = enabled;
+        }
+        crate::runtime::config::set_send_image_as_file(enabled);
+        crate::runtime::log::info(format!(
+            "[OneBot] 图片发送方式已切换为{}",
+            if enabled {
+                "file:// 直传(原图上传, 不压缩)"
+            } else {
+                "内嵌 base64(兼容所有部署方式)"
+            }
+        ));
     }
 
     /// 当前 OneBot 配置快照
@@ -127,6 +154,8 @@ impl OneBotApplication {
             let mut guard = self.config.write().unwrap();
             *guard = new_config.clone();
         }
+        // 图片发送方式也在 onebot.yml 里，热重载时一并生效
+        crate::runtime::config::set_send_image_as_file(new_config.send_image_as_file);
         self.business.update_config(new_config.clone());
         self.start();
         crate::runtime::log::info("[OneBot] 连接热重载完成");

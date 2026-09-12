@@ -41,6 +41,11 @@ impl OneBotActionResponse {
     pub fn success(&self) -> bool {
         self.status == "ok" && self.retcode == 0
     }
+
+    /// OneBot 11 的"已提交处理"（retcode=1 或 status=async）：动作已被受理，消息会随后发出
+    pub fn async_accepted(&self) -> bool {
+        self.retcode == 1 || self.status.eq_ignore_ascii_case("async")
+    }
 }
 
 #[derive(Clone, Debug)]

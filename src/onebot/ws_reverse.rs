@@ -29,7 +29,7 @@ pub struct WsReverseState {
     pub token: String,
     pub heartbeat_interval_ms: u64,
     pub core: Arc<ConnectionCore>,
-    pub clients: Mutex<Vec<UnboundedSender<String>>>,
+    pub clients: Mutex<Vec<UnboundedSender<Message>>>,
     pub stopped: AtomicBool,
 }
 
@@ -63,6 +63,16 @@ pub struct WsReverseProxy {
     pub state: Arc<WsReverseState>,
 }
 
+impl WsReverseProxy {
+    /// 把一帧消息直接塞进写队列（Pong 等控制帧），不阻塞读循环
+    pub fn send_message(&self, message: Message) {
+        let clients = self.state.clients.lock().unwrap();
+        for client in clients.iter() {
+            let _ = client.send(message.clone());
+        }
+    }
+}
+
 impl OneBotConnection for WsReverseProxy {
     fn id(&self) -> u64 {
         self.state.id
@@ -80,7 +90,7 @@ impl OneBotConnection for WsReverseProxy {
                 move |payload| {
                     let mut sent = false;
                     for client in &clients {
-                        let _ = client.send(payload.to_string());
+                        let _ = client.send(Message::Text(payload.to_string().into()));
                         sent = true;
                     }
                     if sent {
@@ -101,7 +111,7 @@ impl OneBotConnection for WsReverseProxy {
     fn send_raw(&self, payload: &str) {
         let clients = self.state.clients.lock().unwrap();
         for client in clients.iter() {
-            let _ = client.send(payload.to_string());
+            let _ = client.send(Message::Text(payload.to_string().into()));
         }
     }
 
@@ -177,12 +187,25 @@ async fn ws_handler(
 
 async fn handle_socket(socket: WebSocket, state: Arc<WsReverseState>) {
     let (mut sink, mut stream) = socket.split();
-    let (tx, mut rx) = unbounded_channel::<String>();
+    let (tx, mut rx) = unbounded_channel::<Message>();
     {
         let mut clients = state.clients.lock().unwrap();
         clients.push(tx);
     }
     log::info(format!("[OneBot reverse WS] 客户端已连接: {}", state.id));
+    // 独立写任务：大图(base64)等大负载写 socket 时不再堵住读循环，
+    // 否则「收消息 + 打印日志」会跟着一起卡住。
+    let writer = tokio::spawn(async move {
+        while let Some(message) = rx.recv().await {
+            let closing = matches!(message, Message::Close(_));
+            if sink.send(message).await.is_err() {
+                break;
+            }
+            if closing {
+                break;
+            }
+        }
+    });
     let proxy = Arc::new(WsReverseProxy {
         state: state.clone(),
     });
@@ -199,7 +222,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<WsReverseState>) {
                         }
                     }
                     Some(Ok(Message::Ping(payload))) => {
-                        let _ = sink.send(Message::Pong(payload)).await;
+                        proxy.send_message(Message::Pong(payload));
                     }
                     Some(Ok(Message::Pong(_))) => {}
                     Some(Ok(_)) => {}
@@ -210,19 +233,9 @@ async fn handle_socket(socket: WebSocket, state: Arc<WsReverseState>) {
                     None => break,
                 }
             }
-            payload = rx.recv() => {
-                match payload {
-                    Some(payload) => {
-                        if payload.is_empty() { break; }
-                        if sink.send(Message::Text(payload.into())).await.is_err() {
-                            break;
-                        }
-                    }
-                    None => break,
-                }
-            }
         }
     }
+    writer.abort();
     let mut clients = state.clients.lock().unwrap();
     clients.retain(|c| !c.is_closed());
     log::info("[OneBot reverse WS] 客户端断开");

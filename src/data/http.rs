@@ -1,6 +1,7 @@
 //! 简单的 HTTP 请求封装（对应原版 NetworkUtil + Jsoup 请求头）
 //! 全部接口使用 async reqwest，调用方需处于 tokio 运行时中。
 
+use once_cell::sync::Lazy;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use std::time::Duration;
 
@@ -14,11 +15,16 @@ const ACCEPT_LANGUAGE_VALUE: &str =
 const JSON_ACCEPT: &str = "application/json, text/plain, */*";
 const IMAGE_ACCEPT: &str = "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8";
 
-fn client() -> reqwest::Client {
+/// 全局共享客户端：复用连接池，避免每个请求都重新 TCP+TLS 握手
+static CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(60))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
+});
+
+fn client() -> reqwest::Client {
+    CLIENT.clone()
 }
 
 /// 把 (名, 值) 列表转成 HeaderMap，非法字段名/值直接忽略

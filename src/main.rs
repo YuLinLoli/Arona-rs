@@ -45,6 +45,16 @@ fn main() {
     // 只在 debug 级别记录，不装 logger 会完全看不到，GUI 起不来时等于两眼一抹黑
     runtime::log::install_logger();
 
+    // 换渲染后端重启（GUI 看门狗 / 软渲染兜底）时带的启动延迟：让上一个可能还卡着的
+    // 进程先彻底退出，避免端口/数据库句柄被占住。正常启动不会设置这个变量。
+    if let Some(ms) = std::env::var("ARONA_START_DELAY_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+    {
+        std::thread::sleep(std::time::Duration::from_millis(ms.min(10_000)));
+    }
+
     // 申请管理员权限（UAC）：需要时用提权实例重新拉起自己并立刻退出。
     // 放在最前面，保证后面所有初始化（含 GUI、OneBot 监听）都在提权进程里完成。
     if runtime::elevate::request_admin(&args) {
@@ -112,7 +122,7 @@ fn main() {
     #[cfg(all(windows, feature = "gui"))]
     runtime::console::attach_console();
 
-    let runtime = match tokio::runtime::Runtime::new() {
+    let runtime = match runtime::runtime_builder().build() {
         Ok(runtime) => runtime,
         Err(err) => {
             runtime::console::eprint_safe(&format!("[Arona] 创建 tokio 运行时失败: {err}"));
@@ -122,6 +132,42 @@ fn main() {
     if let Err(err) = runtime.block_on(run_bot(args, None)) {
         runtime::console::eprint_safe(&format!("[Arona] 运行失败: {err}"));
     }
+}
+
+/// 启动阶段的配置问题：写进统一日志 + startup-error.log + 控制台，GUI 模式再弹一个消息框。
+/// 含 GUI 的 Windows 产物是 windows 子系统，双击启动时既没有控制台、用户也不知道日志在哪，
+/// 以前只 `eprint_safe` + exit(1) 的表现就是「双击毫无反应」。
+fn report_config_problem(file: &std::path::Path, context: &str, err: &str, show_message_box: bool) {
+    let hint = format!(
+        "{context}\n\n配置文件: {}\n原因: {err}\n\n日志: {}\n\n程序已按默认配置继续运行；修正该文件后会自动热重载。",
+        file.display(),
+        runtime::crash::startup_error_path().display()
+    );
+    runtime::crash::report(context, &format!("{} —— {err}", file.display()));
+    runtime::console::eprint_safe(&format!("[Arona] {hint}"));
+    if show_message_box {
+        runtime::crash::message_box("Arona 配置错误", &hint);
+    }
+}
+
+/// 无法继续运行的配置错误（onebot.yml 坏掉时连不上任何 OneBot 实现）：上报后退出
+fn report_config_error(
+    file: &std::path::Path,
+    context: &str,
+    err: &str,
+    show_message_box: bool,
+) -> ! {
+    let hint = format!(
+        "{context}\n\n配置文件: {}\n原因: {err}\n\n日志: {}\n\n程序无法启动，请修正该文件后重试；删除该文件可让它重新生成默认模板。",
+        file.display(),
+        runtime::crash::startup_error_path().display()
+    );
+    runtime::crash::report(context, &format!("{} —— {err}", file.display()));
+    runtime::console::eprint_safe(&format!("[Arona] {hint}"));
+    if show_message_box {
+        runtime::crash::message_box("Arona 配置错误", &hint);
+    }
+    std::process::exit(1);
 }
 
 /// 机器人主流程；shutdown 为 GUI 关闭窗口时触发的退出信号
@@ -149,14 +195,18 @@ pub(crate) async fn run_bot(
 
     runtime::services::set_data_root(runtime::paths::data_root());
 
-    // 先加载业务配置（含热更新；首次会从旧 onebot.yaml 迁移 groups/managers/notify），再加载协议配置
-    config::standalone::init(arona_config_file.clone());
+    // GUI 模式下弹框提示；--nogui 已经有控制台，直接看控制台/日志即可，避免无人值守时被弹框卡住
+    let show_message_box = !args.iter().any(|arg| arg == "--nogui");
+
+    // 先加载业务配置（含热更新；首次会从旧 onebot.yaml 迁移 groups/managers/notify），再加载协议配置。
+    // 配置文件有问题必须留下痕迹：静默回退默认配置会让人误以为改了配置却没生效。
+    // arona.yml 坏了只是回退默认值（机器人仍能用），所以上报后继续；onebot.yml 坏了无从连接，只能退出。
+    if let Err(err) = config::standalone::init(arona_config_file.clone()) {
+        report_config_problem(&arona_config_file, "arona.yml 加载失败", &err, show_message_box);
+    }
     let onebot_config = match config::onebot::load(&config_file) {
         Ok(config) => config,
-        Err(err) => {
-            runtime::console::eprint_safe(&format!("[Arona] onebot.yml 加载失败: {err}"));
-            std::process::exit(1);
-        }
+        Err(err) => report_config_error(&config_file, "onebot.yml 加载失败", &err, show_message_box),
     };
     runtime::paths::set_onebot_file(config_file.clone());
     runtime::paths::set_arona_file(arona_config_file.clone());

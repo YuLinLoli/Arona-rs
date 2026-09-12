@@ -249,6 +249,31 @@ pub fn clear_group_setting(group_id: i64) -> Result<(), String> {
     standalone::clear_group_setting(group_id)
 }
 
+/// 本地图片改用 file:// 直传开关。
+/// 该配置存在 onebot.yml（与连接配置同一个文件），写完立即热生效，无需重启。
+pub fn set_send_image_as_file(enabled: bool) -> Result<String, String> {
+    let file = paths::onebot_file();
+    let mut config = onebot::load(&file)?;
+    if config.send_image_as_file != enabled {
+        config.send_image_as_file = enabled;
+        onebot::save(&file, &config).map_err(|err| format!("写入 onebot.yml 失败: {err}"))?;
+    }
+    // 立即生效：同步内存配置与运行期开关
+    match application::global() {
+        Some(app) => app.apply_send_image_as_file(enabled),
+        None => crate::runtime::config::set_send_image_as_file(enabled),
+    }
+    Ok(format!(
+        "图片发送方式已{}（写入 {}）",
+        if enabled {
+            "改为 file:// 直传，大图不再内嵌 base64"
+        } else {
+            "改回内嵌 base64"
+        },
+        file.display()
+    ))
+}
+
 /// arona.yml 路径（GUI 展示用）
 pub fn arona_file() -> String {
     standalone::config_file()
@@ -352,9 +377,12 @@ mod tests {
         assert!(!remove_connection(&mut config, &second));
     }
 
+    /// 功能开关与黑名单共用全局 group_settings，两个场景必须串行在同一个测试里，
+    /// 否则并行测试互相重置全局状态会随机挂
     #[test]
-    fn group_feature_switch_gates_commands() {
+    fn group_settings_gate_feature_and_blacklist() {
         crate::runtime::config::set_group_settings(Default::default());
+        // 场景一：分群功能开关
         assert!(runtime_config::feature_enabled(Some(1), "tarot"));
         let mut setting = crate::config::arona::GroupSetting::default();
         setting.disabled_features.push("tarot".to_string());
@@ -364,6 +392,18 @@ mod tests {
         assert!(!runtime_config::feature_enabled(Some(1), "tarot"));
         assert!(runtime_config::feature_enabled(Some(2), "tarot"), "其它群不受影响");
         assert!(runtime_config::feature_enabled(None, "tarot"), "私聊不受分群开关限制");
+        // 场景二：群内黑名单与全局黑名单
+        crate::runtime::config::set_global_blacklist(vec![10001]);
+        assert!(runtime_config::is_blacklisted(10001, Some(1)));
+        crate::runtime::config::set_global_blacklist(Vec::new());
+        let mut setting = crate::config::arona::GroupSetting::default();
+        setting.blacklist.push(10002);
+        let mut map = std::collections::BTreeMap::new();
+        map.insert("1".to_string(), setting);
+        crate::runtime::config::set_group_settings(map);
+        assert!(runtime_config::is_blacklisted(10002, Some(1)));
+        assert!(!runtime_config::is_blacklisted(10002, Some(2)));
+        assert!(!runtime_config::is_blacklisted(10002, None));
         crate::runtime::config::set_group_settings(Default::default());
     }
 
@@ -429,19 +469,43 @@ mod tests {
         assert_eq!(app.registry.count(), 0, "停止后注册表应清空");
     }
 
+    /// GUI「OneBot 连接」页的「发送设置」勾选框走的就是这条链路：
+    /// 写入 onebot.yml 并立即热生效（不需要「保存并热重载」或重启）
     #[test]
-    fn blacklist_matches_global_and_group() {
-        crate::runtime::config::set_global_blacklist(vec![10001]);
-        assert!(runtime_config::is_blacklisted(10001, Some(1)));
-        crate::runtime::config::set_global_blacklist(Vec::new());
-        let mut setting = crate::config::arona::GroupSetting::default();
-        setting.blacklist.push(10002);
-        let mut map = std::collections::BTreeMap::new();
-        map.insert("1".to_string(), setting);
-        crate::runtime::config::set_group_settings(map);
-        assert!(runtime_config::is_blacklisted(10002, Some(1)));
-        assert!(!runtime_config::is_blacklisted(10002, Some(2)));
-        assert!(!runtime_config::is_blacklisted(10002, None));
-        crate::runtime::config::set_group_settings(Default::default());
+    fn image_send_switch_writes_onebot_yml_and_applies_immediately() {
+        let dir = std::env::temp_dir().join("arona-admin-send-image-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let file = dir.join("onebot.yml");
+        let _ = std::fs::remove_file(&file);
+        // 进程内只允许设置一次；指向临时目录，避免动到真实的 arona-standalone/onebot.yml
+        paths::set_onebot_file(file.clone());
+        crate::runtime::config::set_send_image_as_file(false);
+
+        let note = set_send_image_as_file(true).expect("切换到 file:// 直传应成功");
+        assert!(note.contains("file://"), "提示应说明已切换: {note}");
+        assert!(
+            crate::runtime::config::send_image_as_file(),
+            "运行期开关应立即变为 true"
+        );
+        let text = std::fs::read_to_string(&file).expect("onebot.yml 应已写入");
+        assert!(
+            text.contains("send_image_as_file: true"),
+            "配置应落盘到 onebot.yml: {text}"
+        );
+
+        let note = set_send_image_as_file(false).expect("切回内嵌 base64 应成功");
+        assert!(!note.contains("file://"), "提示应说明已切回: {note}");
+        assert!(
+            !crate::runtime::config::send_image_as_file(),
+            "运行期开关应立即变回 false"
+        );
+        let text = std::fs::read_to_string(&file).expect("onebot.yml 应已写入");
+        assert!(
+            text.contains("send_image_as_file: false"),
+            "配置应落盘到 onebot.yml: {text}"
+        );
+
+        let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_dir(&dir);
     }
 }

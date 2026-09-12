@@ -1,6 +1,6 @@
 [package]
 name = "arona-rs"
-version = "0.3.0"
+version = "0.3.4"
 edition = "2024"
 license = "AGPL-3.0-only"
 repository = "https://github.com/YuLinLoli/Arona-rs"

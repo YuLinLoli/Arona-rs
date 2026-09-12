@@ -26,6 +26,46 @@ pub fn report(context: &str, message: &str) {
     append_error_file(&path, &text);
 }
 
+/// 弹一个系统消息框（仅 Windows）。
+/// GUI 子系统双击启动时连控制台都没有，日志文件路径用户也不知道，只能靠它让错误被看见。
+/// 仅在启动阶段的致命配置错误里调用，不进 panic 钩子，避免在无人值守/自动化环境里卡住。
+#[cfg(windows)]
+pub fn message_box(title: &str, message: &str) {
+    use std::os::windows::ffi::OsStrExt;
+
+    const MB_OK: u32 = 0x0000_0000;
+    const MB_ICONERROR: u32 = 0x0000_0010;
+    const MB_SETFOREGROUND: u32 = 0x0001_0000;
+    const MB_TOPMOST: u32 = 0x0004_0000;
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn MessageBoxW(hwnd: isize, text: *const u16, caption: *const u16, u_type: u32) -> i32;
+    }
+
+    let wide = |value: &str| -> Vec<u16> {
+        std::ffi::OsStr::new(value)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    };
+    let text = wide(message);
+    let caption = wide(title);
+    // SAFETY: 两个字符串都以 NUL 结尾且在调用期间存活；仅调用 Win32 消息框 API
+    unsafe {
+        MessageBoxW(
+            0,
+            text.as_ptr(),
+            caption.as_ptr(),
+            MB_OK | MB_ICONERROR | MB_SETFOREGROUND | MB_TOPMOST,
+        );
+    }
+}
+
+/// 非 Windows 平台没有消息框，由调用方负责把错误写进日志
+#[cfg(not(windows))]
+pub fn message_box(_title: &str, _message: &str) {}
+
 /// 启动错误文件路径
 pub fn startup_error_path() -> PathBuf {
     crate::runtime::paths::logs_dir().join("startup-error.log")

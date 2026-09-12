@@ -11,3 +11,20 @@ pub mod gacha;
 #[cfg(test)]
 mod render_tests;
 mod text;
+
+/// 在阻塞线程池里执行纯 CPU 的绘图 + PNG 编码。
+///
+/// 抽卡结果图(2340×1080)与活动日历图的绘制、编码都是同步的 CPU 密集操作：直接放在
+/// tokio 工作线程上跑会把它占住，单核/双核服务器（工作线程本来就少）上收消息、写日志
+/// 这些任务会被整段卡死——表现就是「发完指令控制台不动了，过几秒才一次性刷出来」。
+/// 丢进 spawn_blocking 后异步工作线程只负责 IO，绘图期间日志照常输出。
+pub async fn cpu_bound<T, F>(task: F) -> Result<T, String>
+where
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+    T: Send + 'static,
+{
+    match tokio::task::spawn_blocking(task).await {
+        Ok(result) => result,
+        Err(err) => Err(format!("绘图任务执行失败: {err}")),
+    }
+}

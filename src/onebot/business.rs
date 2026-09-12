@@ -16,7 +16,6 @@ use std::time::Duration;
 pub struct HandlerState {
     group_names: Mutex<HashMap<i64, String>>,
     group_name_loading: Mutex<HashSet<i64>>,
-    pending_group_messages: Mutex<HashMap<i64, Vec<OneBotEvent>>>,
 }
 
 impl HandlerState {
@@ -24,7 +23,6 @@ impl HandlerState {
         HandlerState {
             group_names: Mutex::new(HashMap::new()),
             group_name_loading: Mutex::new(HashSet::new()),
-            pending_group_messages: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -218,13 +216,11 @@ impl StandaloneBusinessHandler {
             console::print_message(self_id, event, Some(name));
             return;
         }
-        self.state
-            .pending_group_messages
-            .lock()
-            .unwrap()
-            .entry(group_id)
-            .or_default()
-            .push(event.clone());
+        // 群名还没拿到：立刻按群号打印，绝不把「收到消息」这件事拖到一次网络请求之后。
+        // （原版在这里把消息排队等 get_group_info 返回：OneBot 端慢、没实现 get_group_info
+        //   或网络抖动时，控制台会先卡住最多 5 秒，收到的指令要等命令都执行完才显示出来）
+        console::print_message(self_id, event, None);
+        // 后台补一次群名，只影响后续消息的显示，不阻塞任何打印
         let mut loading = self.state.group_name_loading.lock().unwrap();
         if !loading.contains(&group_id) {
             loading.insert(group_id);
@@ -233,9 +229,9 @@ impl StandaloneBusinessHandler {
         }
     }
 
+    /// 后台获取群名并写入缓存（只用于后续消息的显示，绝不影响当前这行日志的实时性）
     fn spawn_load_group_name(&self, group_id: i64, connection: Arc<dyn OneBotConnection>) {
         let state = self.state.clone();
-        let self_id = self.config().self_id;
         tokio::spawn(async move {
             let params = json!({ "group_id": group_id });
             let response = {
@@ -254,18 +250,9 @@ impl StandaloneBusinessHandler {
             let name = name.unwrap_or_else(|| group_id.to_string());
             {
                 let mut names = state.group_names.lock().unwrap();
-                names.insert(group_id, name.clone());
+                names.insert(group_id, name);
             }
             state.group_name_loading.lock().unwrap().remove(&group_id);
-            let pending = state
-                .pending_group_messages
-                .lock()
-                .unwrap()
-                .remove(&group_id)
-                .unwrap_or_default();
-            for event in pending {
-                console::print_message(self_id, &event, Some(&name));
-            }
         });
     }
 
@@ -291,5 +278,89 @@ impl StandaloneBusinessHandler {
             _ => return Ok(None),
         };
         Ok(Some(data))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::onebot::model::OneBotActionResponse;
+    use crate::runtime::message::BoxFuture;
+
+    /// 永不响应的连接：模拟 OneBot 端很慢 / 没实现 get_group_info，
+    /// 任何动作都只会挂在那里，不会返回。
+    struct NeverResponding;
+
+    impl OneBotConnection for NeverResponding {
+        fn id(&self) -> u64 {
+            1
+        }
+
+        fn send<'a>(
+            &'a self,
+            _action: OneBotAction,
+        ) -> BoxFuture<'a, Option<OneBotActionResponse>> {
+            Box::pin(std::future::pending::<Option<OneBotActionResponse>>())
+        }
+
+        fn send_raw(&self, _payload: &str) {}
+        fn start(&self) {}
+        fn stop(&self) {}
+    }
+
+    fn group_event(self_id: i64, group_id: i64, user_id: i64, text: &str) -> OneBotEvent {
+        OneBotEvent {
+            time: 0,
+            self_id,
+            post_type: "message".into(),
+            notice_type: None,
+            message_type: Some("group".into()),
+            sub_type: None,
+            message_id: Some(1),
+            user_id: Some(user_id),
+            operator_id: None,
+            group_id: Some(group_id),
+            raw_message: Some(text.into()),
+            message: Some(json!([{ "type": "text", "data": { "text": text } }])),
+            sender: Some(json!({ "nickname": "测试用户" })),
+            raw: json!({}),
+        }
+    }
+
+    /// 回归：群名还没缓存时，「收到消息」也必须在本函数返回前就打印出来，
+    /// 不能排队等 get_group_info（原来会等最多 5 秒：控制台先卡住，
+    /// 而并行的命令几秒就出结果，于是出现「结果先出、收到指令后到」）。
+    #[tokio::test]
+    async fn group_message_is_printed_before_group_name_is_resolved() {
+        let self_id = 1493074321_i64;
+        let group_id = 987_654_321_i64;
+        let user_id = 20_001_i64;
+        let marker = "打印时序回归标记-0x5f3759df";
+        let registry = Arc::new(ConnectionRegistry::new());
+        let handler = StandaloneBusinessHandler::new(
+            OneBotConfig::default(),
+            crate::standalone::dispatcher::build(OneBotConfig::default()),
+            registry,
+        );
+
+        handler.on_event(
+            group_event(self_id, group_id, user_id, marker),
+            Arc::new(NeverResponding),
+        );
+
+        let lines = crate::runtime::log::live_lines();
+        let hit = lines
+            .iter()
+            .any(|line| line.text.contains(marker) && line.text.contains(&group_id.to_string()));
+        assert!(
+            hit,
+            "群名未解析时也必须立刻打印收到的消息；实际日志尾部: {:?}",
+            lines
+                .iter()
+                .rev()
+                .take(5)
+                .map(|line| line.text.clone())
+                .collect::<Vec<_>>()
+        );
     }
 }
