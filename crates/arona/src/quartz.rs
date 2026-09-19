@@ -215,6 +215,22 @@ pub fn remove(name: &str) -> bool {
     }
 }
 
+/// 按任务组整体取消（插件被禁用时用：一次停掉自己全部的定时任务，不必逐个记名字）
+pub fn remove_group(group: &str) -> usize {
+    let removed: Vec<Arc<TaskEntry>> = scheduler()
+        .tasks
+        .write()
+        .unwrap()
+        .extract_if(|_, entry| entry.group == group)
+        .map(|(_, entry)| entry)
+        .collect();
+    let count = removed.len();
+    for entry in removed {
+        entry.canceled.store(true, Ordering::SeqCst);
+    }
+    count
+}
+
 pub fn trigger(name: &str) -> Result<(), String> {
     let entry = scheduler()
         .tasks

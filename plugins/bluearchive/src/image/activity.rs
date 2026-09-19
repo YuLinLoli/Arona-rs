@@ -11,7 +11,6 @@ use crate::entity::{Activity, ServerLocale};
 use crate::image::draw;
 use crate::image::text;
 use crate::util::time::translate_readable_time;
-use arona::runtime::paths;
 use image::RgbaImage;
 use std::path::PathBuf;
 
@@ -99,9 +98,9 @@ pub fn render(
     Ok(file)
 }
 
-/// 本地活动日历图路径: arona-standalone/images/activity/activity-<服务>.png
+/// 本地活动日历图路径: data/bluearchive/image/activity/activity-<服务>.png
 pub fn image_path(server: ServerLocale) -> PathBuf {
-    paths::images_root()
+    crate::image_dir()
         .join("activity")
         .join(format!("activity-{}.png", server.command_name()))
 }

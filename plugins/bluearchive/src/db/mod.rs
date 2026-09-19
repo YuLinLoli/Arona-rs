@@ -100,7 +100,7 @@ CREATE INDEX IF NOT EXISTS idx_history_group_pool ON gacha_history(grp, pool);
 
 /// 初始化数据库连接并建表，返回是否成功
 pub fn start() -> bool {
-    let path = arona::runtime::paths::database_file();
+    let path = crate::db_file();
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -157,5 +157,5 @@ pub fn query<T>(f: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> Option<T>
 
 /// 不依赖已存在连接的文件级操作（备份恢复用）
 pub fn file_exists() -> bool {
-    Path::new(&arona::runtime::paths::database_file()).exists()
+    Path::new(&crate::db_file()).exists()
 }

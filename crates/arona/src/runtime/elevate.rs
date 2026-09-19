@@ -150,7 +150,7 @@ mod win {
     }
 
     /// 用 `runas` 动词重新拉起自身（会弹 UAC）；工作目录一并传过去，
-    /// 因为数据目录 `arona-standalone/` 是相对工作目录创建的
+    /// 因为运行目录（config/ 与 data/）是相对工作目录定位的
     pub fn relaunch_elevated(args: &[String]) -> Result<(), String> {
         let exe = std::env::current_exe().map_err(|err| err.to_string())?;
         let mut params: Vec<String> = args.iter().skip(1).cloned().collect();

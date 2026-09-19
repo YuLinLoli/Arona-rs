@@ -1,7 +1,7 @@
 //! /活动 命令与活动日历同步（对应原版 StandaloneActivity + StandaloneActivitySync）
 //! /活动 优先输出活动日历图片（纯 Rust 渲染, 对应原版 createActivityImage）；
 //! 字体不可用等渲染失败时自动回退为纯文本日历。
-//! 图片作为本地资源常驻 arona-standalone/images/activity/activity-<服务>.png, 只在每日 0 点与
+//! 图片作为本地资源常驻 data/bluearchive/image/activity/activity-<服务>.png, 只在每日 0 点与
 //! 活动到期后 5 分钟(1小时预警 + 1小时5分钟)由定时任务刷新; /活动 命中本地图片即直接发送。
 //! 刷新触发点: 程序启动时、每日 0 点、活动到期后 5 分钟。
 

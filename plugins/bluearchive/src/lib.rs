@@ -22,7 +22,58 @@ mod util;
 
 use arona::plugin::{AronaPlugin, PluginContext, PluginMeta};
 use arona::runtime::config::Feature;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicI32, Ordering};
+
+/// 本插件的稳定 id：框架按它规定落盘位置（`plugins/bluearchive/`、`config/bluearchive/arona.yml`、
+/// `data/bluearchive/`），`disabled_plugins` 里也写它。改名等于换一份用户数据，别动。
+pub(crate) const PLUGIN_ID: &str = "bluearchive";
+
+/// 本插件的数据目录（data/bluearchive：数据库与备份都在这）
+pub(crate) fn data_dir() -> PathBuf {
+    arona::runtime::paths::plugin_data_dir(PLUGIN_ID)
+}
+
+/// 本插件的图片目录（data/bluearchive/image：活动日历图、抽卡卡面、攻略缓存…）
+pub(crate) fn image_dir() -> PathBuf {
+    arona::runtime::paths::plugin_image_dir(PLUGIN_ID)
+}
+
+/// 本插件的 SQLite 数据库文件（data/bluearchive/arona.db）
+pub(crate) fn db_file() -> PathBuf {
+    data_dir().join("arona.db")
+}
+
+/// 本插件的备份目录（data/bluearchive/backups）
+pub(crate) fn backups_dir() -> PathBuf {
+    let dir = data_dir().join("backups");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+/// 本插件的配置目录（config/bluearchive：插件自己的 arona.yml 由框架生成，其它随带配置放这里）
+pub(crate) fn config_dir() -> PathBuf {
+    arona::runtime::paths::plugin_config_dir(PLUGIN_ID)
+}
+
+/// 旧版本把图片/数据库/备份放在 `arona-standalone/` 下。升级后一次性**复制**到
+/// `data/bluearchive/` 与 `config/bluearchive/`（只补缺、保留旧文件），用户不必重新拉数据。
+fn migrate_legacy_dirs() {
+    let legacy = arona::runtime::paths::legacy_root();
+    if !legacy.is_dir() {
+        return;
+    }
+    let data = data_dir();
+    arona::runtime::paths::migrate_dir(&legacy.join("images"), &image_dir());
+    for name in ["arona.db", "arona.db-wal", "arona.db-shm"] {
+        arona::runtime::paths::migrate_file(&legacy.join("data").join(name), &data.join(name));
+    }
+    arona::runtime::paths::migrate_dir(&legacy.join("backups"), &backups_dir());
+    arona::runtime::paths::migrate_file(
+        &legacy.join("trainer_config.yml"),
+        &config_dir().join("trainer_config.yml"),
+    );
+}
 
 /// 碧蓝档案功能插件。
 pub struct BluearchivePlugin;
@@ -96,12 +147,16 @@ const FEATURES: [Feature; 10] = [
 /// 每日活动推送任务名（与 activity::notify::enable_daily_job 保持一致）
 const DAILY_NOTIFY_JOB: &str = "StandaloneActivityNotify";
 
+/// 启动 20 秒后的首次预警任务名（create_delay 固定归在 "Delay" 组，只能按名字取消）
+const DAILY_NOTIFY_INIT_JOB: &str = "StandaloneActivityNotifyInit";
+
 /// 上一次生效的推送小时（-1 = 尚未初始化）：arona.yml 热重载后据此判断是否需要重建每日任务
 static LAST_NOTIFY_HOUR: AtomicI32 = AtomicI32::new(-1);
 
 impl AronaPlugin for BluearchivePlugin {
     fn meta(&self) -> PluginMeta {
         PluginMeta {
+            id: PLUGIN_ID,
             name: "BluearchivePlugin",
             version: env!("CARGO_PKG_VERSION"),
             description: "碧蓝档案功能插件（抽卡/活动/攻略/塔罗/名字记录/备份恢复）",
@@ -109,12 +164,14 @@ impl AronaPlugin for BluearchivePlugin {
     }
 
     fn install(&self) -> Result<(), String> {
-        // 登记功能开关：框架 GUI 的「功能开关」页与 arona.yml 模板注释据此生成
+        // 先把旧目录里的数据补迁到统一位置，后面的建库/读图才找得到东西
+        migrate_legacy_dirs();
+        // 登记功能开关：框架 GUI 的「功能开关」页与配置模板注释据此生成
         for feature in FEATURES {
-            arona::admin::register_feature(feature);
+            arona::admin::register_feature(feature, PLUGIN_ID);
         }
-        // 登记本插件自持有的配置区（notify / trainer）：必须早于框架加载 arona.yml，
-        // 否则加载时这两个顶层键会被当成未知键忽略、模板里也不会写出它们的注释块。
+        // 登记本插件自持有的配置区（notify / trainer）：必须早于框架加载配置，
+        // 否则 config/bluearchive/arona.yml 生成不出它们的带注释模板。
         config::register_sections();
         Ok(())
     }
@@ -122,7 +179,7 @@ impl AronaPlugin for BluearchivePlugin {
     fn configure(&self, ctx: &PluginContext) -> Result<(), String> {
         // 构建本插件的命令分发器（内部会注册全部服务），交给框架装配业务处理器
         let dispatcher = standalone::dispatcher::build(ctx.onebot_config.clone());
-        arona::plugin::set_dispatcher(dispatcher);
+        ctx.set_dispatcher(dispatcher);
 
         // --test-notify：20 秒后完整跑一次每日推送，便于联调验证
         if ctx.test_notify {
@@ -182,6 +239,16 @@ impl AronaPlugin for BluearchivePlugin {
     }
 
     fn stop(&self) {
+        // 进程退出与「被禁用」都走这里：先取消本插件的全部定时任务，
+        // 不然禁用了还照点在群里推日历/预警。
+        for group in [
+            DAILY_NOTIFY_JOB,
+            "StandaloneActivityNotifyOneHour",
+            "AronaActivityImageRefresh",
+        ] {
+            arona::quartz::remove_group(group);
+        }
+        arona::quartz::remove(DAILY_NOTIFY_INIT_JOB);
         db::close();
     }
 }

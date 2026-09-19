@@ -1,10 +1,10 @@
 //! 独立模式 arona 业务配置持有者（对应原版 standalone/StandaloneAronaConfig）
-//! 负责加载 arona.yml、监听文件变更自动热重载、为 /config 指令提供读写能力。
+//! 负责加载框架那份 config/arona.yml、监听文件变更自动热重载、为 /config 指令提供读写能力。
+//! 插件自己的配置在 config/<插件>/arona.yml，由 [`super::plugin_config`] 管。
 
 use super::arona::AronaConfig;
 use crate::runtime::value::{self, ConfigValue};
 use once_cell::sync::OnceCell;
-use serde_yaml::Value;
 use std::path::PathBuf;
 use std::sync::RwLock;
 use std::time::SystemTime;
@@ -15,7 +15,8 @@ pub struct ConfigField {
 }
 
 /// 框架自身管理的通用配置项（授权/黑名单）。插件自己持有的配置区（notify/trainer…）
-/// 由插件在 `/config` 里通过 [`section_value`] / [`set_section`] 读写，不进本表。
+/// 住在各自的 config/<插件>/arona.yml 里，由插件通过 [`super::plugin_config::section_value`]
+/// 读写，不进本表。
 pub const FIELDS: [ConfigField; 2] = [
     ConfigField {
         key: "groups",
@@ -67,27 +68,6 @@ pub fn init(path: PathBuf) -> Result<(), String> {
 /// 当前配置快照
 pub fn config() -> AronaConfig {
     state().read().unwrap().config.clone()
-}
-
-/// 读取某个插件配置区的原样 YAML 值（未登记/文件里没有时返回 None）
-pub fn section_value(key: &str) -> Option<Value> {
-    state().read().unwrap().config.sections.get(key).cloned()
-}
-
-/// 写回某个插件配置区并持久化到 arona.yml、热应用到运行期（插件 `/config` 用）。
-/// 会触发一次插件 `on_config_reload`（首次加载后的路径），插件自行决定是否需要重建任务。
-pub fn set_section(key: &str, value: Value) -> Result<(), String> {
-    let mut config = config();
-    config.sections.insert(key.to_string(), value);
-    let path = state()
-        .read()
-        .unwrap()
-        .file
-        .clone()
-        .ok_or_else(|| "配置文件尚未初始化".to_string())?;
-    super::arona::save(&path, &config).map_err(|err| format!("写入 arona.yml 失败: {err}"))?;
-    apply(config);
-    Ok(())
 }
 
 pub fn find_field_index(key: &str) -> Option<usize> {
@@ -162,6 +142,7 @@ fn apply(new_config: AronaConfig) {
     crate::runtime::config::set_managers(new_config.managers.clone());
     crate::runtime::config::set_global_blacklist(new_config.global_blacklist.clone());
     crate::runtime::config::set_group_settings(new_config.group_settings.clone());
+    crate::runtime::config::set_disabled_plugins(new_config.disabled_plugins.clone());
     let first = {
         let mut st = state().write().unwrap();
         st.config = new_config;
@@ -169,10 +150,12 @@ fn apply(new_config: AronaConfig) {
         st.applied_once = true;
         first
     };
-    // 首次加载不通知（插件 start 阶段会自行按配置建任务）；之后每次重载/写入都通知，
-    // 由插件自己在 on_config_reload 里判断是否需要重建（如推送小时是否变了）。
-    // 写锁已释放后再通知：插件会回读本配置（读锁）。
+    // 首次加载不通知：那时插件还没装配，configure/start 会按这份名单自己跳过禁用的插件。
+    // 之后每次重载/写入都通知，且写锁已释放（插件会回读本配置的读锁）。
     if !first {
+        // 先协调启用状态（禁用→stop / 启用→configure+start），再通知热重载：
+        // 刚启用的插件会同时收到一次 on_config_reload，自己的定时任务才是按新配置建的。
+        crate::plugin::sync_enabled_state();
         crate::plugin::notify_config_reloaded();
     }
     crate::runtime::log::info("arona.yml 配置已重载");
@@ -335,9 +318,9 @@ fn persist(config: &AronaConfig) -> Result<(), String> {
 
 /// 清理空的分群设置
 fn normalize_group_settings(config: &mut AronaConfig) {
-    config.group_settings.retain(|_, setting| {
-        !(setting.disabled_features.is_empty() && setting.blacklist.is_empty())
-    });
+    config
+        .group_settings
+        .retain(|_, setting| !setting.is_empty());
 }
 
 /// 启用/停用某个群（启用 = 加入 groups，停用 = 移出 groups）
@@ -390,6 +373,39 @@ pub fn set_group_blacklist(group_id: i64, user_id: i64, blacklisted: bool) -> Re
     persist(&config)
 }
 
+/// 全局启用/停用某个插件（GUI「插件管理」页的总开关）。
+/// 写盘后 apply 会调 [`crate::plugin::sync_enabled_state`]：停用即 stop()，启用即补 configure()+start()。
+pub fn set_plugin_enabled(plugin: &str, enabled: bool) -> Result<(), String> {
+    let mut config = config();
+    config
+        .disabled_plugins
+        .retain(|name| !name.eq_ignore_ascii_case(plugin));
+    if !enabled {
+        config.disabled_plugins.push(plugin.to_string());
+    }
+    persist(&config)
+}
+
+/// 在某个群里启用/停用某个插件（GUI「群管理」页）。只影响路由，不动插件的后台任务。
+pub fn set_group_plugin_enabled(group_id: i64, plugin: &str, enabled: bool) -> Result<(), String> {
+    let mut config = config();
+    {
+        let setting = config
+            .group_settings
+            .entry(group_id.to_string())
+            .or_default();
+        setting
+            .disabled_plugins
+            .retain(|name| !name.eq_ignore_ascii_case(plugin));
+        if !enabled {
+            setting.disabled_plugins.push(plugin.to_string());
+            setting.disabled_plugins.sort();
+        }
+    }
+    normalize_group_settings(&mut config);
+    persist(&config)
+}
+
 /// 全局黑名单：加入或移出
 pub fn set_global_blacklist(user_id: i64, blacklisted: bool) -> Result<(), String> {
     let mut config = config();
@@ -408,7 +424,7 @@ pub fn clear_group_setting(group_id: i64) -> Result<(), String> {
     persist(&config)
 }
 
-/// 轮询监听 arona.yml 修改（每 2 秒），触发热重载
+/// 轮询监听配置文件修改（每 2 秒）：框架的 arona.yml 与各插件的 config/<插件>/arona.yml
 fn spawn_watcher() {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
@@ -432,6 +448,8 @@ fn spawn_watcher() {
                 }
                 reload();
             }
+            // 插件配置文件同一条链路上顺带检查：省得起第二个轮询任务
+            super::plugin_config::poll_changed();
         }
     });
 }

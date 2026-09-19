@@ -170,8 +170,10 @@ fn mutate_notify_black_groups(value: i64, is_add: bool, show_value: bool) -> Str
 fn view_all() -> OutgoingMessage {
     let config = standalone::config();
     let notify = crate::config::notify();
-    let mut text = String::from(
-        "Arona 全部配置\n配置文件: arona-standalone/arona.yml (修改保存后自动热重载)\n",
+    let mut text = format!(
+        "Arona 全部配置\n框架配置: {}\n插件配置: {}\n(修改保存后自动热重载)\n",
+        arona::runtime::paths::arona_file().display(),
+        arona::config::plugin_config::config_file(crate::PLUGIN_ID).display(),
     );
     text.push_str(USAGE);
     text.push('\n');

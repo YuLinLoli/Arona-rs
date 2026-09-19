@@ -67,7 +67,7 @@ pub struct RemoteActionItem {
 
 /// 图片库根目录（等价原版 dataRoot/image）
 pub fn image_library_root() -> PathBuf {
-    arona::runtime::paths::images_root()
+    crate::image_dir()
 }
 
 /// 图片库本地文件路径（对应原版 GeneralUtils.localImageFile）

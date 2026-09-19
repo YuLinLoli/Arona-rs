@@ -1,9 +1,9 @@
 //! 碧蓝档案插件自持有的业务配置（notify 每日推送 / trainer 攻略）。
 //!
-//! 这些配置住在 arona.yml 的顶层键 `notify` / `trainer` 里，但框架不理解其内容：
-//! 插件在 install 阶段用 [`register_sections`] 把 [`NotifySection`] / [`TrainerSection`]
-//! 登记进框架，框架据此（1）识别合法顶层键、（2）生成 arona.yml 时回调 [`ConfigSection::render`]
-//! 写出带注释片段。运行期用 [`notify`] / [`trainer`] 从框架保存的原样 YAML 反序列化读取，
+//! 这两块配置住在框架给本插件划的配置文件 `config/bluearchive/arona.yml` 里（顶层键
+//! `notify` / `trainer`），框架不理解其内容：插件在 install 阶段用 [`register_sections`]
+//! 把 [`NotifySection`] / [`TrainerSection`] 登记进去，框架据此生成带注释模板、加载原样
+//! YAML 片段并在文件改动时热重载。运行期用 [`notify`] / [`trainer`] 反序列化读取，
 //! `/config` 改这两区时用 [`set_notify`] 写回。
 
 use arona::config::arona::ConfigSection;
@@ -102,24 +102,24 @@ pub struct TrainerFileConfig {
     pub overrides: Vec<TrainerOverride>,
 }
 
-/// 从框架保存的 arona.yml 原样片段读出 notify 配置（缺失或格式错时回退默认值）
+/// 从框架保存的插件配置原样片段读出 notify 配置（缺失或格式错时回退默认值）
 pub fn notify() -> NotifyConfig {
-    arona::config::standalone::section_value("notify")
+    arona::config::plugin_config::section_value("notify")
         .and_then(|value| serde_yaml::from_value::<NotifyConfig>(value).ok())
         .unwrap_or_default()
 }
 
-/// 从框架保存的 arona.yml 原样片段读出 trainer 配置（缺失或格式错时回退默认值）
+/// 从框架保存的插件配置原样片段读出 trainer 配置（缺失或格式错时回退默认值）
 pub fn trainer() -> TrainerConfig {
-    arona::config::standalone::section_value("trainer")
+    arona::config::plugin_config::section_value("trainer")
         .and_then(|value| serde_yaml::from_value::<TrainerConfig>(value).ok())
         .unwrap_or_default()
 }
 
-/// 把修改后的 notify 配置写回 arona.yml（触发框架热重载与插件 on_config_reload）
+/// 把修改后的 notify 配置写回 config/bluearchive/arona.yml（触发插件配置热重载）
 pub fn set_notify(config: &NotifyConfig) -> Result<(), String> {
     let value = serde_yaml::to_value(config).map_err(|err| format!("序列化 notify 失败: {err}"))?;
-    arona::config::standalone::set_section("notify", value)
+    arona::config::plugin_config::set_section("notify", value)
 }
 
 fn yaml_quote(value: &str) -> String {
@@ -132,11 +132,6 @@ struct NotifySection;
 impl ConfigSection for NotifySection {
     fn key(&self) -> &'static str {
         "notify"
-    }
-
-    /// 回到拆分前 arona.yml 里的老位置：紧跟 managers，在黑名单/分群那段之前
-    fn after_key(&self) -> Option<&'static str> {
-        Some("managers")
     }
 
     fn default_value(&self) -> Value {
@@ -175,7 +170,7 @@ impl ConfigSection for NotifySection {
     }
 }
 
-/// trainer 配置区渲染器（拆分前就写在 arona.yml 末尾，所以不声明 after_key）
+/// trainer 配置区渲染器
 struct TrainerSection;
 
 impl ConfigSection for TrainerSection {
@@ -223,15 +218,15 @@ impl ConfigSection for TrainerSection {
     }
 }
 
-/// install 阶段登记本插件的两块配置区（同一位置上按这里的顺序写出，
-/// 各自具体落在 arona.yml 哪一段后面由 `after_key` 声明）
+/// install 阶段登记本插件的两块配置区：框架据此在 config/bluearchive/arona.yml 里
+/// 按这里的顺序生成带注释模板（键名撞车时框架保留先登记的那家）
 pub fn register_sections() {
-    arona::config::arona::register_section(Arc::new(NotifySection));
-    arona::config::arona::register_section(Arc::new(TrainerSection));
+    arona::config::arona::register_section(crate::PLUGIN_ID, Arc::new(NotifySection));
+    arona::config::arona::register_section(crate::PLUGIN_ID, Arc::new(TrainerSection));
 }
 
-/// 串行化会改动全局 arona 配置持有者（`standalone::init`）的测试，避免并行互相覆盖。
-/// 用 tokio 异步锁：async 测试要跨 `.await` 持有它。
+/// 串行化会改动进程级配置表（插件配置持有者与框架 arona.yml 持有者）的测试，
+/// 避免并行互相覆盖。用 tokio 异步锁：async 测试要跨 `.await` 持有它。
 #[cfg(test)]
 pub(crate) static CONFIG_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -239,23 +234,22 @@ pub(crate) static CONFIG_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex:
 mod tests {
     use super::*;
 
-    /// 端到端：notify 段作为插件自持有配置区，读 → 改 → 写回 arona.yml → 重载，
-    /// 且写回时通用项(groups/managers)与其它 notify 子项都不丢，trainer 默认块照常渲染。
+    /// 端到端：notify 作为插件自持有配置区住在 config/bluearchive/arona.yml。
+    /// 读 → 改 → 写回 → 再读；框架的通用项（groups/managers）不会混进这个文件，
+    /// 未登记的 trainer 默认块照常渲染出来。
     #[tokio::test]
-    async fn notify_roundtrips_through_arona_yml() {
+    async fn notify_roundtrips_through_plugin_config_file() {
         let _serial = CONFIG_TEST_LOCK.lock().await;
         register_sections();
-        let dir = std::env::temp_dir().join("arona-cfg-notify-roundtrip");
-        let _ = std::fs::create_dir_all(&dir);
-        let file = dir.join("arona.yml");
+        let file = arona::config::plugin_config::config_file(crate::PLUGIN_ID);
+        std::fs::create_dir_all(file.parent().expect("插件配置文件应有父目录")).unwrap();
         let _ = std::fs::remove_file(&file);
         std::fs::write(
             &file,
-            "groups: [123]\nmanagers: [456]\n\
-             notify:\n  enable: true\n  every_day_hour: 8\n  jp: true\n  global: false\n  cn: true\n  black_groups: [999]\n  notify_text: \"预警\"\n",
+            "notify:\n  enable: true\n  every_day_hour: 8\n  jp: true\n  global: false\n  cn: true\n  black_groups: [999]\n  notify_text: \"预警\"\n",
         )
         .unwrap();
-        arona::config::standalone::init(file.clone()).expect("测试配置应能加载");
+        arona::config::plugin_config::init();
 
         let original = notify();
         assert_eq!(original.every_day_hour, 8);
@@ -273,30 +267,61 @@ mod tests {
             text.contains("notify_text: \"改过的文案\""),
             "文案未落盘: {text}"
         );
-        assert!(text.contains("groups: [123]"), "通用项 groups 丢失: {text}");
-        assert!(
-            text.contains("managers: [456]"),
-            "通用项 managers 丢失: {text}"
-        );
         assert!(
             text.contains("trainer:"),
             "未登记的 trainer 默认块未渲染: {text}"
         );
-        // 两块配置区各回各位：notify 紧跟 managers（拆分前就在那儿），trainer 留在末尾
-        let managers_at = text.find("managers: [456]").expect("managers 段");
-        let notify_at = text.find("notify:").expect("notify 段");
-        let blacklist_at = text.find("黑名单与分群功能开关").expect("框架黑名单段");
-        let trainer_at = text.find("trainer:").expect("trainer 段");
         assert!(
-            managers_at < notify_at && notify_at < blacklist_at,
-            "notify 应紧跟 managers、排在框架黑名单段之前:\n{text}"
+            !text.contains("managers:"),
+            "框架的通用项不该出现在插件配置里: {text}"
         );
         assert!(
-            blacklist_at < trainer_at,
-            "trainer 应排在框架配置段之后:\n{text}"
+            text.contains("id: bluearchive"),
+            "模板应写明插件 id: {text}"
         );
         assert_eq!(notify().every_day_hour, 20, "内存值未随写回同步");
 
         let _ = std::fs::remove_file(&file);
+    }
+
+    /// 升级兼容：notify 还写在框架 arona.yml 顶层时，框架加载它就把它搬进
+    /// config/bluearchive/arona.yml，并从框架那份文件里去掉，用户不用手改。
+    #[tokio::test]
+    async fn legacy_notify_in_framework_config_moves_to_plugin_file() {
+        let _serial = CONFIG_TEST_LOCK.lock().await;
+        register_sections();
+        let dir = std::env::temp_dir().join("arona-cfg-legacy-notify");
+        std::fs::create_dir_all(&dir).unwrap();
+        let framework_file = dir.join("arona.yml");
+        std::fs::write(
+            &framework_file,
+            "groups: [123]\nmanagers: [456]\nnotify:\n  every_day_hour: 21\n",
+        )
+        .unwrap();
+        let plugin_file = arona::config::plugin_config::config_file(crate::PLUGIN_ID);
+        let _ = std::fs::remove_file(&plugin_file);
+
+        arona::config::standalone::init(framework_file.clone()).expect("框架配置应能加载");
+        arona::config::plugin_config::init();
+
+        assert_eq!(notify().every_day_hour, 21, "旧写法里的值应当接管插件配置");
+        let plugin_text = std::fs::read_to_string(&plugin_file).expect("插件配置文件应已生成");
+        assert!(
+            plugin_text.contains("every_day_hour: 21"),
+            "旧写法应写进插件自己的文件: {plugin_text}"
+        );
+        let framework_text = std::fs::read_to_string(&framework_file).expect("框架配置应已重写");
+        assert!(
+            !framework_text.contains("notify:"),
+            "框架 arona.yml 里不该再留插件的键: {framework_text}"
+        );
+        assert!(
+            framework_text.contains("groups: [123]"),
+            "重写框架配置不该丢通用项: {framework_text}"
+        );
+
+        let _ = std::fs::remove_file(&framework_file);
+        let _ = std::fs::remove_file(&plugin_file);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

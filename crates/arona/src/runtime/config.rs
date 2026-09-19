@@ -5,28 +5,75 @@ use std::collections::BTreeMap;
 use std::sync::RwLock;
 
 /// 可被分群开关控制的功能项（GUI 与配置模板共用同一份清单）
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Feature {
     pub key: &'static str,
     pub name: &'static str,
     pub description: &'static str,
 }
 
-/// 功能清单：由插件在 install 阶段通过 `register_feature` 动态登记。
+/// 功能项 + 提供它的插件名。「插件级开关」（全局与分群）靠这个归属关系生效：
+/// 禁用插件 = 它名下所有功能一起停掉，不需要插件自己配合。
+struct RegisteredFeature {
+    feature: Feature,
+    plugin: String,
+}
+
+/// 功能清单：由插件在 install 阶段通过 [`register_feature`] 动态登记。
 /// key 用于 arona.yml 的 group_settings.disabled_features。
-static FEATURES: RwLock<Vec<Feature>> = RwLock::new(Vec::new());
+static FEATURES: RwLock<Vec<RegisteredFeature>> = RwLock::new(Vec::new());
 
 /// 登记一个可分群开关的功能（key 重复时忽略后来的，保留首个的展示信息）
-pub fn register_feature(feature: Feature) {
+pub fn register_feature(feature: Feature, plugin: &str) {
     let mut features = FEATURES.write().unwrap();
-    if !features.iter().any(|f| f.key == feature.key) {
-        features.push(feature);
+    if !features.iter().any(|f| f.feature.key == feature.key) {
+        features.push(RegisteredFeature {
+            feature,
+            plugin: plugin.to_string(),
+        });
     }
 }
 
 /// 功能清单（GUI 展示用）
 pub fn features() -> Vec<Feature> {
-    FEATURES.read().unwrap().clone()
+    FEATURES
+        .read()
+        .unwrap()
+        .iter()
+        .map(|registered| registered.feature.clone())
+        .collect()
+}
+
+/// 某个插件提供的功能清单（GUI「插件管理」页展示）
+pub fn features_of(plugin: &str) -> Vec<Feature> {
+    FEATURES
+        .read()
+        .unwrap()
+        .iter()
+        .filter(|registered| registered.plugin == plugin)
+        .map(|registered| registered.feature.clone())
+        .collect()
+}
+
+/// 功能 key -> 提供它的插件名
+pub fn feature_owner(key: &str) -> Option<String> {
+    FEATURES
+        .read()
+        .unwrap()
+        .iter()
+        .find(|registered| registered.feature.key == key)
+        .map(|registered| registered.plugin.clone())
+}
+
+/// 全部功能归属的插件名（去重，保持登记顺序）
+pub fn feature_plugins() -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for registered in FEATURES.read().unwrap().iter() {
+        if !names.contains(&registered.plugin) {
+            names.push(registered.plugin.clone());
+        }
+    }
+    names
 }
 
 /// 功能 key 列表文本，如 "gacha, name, tarot"
@@ -35,21 +82,57 @@ pub fn feature_keys_text() -> String {
         .read()
         .unwrap()
         .iter()
-        .map(|feature| feature.key)
+        .map(|registered| registered.feature.key)
         .collect::<Vec<&str>>()
         .join(", ")
 }
 
-/// 群功能开关默认开启；私聊(无群号)不受分群开关限制
+/// 群功能开关默认开启；私聊(无群号)不受分群开关限制。
+///
+/// 两道判断：提供这个功能的插件有没有被整体禁用（全局 + 该群），以及该群有没有单独关掉这个 key。
 pub fn feature_enabled(group_id: Option<i64>, key: &str) -> bool {
     if key.is_empty() {
         return true;
+    }
+    let owner = feature_owner(key);
+    if let Some(plugin) = &owner {
+        if !plugin_enabled(plugin) {
+            return false;
+        }
     }
     let Some(group_id) = group_id else {
         return true;
     };
     match group_settings().get(&group_id.to_string()) {
-        Some(setting) => setting.feature_enabled(key),
+        None => true,
+        Some(setting) => {
+            setting.feature_enabled(key)
+                && match &owner {
+                    Some(plugin) => plugin_enabled_in_group(plugin, Some(group_id)),
+                    // 没人登记过的 key（老配置里的残留）不做插件判断，按功能开关结论放行
+                    None => true,
+                }
+        }
+    }
+}
+
+/// 插件是否全局启用（不在 arona.yml 的 disabled_plugins 里就是启用）
+pub fn plugin_enabled(plugin: &str) -> bool {
+    !disabled_plugins()
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(plugin))
+}
+
+/// 插件在某个群里是否启用（私聊无群号，一律按启用处理，与 [`feature_enabled`] 一致）
+pub fn plugin_enabled_in_group(plugin: &str, group_id: Option<i64>) -> bool {
+    let Some(group_id) = group_id else {
+        return true;
+    };
+    match group_settings().get(&group_id.to_string()) {
+        Some(setting) => !setting
+            .disabled_plugins
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(plugin)),
         None => true,
     }
 }
@@ -83,8 +166,10 @@ pub struct RuntimeConfig {
     pub global_blacklist: RwLock<Vec<i64>>,
     /// 本地图片改用 file:// 路径直传 OneBot 实现
     pub send_image_as_file: RwLock<bool>,
-    /// 分群设置（群号 -> 功能开关/群内黑名单）
+    /// 分群设置（群号 -> 功能开关/插件开关/群内黑名单）
     pub group_settings: RwLock<BTreeMap<String, GroupSetting>>,
+    /// 全局禁用的插件名（arona.yml 的 disabled_plugins）
+    pub disabled_plugins: RwLock<Vec<String>>,
 }
 
 static CONFIG: OnceCell<RuntimeConfig> = OnceCell::new();
@@ -99,6 +184,7 @@ fn instance() -> &'static RuntimeConfig {
         global_blacklist: RwLock::new(Vec::new()),
         send_image_as_file: RwLock::new(false),
         group_settings: RwLock::new(BTreeMap::new()),
+        disabled_plugins: RwLock::new(Vec::new()),
     })
 }
 
@@ -176,4 +262,13 @@ pub fn uuid() -> String {
 
 pub fn set_uuid(value: String) {
     *instance().uuid.write().unwrap() = value;
+}
+
+/// 全局禁用的插件名列表（arona.yml 的 disabled_plugins）
+pub fn disabled_plugins() -> Vec<String> {
+    instance().disabled_plugins.read().unwrap().clone()
+}
+
+pub fn set_disabled_plugins(plugins: Vec<String>) {
+    *instance().disabled_plugins.write().unwrap() = plugins;
 }

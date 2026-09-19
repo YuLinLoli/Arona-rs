@@ -212,11 +212,11 @@ pub(crate) async fn run_bot(
     runtime::config::set_bot_id(onebot_config.self_id);
     runtime::config::set_end_with_sensei("老师".to_string());
 
+    // 插件配置：每个插件一份 config/<插件>/arona.yml（旧写法已在上面被接管，这里落盘并加载）
+    config::plugin_config::init();
+
     // 装配阶段：插件构建命令分发器
-    let ctx = plugin::PluginContext {
-        onebot_config: onebot_config.clone(),
-        test_notify,
-    };
+    let ctx = plugin::PluginContext::new(onebot_config.clone(), test_notify);
     plugin::configure_all(&ctx)?;
 
     // 启动阶段：数据库、数据预热、定时推送等由插件负责

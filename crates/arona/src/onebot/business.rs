@@ -61,11 +61,15 @@ impl StandaloneBusinessHandler {
     /// 收到事件
     pub fn on_event(&self, event: OneBotEvent, connection: Arc<dyn OneBotConnection>) {
         self.registry.broadcast_except(&event.raw, connection.id());
-        if event.post_type == "notice" {
-            self.handle_notice(&event);
-            return;
-        }
         if event.post_type != "message" {
+            // 框架自己的通知处理（机器人被踢时清理 groups 配置）
+            if event.post_type == "notice" {
+                self.handle_notice(&event);
+            }
+            // 通知/请求/元事件无条件投给插件钩子：黑名单用户退群、加群申请这类事同样要能响应
+            tokio::spawn(async move {
+                crate::onebot::hooks::dispatch(&event).await;
+            });
             return;
         }
         let self_id = self.config().self_id;
@@ -75,9 +79,8 @@ impl StandaloneBusinessHandler {
             console::print_message(self_id, &event, None);
         }
         let text = protocol::extract_text(&event).trim().to_string();
-        if text.is_empty() {
-            return;
-        }
+        // 纯图片/表情这类没有文本的消息，没有可分发的命令，但事件钩子照样要收到
+        let has_command = !text.is_empty();
         let Some(user_id) = event.user_id else { return };
         let is_admin = crate::runtime::config::is_manager(user_id);
         if !is_admin && !self.is_allowed_group(event.group_id) {
@@ -118,8 +121,15 @@ impl StandaloneBusinessHandler {
         });
         let dispatcher = self.dispatcher.clone();
         tokio::spawn(async move {
-            // 未匹配到命令时的兜底（如按 /攻略 模糊建议的数字回复）由分发器的 FallbackHandler 负责，
+            // 消息钩子先于命令分发：插件有机会整条接管（返回 Handled 时不再走命令）。
+            // 未匹配命令时的兜底（如 /攻略 模糊建议的数字回复）由分发器的 FallbackHandler 负责，
             // 由插件在构建分发器时注册，框架这里不感知具体功能。
+            if crate::onebot::hooks::dispatch(&event).await {
+                return;
+            }
+            if !has_command {
+                return;
+            }
             dispatcher.dispatch(context.clone()).await;
         });
     }

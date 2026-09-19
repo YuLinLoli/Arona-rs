@@ -421,11 +421,13 @@ mod tests {
         let dir = std::env::temp_dir().join("arona-notify-test");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("arona.yml");
+        std::fs::write(&path, "groups: [910001, 910002]\nmanagers: []\n").unwrap();
+        // notify 是本插件自持有的配置区，住在 config/bluearchive/arona.yml，不在框架那份里
+        let plugin_file = arona::config::plugin_config::config_file(crate::PLUGIN_ID);
+        std::fs::create_dir_all(plugin_file.parent().expect("插件配置目录")).unwrap();
         std::fs::write(
-            &path,
-            "groups: [910001, 910002]\n\
-             managers: []\n\
-             notify:\n\
+            &plugin_file,
+            "notify:\n\
              \x20 enable: true\n\
              \x20 every_day_hour: 8\n\
              \x20 jp: true\n\
@@ -444,10 +446,11 @@ mod tests {
         // 全局 arona 配置持有者被所有 init 测试共享，跨 await 持锁与其它配置测试串行
         let _serial = config::CONFIG_TEST_LOCK.lock().await;
         // 运行期由插件 install() 登记配置区；测试里直接 init()，需自行登记，
-        // 否则 arona.yml 的 notify 段会被当成未知键丢弃
+        // 否则 notify 段会被当成未知键丢弃
         config::register_sections();
         arona::runtime::config::set_bot_id(10000);
         arona::config::standalone::init(write_test_config()).expect("测试配置应能加载");
+        arona::config::plugin_config::init();
         let sender = Arc::new(CaptureSender::new());
         arona::runtime::services::set_message_sender(sender.clone());
 

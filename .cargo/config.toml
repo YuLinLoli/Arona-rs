@@ -28,9 +28,9 @@ dist = "test -p arona-host dist_build --release -- --ignored --nocapture --test-
 installer = "test -p arona-host installer_build --release -- --ignored --nocapture --test-threads=1"
 # 发布构建并立即运行
 run-release = "run --release -p arona-host"
-# 图片渲染冒烟自检: 生成样例 PNG 到 arona-standalone/images 并断言关键区域颜色
+# 图片渲染冒烟自检: 生成样例 PNG 到 data/bluearchive/image 并断言关键区域颜色
 smoke-image = "test -p bluearchive-plugin render -- --ignored --nocapture"
-# /十连 端到端自检: 走完整命令链路并生成结果图到 arona-standalone/images/gacha/result
+# /十连 端到端自检: 走完整命令链路并生成结果图到 data/bluearchive/image/gacha/result
 smoke-tenpull = "test -p bluearchive-plugin ten_pull -- --ignored --nocapture --test-threads=1"
 # /攻略 端到端自检: 拉取活动攻略/日程笔记/当期卡池/云端图片
 smoke-trainer = "test -p bluearchive-plugin trainer_test -- --ignored --nocapture --test-threads=1"

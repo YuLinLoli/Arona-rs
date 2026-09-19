@@ -3,8 +3,8 @@
 //! 含 GUI 的 Windows 产物是 windows 子系统（没有控制台），双击启动时一旦失败
 //! 就会表现为「没反应」。这里保证错误至少能被看见：
 //! 1. 打印到 stderr（有控制台时）
-//! 2. 写入统一日志 arona-standalone/logs/arona-yyyy-MM-dd.log
-//! 3. 兜底写入 arona-standalone/logs/startup-error.log
+//! 2. 写入统一日志 logs/arona-yyyy-MM-dd.log
+//! 3. 兜底写入 logs/startup-error.log
 //!
 //! 这里**不**主动 AllocConsole：GUI 模式/机器人运行期间报个警告就弹出一个黑窗口，
 //! 比看不到错误更糟。真要按命令行模式跑，由 `crate::run` 在进入命令行分支时调用

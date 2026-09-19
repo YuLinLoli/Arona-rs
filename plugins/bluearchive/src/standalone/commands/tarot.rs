@@ -9,7 +9,6 @@ use crate::runtime::tarot_config;
 use crate::util::time;
 use arona::runtime::dispatcher::CommandContext;
 use arona::runtime::message::OutgoingMessage;
-use arona::runtime::paths;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -90,7 +89,7 @@ async fn send_message(
 fn local_tarot_file(number: i64, positive: bool) -> Option<PathBuf> {
     let suffix = if positive { "up" } else { "down" };
     Some(
-        paths::images_root()
+        crate::image_dir()
             .join(TAROT_FOLDER)
             .join(format!("{}-{suffix}.png", number + 1)),
     )

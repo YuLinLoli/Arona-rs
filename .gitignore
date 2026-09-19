@@ -3,6 +3,21 @@ arona-standalone/
 .codex/
 .idea/
 
+# 运行期目录：程序与测试都按“当前工作目录”落地配置/数据/日志/插件清单，
+# cargo test 的工作目录是各个包目录，所以这三处都要忽略（路径写全，避免误伤 src/config 这类模块目录）
+/config/
+/data/
+/logs/
+/plugins/*/plugin.yml
+/crates/arona/config/
+/crates/arona/data/
+/crates/arona/logs/
+/crates/arona/plugins/
+/plugins/bluearchive/config/
+/plugins/bluearchive/data/
+/plugins/bluearchive/logs/
+/plugins/bluearchive/plugins/
+
 # 软件 OpenGL 兜底依赖(Mesa llvmpipe, 约 62MB): 用 scripts/fetch-softgl.ps1 现场获取, 不入库
 /softgl/
 .tmp-mesa/

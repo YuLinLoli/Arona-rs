@@ -78,9 +78,7 @@ fn content_id_of(node: &Value) -> Option<i64> {
 
 /// 活动攻略/日程笔记缓存根目录（对应原版 cacheDirectory）
 fn cache_directory(relative: &str) -> PathBuf {
-    arona::runtime::paths::images_root()
-        .join("gamekee")
-        .join(relative)
+    crate::image_dir().join("gamekee").join(relative)
 }
 
 /// 命中缓存则返回按序号排序的图片；contentId 不匹配时清空目录并返回 None

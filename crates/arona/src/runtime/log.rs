@@ -1,5 +1,5 @@
 //! 运行期日志（对应原版 RuntimeLog + StandaloneLogFile）
-//! 独立模式输出到 stdout，并附带写入 arona-standalone/logs/arona-yyyy-MM-dd.log（按天滚动）。
+//! 独立模式输出到 stdout，并附带写入 logs/arona-yyyy-MM-dd.log（按天滚动）。
 
 use once_cell::sync::OnceCell;
 use std::fs::OpenOptions;

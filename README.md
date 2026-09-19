@@ -65,15 +65,16 @@
    程序会自动沿降级链切到 CPU 渲染把管理面板画出来，所以服务器上也能正常开 GUI；
    正常带显卡的机器会优先用硬件渲染，`softgl\` 那份平时不会被加载。
    只在正常带显卡的机器上用的话，安装时选「自定义安装」可以把 `softgl\` 这项取消，省下 62 MB。
-3. 安装目录（默认 `%LOCALAPPDATA%\Programs\Arona-rs`）里会释放一份默认配置
-   （`arona-standalone\onebot.yml`、`arona.yml`、`trainer_config.yml`）。
+3. 安装目录（默认 `%LOCALAPPDATA%\Programs\Arona-rs`）的 `config\` 里会释放一份默认配置
+   （`config\onebot.yml`、`config\arona.yml`、`config\bluearchive\trainer_config.yml`）。
    这些文件**只在缺失时写入**，升级安装不会覆盖你改过的配置；万一缺失或损坏，
    程序启动时也会按内置默认值自动补齐。
 4. 从开始菜单启动「Arona-rs」打开管理面板，填好 OneBot 连接与群配置即可。
 
 安装包是**按用户安装**的，全程不需要管理员权限，也不会把数据写进 `Program Files`。
-快捷方式已把工作目录设为安装目录，所以数据目录就是安装目录下的 `arona-standalone\`。
-卸载时默认**保留** `arona-standalone\`（配置 / 数据库 / 日志 / 图片），会单独询问是否连数据一起删除。
+快捷方式已把工作目录设为安装目录，所以配置、数据、日志就在安装目录的
+`config\`、`data\`、`logs\` 下。
+卸载时默认**保留**这三个目录（配置 / 数据库 / 日志 / 图片），会单独询问是否连数据一起删除。
 
 #### 更新
 
@@ -97,8 +98,10 @@ HKEY_CURRENT_USER\Software\YuLinLoli\Arona-rs      # 选「为所有用户安装
 1. 从 [Releases](https://github.com/YuLinLoli/Arona-rs/releases) 下载 `arona-rs-<版本号>-win-x64.zip`
    解压（里面是 `arona-rs.exe`、`dxcompiler.dll`、`dxil.dll` 与 `softgl/`，渲染运行库全部随包；
    裸 exe 不再单独发布，需要单文件就用安装包）。解压后这些文件保持同级即可。
-2. 在你想作为数据目录的位置运行一次，会在**当前工作目录**下自动生成 `arona-standalone/`（`arona.yml`、`onebot.yml`、`data/`、`logs/`、`images/`、`backups/`）。
-3. 编辑 `onebot.yml` 填机器人账号和连接方式，编辑 `arona.yml` 填服务群和管理员。
+2. 在你想作为运行目录的位置运行一次，会在**当前工作目录**下自动生成
+   `config/`（`arona.yml`、`onebot.yml`、`gui.txt`、各插件的 `arona.yml`）、
+   `data/`（各插件自己的数据目录）、`logs/` 与 `plugins/`（插件清单）。
+3. 编辑 `config/onebot.yml` 填机器人账号和连接方式，编辑 `config/arona.yml` 填服务群和管理员。
 4. 重新启动。
 
 ### 管理员权限（UAC）
@@ -155,10 +158,26 @@ connections:
 
 ### arona.yml
 
+框架那份 `config/arona.yml` 只管「谁能用、谁被停掉」：
+
 ```yaml
 groups: []                  # 允许响应的群号，留空 = 所有群
 managers: []                # 管理员 QQ 号
+global_blacklist: []        # 全局用户黑名单：任何群/私聊都不触发（管理员不受限）
+disabled_plugins: []        # 整体停用的插件 id：不装配、不接收任何事件
 
+# 分群设置：群号 -> 关闭的功能 / 停用的插件 / 群内成员黑名单
+group_settings:
+  "123456789":
+    disabled_features: [tarot]
+    disabled_plugins: [bluearchive]
+    blacklist: [10001]
+```
+
+玩法参数住在插件自己那份 `config/<插件>/arona.yml`（碧蓝档案插件即
+`config/bluearchive/arona.yml`，首次启动时按内置模板自动生成并带逐行注释）：
+
+```yaml
 notify:
   enable: true              # 每日活动推送
   every_day_hour: 8
@@ -175,11 +194,15 @@ trainer:
   override: []              # /攻略 别名覆盖: type=IMAGE|RAW|CODE, name, value
 ```
 
-两个配置文件保存后自动热重载；`onebot.yml` 的连接项需要重启生效。`arona-standalone/trainer_config.yml` 可单独维护 `/攻略` 别名覆盖。
+旧版本把这些键写在框架 `arona.yml` 顶层，升级时框架会自动把它们搬进
+`config/bluearchive/arona.yml`，不用手改。
+
+两份文件保存后都自动热重载；`onebot.yml` 的连接项需要在面板里点「保存并热重载」。
+`config/bluearchive/trainer_config.yml` 可单独维护 `/攻略` 别名覆盖。
 
 ### 启动参数与环境变量
 
-- `--gui`（默认）：打开管理面板（群功能开关 / 群成员黑名单 / OneBot 连接配置与热重载）
+- `--gui`（默认）：打开管理面板（插件管理 / 群功能开关 / 群成员黑名单 / OneBot 连接配置与热重载）
 - `--nogui`：不打开面板，只启动命令行(黑窗口)模式
 - `--renderer=glow|wgpu|softgl`：只试指定的渲染后端（默认自动：**从高到低** —— 硬件 `glow` →
   `wgpu` + 随包 DXC → `wgpu` + 系统 FXC → 软件 OpenGL 兜底）
@@ -266,7 +289,7 @@ pwsh -File scripts/make-icon.ps1     # 从 assets/source 的立绘取上半部�
 ```bash
 cargo test                 # 离线单元测试
 cargo smoke-image          # 抽卡 / 活动日历图渲染冒烟自检（像素级断言）
-cargo smoke-tenpull        # /十连 端到端（联网，出图到 arona-standalone/images）
+cargo smoke-tenpull        # /十连 端到端（联网，出图到 data/bluearchive/image/gacha/result）
 cargo smoke-trainer        # /攻略 端到端（联网）
 cargo smoke-notify         # 推送与预警调度逻辑（离线）
 cargo smoke-notify-net     # 每日推送端到端（联网）
@@ -295,7 +318,37 @@ installer/               Windows 安装包：arona-rs.iss(Inno Setup 脚本)、i
 ```
 
 框架 `arona` 不依赖任何插件，插件单向依赖框架；要在不装 OneBot 的情况下换/加功能包，
-只改 `plugins.toml` 与 host 的 `Cargo.toml` 即可。开发新插件见 [PLUGIN_DEVELOPMENT.md](PLUGIN_DEVELOPMENT.md)。
+只改 `plugins.toml` 与 host 的 `Cargo.toml` 即可。
+
+框架给插件留出的接口：OneBot v11 全量强类型动作（收发/撤回消息、群管、成员资料、群文件、请求处理…）、
+四类事件的订阅钩子（message/notice/request/meta）、统一的 `config/<插件>/` 与 `data/<插件>/` 落盘位置、
+功能开关与插件级启停门控。开发新插件见 [PLUGIN_DEVELOPMENT.md](PLUGIN_DEVELOPMENT.md)。
+
+### 运行目录
+
+程序按**当前工作目录**摆放运行期文件（取路径的唯一入口是 `crates/arona/src/runtime/paths.rs`，
+插件不要自己拼路径，用框架给的 `ctx.config_dir()` / `ctx.data_dir()` / `ctx.image_dir()`）：
+
+```
+<运行目录>/
+  config/
+    arona.yml              框架配置：群授权 / 管理员 / 功能开关 / 插件开关
+    onebot.yml             OneBot 连接
+    gui.txt                面板外观偏好
+    <插件>/arona.yml        插件自己的配置（框架按注册表生成带注释的模板；插件升级新增的配置区会自动补齐，用户改过的值不动）
+    <插件>/…               插件附带的其它配置文件（如 trainer_config.yml）
+  data/
+    <插件>/                 插件数据（如 data/bluearchive/ 下的 arona.db、image/、backups/）
+  logs/                    按天滚动的日志
+  plugins/
+    <插件>/plugin.yml       插件清单（id / 名称 / 版本），install 阶段由框架写出
+```
+
+`plugins/<插件>/` 是插件的**身份目录**：插件随 exe 静态编译，不从这里加载代码，
+它表示「这个插件装在这台机器上」，用户数据一律按 id 归到 `config/<插件>/` 与 `data/<插件>/`。
+
+旧版本把这一切放在工作目录的 `arona-standalone/` 下：升级后首次启动会把框架认识的
+`arona.yml` / `onebot.yml` / `gui.txt` / `logs/` **复制**进上面的新布局（旧目录原样保留，不删不改）。
 
 ## 管理 GUI
 
@@ -322,13 +375,18 @@ DX12 之下还有 WARP 软件渲染），最后才是随程序附带的软件 Op
 
 若需要不含 GUI 的精简命令行产物：`cargo build --release --no-default-features`（或 `cargo build-nogui`）。
 
-面板顶部有四个标签页（关闭窗口 = 退出整个程序，GUI 与机器人一起结束）：
+面板顶部有五个标签页（关闭窗口 = 退出整个程序，GUI 与机器人一起结束）：
 
 **群管理**
 - 左栏：搜索群号/群名，`●`/`○` 标记该群是否启用，右侧显示已关闭的功能数量与黑名单人数；可点「刷新群列表」从 OneBot 拉取。
-- 右栏：勾选「启用本群响应」；按功能 key 逐个开关（抽卡 / 名字 / 塔罗 / 活动 / 攻略 / 任务 / 备份 / 配置 / 紧急 / 帮助）。
+- 右栏：勾选「机器人在此群启用」；「插件开关」按插件逐个停用（本群不响应它名下的命令与事件，在「插件管理」页整体停用的插件这里显示为灰色）；再按功能 key 逐个开关（抽卡 / 名字 / 塔罗 / 活动 / 攻略 / 任务 / 备份 / 配置 / 紧急 / 帮助）。
 - 「群成员黑名单」：点进群后自动拉取该群全部成员（管理员/群主/成员排序），每个成员有「本群」「全局」两个勾选框，可加入或移出黑名单，支持「只看黑名单」过滤。
-- 「清空该群设置」：删除该群的 `disabled_features` 与 `blacklist`，恢复默认。
+- 「清空该群设置」：删除该群的 `disabled_features`、`disabled_plugins` 与 `blacklist`，恢复默认。
+
+**插件管理**
+- 每个插件一张卡片：名称 / 版本 / 启用勾选框、说明、插件 id、它提供的功能开关、订阅的 OneBot 事件钩子、配置文件与数据目录（带「打开」按钮直接调资源管理器）。
+- 取消勾选即整体停用：写进 `config/arona.yml` 的 `disabled_plugins`，热生效 —— 插件 `stop()`（定时任务一并取消）、不再装配、不接收任何消息与事件；配置和数据原样保留，重新勾选就恢复。
+- 只想在某个群里停用：用「群管理」页的「插件开关」。
 
 **OneBot 连接**
 - 连接列表展示全部实例（同一类型可添加多个）。
@@ -342,16 +400,16 @@ DX12 之下还有 WARP 软件渲染），最后才是随程序附带的软件 Op
   （`[Arona]`/`[OneBot]` 绿、`WARNING`/`ERROR` 黄/红），并会按背景深浅换成对应深浅的版本，白色背景上同样看得清。
 - 行首显示本机时间。
 - 工具栏：`刷新`、`清空`、`自动滚动`、`只看告警/错误`、`最近 N 行`（200/500/1000/3000）、`打开日志目录`，以及关键字过滤。
-- 缓冲上限 3000 行（只保留最新），完整历史仍按天落盘到 `arona-standalone/logs/arona-yyyy-MM-dd.log`。
+- 缓冲上限 3000 行（只保留最新），完整历史仍按天落盘到 `logs/arona-yyyy-MM-dd.log`。
 
 **关于**
 - 显示版本号、项目仓库（https://github.com/YuLinLoli/Arona-rs ）、鸣谢（原版作者
-  https://github.com/diyigemt ）、开源协议，以及数据目录路径与快捷打开按钮。
+  https://github.com/diyigemt ）、开源协议，以及运行目录路径与快捷打开按钮。
 
 **外观（白天 / 黑夜）**
 - 右上角「外观」下拉可选 `跟随系统` / `白天模式` / `黑夜模式`，默认跟随系统。
 - 白天模式整体亮色背景 + **黑色**文字，黑夜模式整体深色背景 + **白色**文字。
-- 选择保存在数据目录的 `arona-standalone/gui.txt`，下次启动沿用（与机器人配置无关，删掉即恢复默认）。
+- 选择保存在 `config/gui.txt`，下次启动沿用（与机器人配置无关，删掉即恢复默认）。
 
 ### Windows Server / 虚拟机（没有可用显卡驱动）
 
@@ -393,7 +451,7 @@ powershell -ExecutionPolicy Bypass -File scripts/fetch-softgl.ps1
 arona-rs.exe --softgl
 ```
 
-- 目录查找顺序：`ARONA_SOFTGL_DIR` → exe 同级 `softgl\` → 工作目录 `softgl\` → `arona-standalone\softgl\`。
+- 目录查找顺序：`ARONA_SOFTGL_DIR` → exe 同级 `softgl\` → 工作目录 `softgl\` → `data\softgl\`。
 - 环境变量：`ARONA_SOFTGL=1` 等价于 `--softgl`；`ARONA_SOFTGL_DIR=<目录>` 直接指定目录。
 - `cargo dist` 与 GitHub Actions 发布包会自动带上 `softgl/`（发布 zip 解压后 exe 与 `softgl\` 同级即生效）。
 
@@ -424,12 +482,12 @@ arona-rs.exe --softgl
 程序启动时会安装 `log` 门面，**wgpu / glutin / winit 的诊断都会写进控制台和日志文件**。
 在这之前它们是被直接丢弃的，所以只会看到一句“没有可用的 wgpu 适配器”却不知道原因；
 关键信息（如 `failed to create Dx12 backend: ...`、`failed to load d3d12.dll`）现在都在
-`arona-standalone/logs/arona-yyyy-MM-dd.log` 里。`ARONA_LOG=info|debug|trace|off` 可调整级别。
+`logs/arona-yyyy-MM-dd.log` 里。`ARONA_LOG=info|debug|trace|off` 可调整级别。
 
 窗口创建失败时程序**不会静默退出**，而是：
 
 - 把 `GUI 启动失败: ...` 打到控制台（双击时会自动接回/新建控制台窗口）；
-- 写入 `arona-standalone/logs/startup-error.log` 与当天的 `arona-yyyy-MM-dd.log`；
+- 写入 `logs/startup-error.log` 与当天的 `arona-yyyy-MM-dd.log`；
 - 如果存在 `softgl\`，先自动用软件 OpenGL 重启一次；
 - 仍然失败才**回退到命令行模式**继续运行机器人（下次可直接加 `--nogui` 跳过 GUI）。
 
@@ -447,31 +505,37 @@ arona-rs.exe --softgl
 排查清单：
 
 - 直接跑 `arona-rs.exe --nogui`：能起机器人说明只是 GUI 的问题，用命令行模式即可；
-- 双击毫无反应：看 `arona-standalone/logs/startup-error.log`，配置/渲染/panic 的原因都在里面；
+- 双击毫无反应：看 `logs/startup-error.log`，配置/渲染/panic 的原因都在里面；
 - 面板起不来：先看日志里的后端失败原因；实在不行跑一次 `scripts/fetch-softgl.ps1` 走软渲染；
 - 用远程桌面（RDP）登录通常也能直接开面板；
 - Windows Server Core（无桌面体验）不支持 GUI，请只用 `--nogui`。
+
 ### 配置结构
 
 GUI「OneBot 连接」页里的「发送设置」（`send_image_as_file`）落在 `onebot.yml`，勾选后立即写盘并热生效；
-其余业务配置都在 `arona.yml` 里：
+其余授权/开关类配置都在框架的 `config/arona.yml` 里：
 
 ```yaml
+# 全局禁用的插件：列在这里的插件 id 不装配、不接收任何事件（GUI「插件管理」页写它）
+disabled_plugins: [bluearchive]
 # 全局用户黑名单：这些 QQ 在任何群/私聊都不触发机器人（管理员不受限）
 global_blacklist: [10001]
-# 分群设置：群号 -> 关闭的功能 / 群内成员黑名单
+# 分群设置：群号 -> 停用的插件 / 关闭的功能 / 群内成员黑名单
 group_settings:
   "123456789":
+    disabled_plugins: [bluearchive]        # 只在这个群里停用整个插件
     disabled_features: [tarot, activity]   # 可用 key 见 arona.yml 模板注释
     blacklist: [10002, 10003]
 ```
 
 修改会在下次读取时生效；通过 GUI 保存的分群设置会立即写盘并应用。
 
-`arona.yml` 里还可以出现 `notify`（每日推送）、`trainer`（`/攻略`）这类**插件自持有**的顶层配置区：
-框架只把它们当原样 YAML 片段保存、生成模板时回调插件写的渲染器，具体内容与读写命令都归插件实现
-（见 [PLUGIN_DEVELOPMENT.md](PLUGIN_DEVELOPMENT.md) §7）。加新插件时它自己的配置区同样写在这里，
-不需要改框架。
+玩法参数不归框架管，住在各插件自己的 `config/<插件>/arona.yml`（如
+`config/bluearchive/arona.yml` 的 `notify`、`trainer`）：框架只把它当原样 YAML 片段保存、
+生成模板时回调插件写的渲染器，具体内容与读写命令都归插件实现
+（见 [PLUGIN_DEVELOPMENT.md](PLUGIN_DEVELOPMENT.md) §7）。加新插件时它自己的配置区同样写在
+自己那份文件里，不需要改框架；旧版写在框架 `arona.yml` 顶层的插件配置区会在升级时自动搬过去。
+
 ## 移植声明与许可
 
 本项目是 [diyigemt/arona](https://github.com/diyigemt/arona) 的 Rust 移植版：命令行为、配置项、文案与数据结构均移植自该项目的 AGPLv3 源码（含其独立运行模式），仅保留 OneBot 独立模式、移除全部 Mirai 相关实现。

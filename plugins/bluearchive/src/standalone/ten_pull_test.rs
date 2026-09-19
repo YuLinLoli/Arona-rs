@@ -1,5 +1,5 @@
 //! `/十连` 端到端自检：走完整命令分发链路（服务守卫 -> 抽卡 -> 结果图渲染），
-//! 结果图落盘到运行目录 `arona-standalone/images/gacha/result/`。
+//! 结果图落盘到 `data/bluearchive/image/gacha/result/`。
 //!
 //! 需要联网拉取 kivo 学生数据/GameKee 当期卡池/学生头像，因此默认 ignore。
 //! 运行: cargo test ten_pull -- --ignored --nocapture --test-threads=1
@@ -34,7 +34,7 @@ impl MessageSender for CaptureSender {
 #[tokio::test]
 async fn ten_pull_outputs_image_into_standalone() {
     // 运行期依赖：数据目录 / 数据库 / 机器人配置
-    let root = arona::runtime::paths::prepare_standalone_root();
+    let image_root = crate::image_dir();
     arona::runtime::services::set_data_root(arona::runtime::paths::data_root());
     arona::runtime::config::set_bot_id(10000);
     arona::runtime::config::set_end_with_sensei("老师".to_string());
@@ -93,12 +93,12 @@ async fn ten_pull_outputs_image_into_standalone() {
     println!("抽卡结果图: {}", image_file.display());
     assert!(image_file.exists(), "结果图文件不存在: {image_path}");
 
-    let expected_dir = root.join("images").join("gacha").join("result");
+    let expected_dir = image_root.join("gacha").join("result");
     let parent = image_file.parent().expect("结果图没有父目录");
     assert_eq!(
         parent.canonicalize().ok(),
         expected_dir.canonicalize().ok(),
-        "结果图未落在 arona-standalone/images/gacha/result: {}",
+        "结果图未落在 data/bluearchive/image/gacha/result: {}",
         image_file.display()
     );
 

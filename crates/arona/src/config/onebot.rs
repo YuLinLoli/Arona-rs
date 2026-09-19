@@ -370,7 +370,7 @@ fn template(config: &OneBotConfig) -> String {
     out.push_str("# ==================== Arona OneBot 配置文件 ====================\n");
     out.push_str("# Rust 移植版（arona-rs）独立运行模式使用本文件。\n");
     out.push_str(
-        "# 文件位置：与可执行文件同级的 arona-standalone/onebot.yml，保存后热重载生效。\n",
+        "# 文件位置：运行目录下的 config/onebot.yml（与框架的 config/arona.yml 同目录），保存后热重载生效。\n",
     );
     out.push_str("# 每个连接的 type 取值：ws-forward / ws-reverse / http / http-reverse；\n");
     out.push_str("# 同一类型可以配置多个实例（键名任意，例如 ws-reverse-2）。\n\n");

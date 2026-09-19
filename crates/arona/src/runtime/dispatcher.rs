@@ -166,6 +166,11 @@ impl SimpleCommandDispatcher {
     }
 
     pub async fn dispatch(&self, context: Arc<CommandContext>) -> bool {
+        // 分发器由插件在 configure 阶段登记：那个插件全局停用、或在当前群被停用，
+        // 它名下的命令一律不再路由（未标功能 key 的命令也吃到分群插件开关）
+        if !crate::plugin::dispatcher_active_in_group(context.group_id) {
+            return false;
+        }
         let parts: Vec<String> = context
             .text
             .trim()

@@ -34,7 +34,7 @@ fn setup() -> (
     Arc<CaptureSender>,
     i64,
 ) {
-    arona::runtime::paths::prepare_standalone_root();
+    arona::runtime::paths::prepare();
     arona::runtime::services::set_data_root(arona::runtime::paths::data_root());
     arona::runtime::config::set_bot_id(10000);
     arona::runtime::config::set_end_with_sensei("老师".to_string());
@@ -252,7 +252,7 @@ async fn activity_command_returns_text() {
     assert_eq!(
         std::path::Path::new(&file),
         path.as_path(),
-        "活动图应为本地资源图片 arona-standalone/images/activity/activity-jp.png"
+        "活动图应为本地资源图片 data/bluearchive/image/activity/activity-jp.png"
     );
     let before = std::fs::metadata(&path)
         .and_then(|meta| meta.modified())

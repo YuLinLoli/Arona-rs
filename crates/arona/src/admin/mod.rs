@@ -9,6 +9,7 @@ use crate::onebot::protocol;
 use crate::runtime::config as runtime_config;
 use crate::runtime::paths;
 use serde_json::{Value, json};
+use std::path::PathBuf;
 use std::time::Duration;
 
 /// 群信息（OneBot get_group_list 与本地配置合并）
@@ -61,8 +62,81 @@ pub fn features() -> Vec<runtime_config::Feature> {
 
 /// 登记一个可分群开关的功能：插件在 install 阶段调用，GUI 的「功能开关」页会自动列出。
 /// 这就是框架留给插件的权限/开关接口——功能属于插件，开关与黑名单的存取由框架统一管理。
-pub fn register_feature(feature: runtime_config::Feature) {
-    runtime_config::register_feature(feature);
+///
+/// `plugin` 传自己的 `meta().id`：插件被整体禁用（全局或某个群）时，它名下功能一起停掉。
+pub fn register_feature(feature: runtime_config::Feature, plugin: &str) {
+    runtime_config::register_feature(feature, plugin);
+}
+
+// ==================== 插件管理 ====================
+
+/// 插件条目（GUI「插件管理」页）
+#[derive(Clone, Debug)]
+pub struct PluginInfo {
+    /// 插件 id：目录名与 `disabled_plugins` 里的写法
+    pub id: String,
+    pub name: String,
+    pub version: String,
+    pub description: String,
+    /// 全局启用状态（框架 arona.yml 的 disabled_plugins）
+    pub enabled: bool,
+    /// 该插件登记的功能开关
+    pub features: Vec<runtime_config::Feature>,
+    /// 该插件订阅的事件类型中文名（消息/通知/请求/元事件）
+    pub hooks: Vec<&'static str>,
+    /// 插件目录 plugins/<id>/
+    pub plugin_dir: PathBuf,
+    /// 配置文件 config/<id>/arona.yml（没有登记配置区时文件不存在）
+    pub config_file: PathBuf,
+    /// 数据目录 data/<id>/
+    pub data_dir: PathBuf,
+}
+
+/// 已注册插件的概览列表
+pub fn plugin_list() -> Vec<PluginInfo> {
+    let subscriptions = crate::onebot::hooks::subscriptions();
+    crate::plugin::metas()
+        .into_iter()
+        .map(|meta| {
+            let hooks = subscriptions
+                .iter()
+                .find(|(plugin, _)| *plugin == meta.id)
+                .map(|(_, kinds)| kinds.clone())
+                .unwrap_or_default();
+            PluginInfo {
+                id: meta.id.to_string(),
+                name: meta.name.to_string(),
+                version: meta.version.to_string(),
+                description: meta.description.to_string(),
+                enabled: runtime_config::plugin_enabled(meta.id),
+                features: runtime_config::features_of(meta.id),
+                hooks,
+                plugin_dir: paths::plugin_dir(meta.id),
+                config_file: paths::plugin_config_file(meta.id),
+                data_dir: paths::plugin_data_dir(meta.id),
+            }
+        })
+        .collect()
+}
+
+/// 全局启用/停用一个插件（按 id）：写配置文件后立即协调生命周期（停用 stop()、启用补 configure+start）
+pub fn set_plugin_enabled(plugin: &str, enabled: bool) -> Result<String, String> {
+    standalone::set_plugin_enabled(plugin, enabled)?;
+    Ok(format!(
+        "插件 {plugin} 已{}（写入 {}）",
+        if enabled { "启用" } else { "禁用" },
+        arona_file()
+    ))
+}
+
+/// 某个群里启用/停用插件（按 id；只影响该群的路由，不动插件后台任务）
+pub fn set_group_plugin_enabled(group_id: i64, plugin: &str, enabled: bool) -> Result<(), String> {
+    standalone::set_group_plugin_enabled(group_id, plugin, enabled)
+}
+
+/// 某个群禁用的插件 id 列表（GUI「群管理」页画开关用）
+pub fn group_disabled_plugins(group_id: i64) -> Vec<String> {
+    runtime_config::group_setting(group_id).disabled_plugins
 }
 
 // ==================== OneBot API ====================

@@ -7,7 +7,6 @@ use crate::data::http;
 use crate::gacha::{DrawReport, DrawResult};
 use crate::image::draw;
 use crate::image::text;
-use arona::runtime::paths;
 use image::RgbaImage;
 use std::path::{Path, PathBuf};
 
@@ -35,11 +34,11 @@ const STAR_SPACING: f64 = 74.0;
 const AVATAR_EXTS: [&str; 4] = ["png", "jpg", "jpeg", "webp"];
 
 fn avatar_dir() -> PathBuf {
-    paths::images_root().join("gacha").join("avatar")
+    crate::image_dir().join("gacha").join("avatar")
 }
 
 fn result_dir() -> PathBuf {
-    paths::images_root().join("gacha").join("result")
+    crate::image_dir().join("gacha").join("result")
 }
 
 /// 渲染抽卡结果图并保存为 PNG，返回文件路径。

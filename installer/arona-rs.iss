@@ -81,7 +81,7 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=6.1sp1
 ; 默认「仅为我安装」，装在 %LOCALAPPDATA%\Programs 下，全程不需要管理员权限，
-; 也避免装进 Program Files 后普通用户写不了数据目录（arona-standalone/）
+; 也避免装进 Program Files 后普通用户写不了运行目录（config/ 与 data/）
 ;
 ; 注意：这里只管「安装程序」本身的权限；主程序 arona-rs.exe 启动时会自己申请
 ; 管理员权限（UAC 自提权，见 crates/arona/src/runtime/elevate.rs），与安装范围无关。
@@ -133,9 +133,11 @@ Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion; Components: main
 Source: "intro.txt"; DestDir: "{app}"; DestName: "安装说明.txt"; Flags: ignoreversion; Components: main
 ; ---- 默认配置文件：只在缺失时释放，已存在（含用户改过的）一律不动 ----
 ;      uninsneveruninstall: 卸载时默认保留，是否删除由卸载流程单独询问
-Source: "defaults\onebot.yml"; DestDir: "{app}\arona-standalone"; Flags: onlyifdoesntexist uninsneveruninstall; Components: main
-Source: "defaults\arona.yml"; DestDir: "{app}\arona-standalone"; Flags: onlyifdoesntexist uninsneveruninstall; Components: main
-Source: "defaults\trainer_config.yml"; DestDir: "{app}\arona-standalone"; Flags: onlyifdoesntexist uninsneveruninstall; Components: main
+;      运行目录固定是 exe 所在目录（快捷方式已设 WorkingDir），配置统一在 config/ 下，
+;      每个插件自己的配置与数据再各占一层子目录（config/bluearchive/、data/bluearchive/）
+Source: "defaults\onebot.yml"; DestDir: "{app}\config"; Flags: onlyifdoesntexist uninsneveruninstall; Components: main
+Source: "defaults\arona.yml"; DestDir: "{app}\config"; Flags: onlyifdoesntexist uninsneveruninstall; Components: main
+Source: "defaults\trainer_config.yml"; DestDir: "{app}\config\bluearchive"; Flags: onlyifdoesntexist uninsneveruninstall; Components: main
 ; ---- CPU 软件渲染依赖（大体积依赖与 exe 分开存储，安装时释放到 {app}\softgl）----
 ;      程序在 exe 同级目录寻找 softgl\，找不到就跳过软渲染，不影响机器人功能
 #ifdef HasSoftgl
@@ -150,9 +152,10 @@ Source: "{#AppSourceDir}\dxil.dll"; DestDir: "{app}"; Flags: ignoreversion resta
 #endif
 
 [Icons]
-; 快捷方式必须把工作目录设成安装目录：数据目录 arona-standalone/ 是相对工作目录创建的
+; 快捷方式必须把工作目录设成安装目录：config/ 与 data/ 都是相对工作目录创建的
 Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExeName}"; WorkingDir: "{app}"; IconFilename: "{app}\{#AppExeName}"
-Name: "{autoprograms}\{#AppName} 数据目录"; Filename: "{app}\arona-standalone"; IconFilename: "{app}\{#AppExeName}"
+Name: "{autoprograms}\{#AppName} 运行目录"; Filename: "{app}"; IconFilename: "{app}\{#AppExeName}"
+Name: "{autoprograms}\{#AppName} 配置目录"; Filename: "{app}\config"; IconFilename: "{app}\{#AppExeName}"
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; WorkingDir: "{app}"; IconFilename: "{app}\{#AppExeName}"; Tasks: desktopicon
 
 [InstallDelete]
@@ -161,7 +164,7 @@ Type: files; Name: "{app}\arona-rs-*.exe"
 
 [Run]
 Filename: "{app}\{#AppExeName}"; Description: "{cm:LaunchProgram,{#AppName}}"; WorkingDir: "{app}"; Flags: nowait postinstall skipifsilent
-Filename: "{app}\arona-standalone"; Description: "打开数据目录（onebot.yml / arona.yml 在这里）"; Flags: postinstall shellexec skipifsilent unchecked
+Filename: "{app}\config"; Description: "打开配置目录（onebot.yml / arona.yml 在这里）"; Flags: postinstall shellexec skipifsilent unchecked
 Filename: "{app}\安装说明.txt"; Description: "查看安装说明"; Flags: postinstall shellexec skipifsilent unchecked
 
 [Code]
@@ -283,13 +286,31 @@ end;
 
 const
   UninstallDataPrompt = '是否同时删除配置、数据库、日志与图片？' + #13#10 + #13#10 +
-    '选择「是」会删除整个 arona-standalone 目录，其中包括你配置好的群、管理员、' +
+    '选择「是」会删除安装目录下的 config、data、logs 三个目录，其中包括你配置好的群、管理员、' +
     '黑名单、抽卡历史与备份，删除后无法恢复。' + #13#10 + #13#10 +
     '只想卸载程序、以后可能还回来用，请选择「否」。';
 
+// 卸载时询问后清理的用户数据目录（框架与所有插件都收敛在这三个目录下）
+procedure DeleteUserDataDirs();
+var
+  I: Integer;
+  Subs: array[0..2] of String;
+  Dir: String;
+begin
+  Subs[0] := 'config';
+  Subs[1] := 'data';
+  Subs[2] := 'logs';
+  for I := 0 to 2 do
+  begin
+    Dir := ExpandConstant('{app}\' + Subs[I]);
+    if DirExists(Dir) then
+      DelTree(Dir, True, True, True);
+  end;
+end;
+
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
-  DataDir: String;
+  HasUserData: Boolean;
 begin
   // 静默卸载(/VERYSILENT)不弹窗，一律保留用户数据，避免误删
   if UninstallSilent then
@@ -298,12 +319,17 @@ begin
   end;
   if CurUninstallStep = usPostUninstall then
   begin
-    DataDir := ExpandConstant('{app}\arona-standalone');
-    if DirExists(DataDir) then
+    HasUserData := DirExists(ExpandConstant('{app}\config'))
+      or DirExists(ExpandConstant('{app}\data'))
+      or DirExists(ExpandConstant('{app}\logs'))
+      or DirExists(ExpandConstant('{app}\arona-standalone'));
+    if HasUserData then
     begin
       if MsgBox(UninstallDataPrompt, mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES then
       begin
-        DelTree(DataDir, True, True, True);
+        DeleteUserDataDirs();
+        // 旧版本留下的 arona-standalone/ 已由程序升级时复制进新目录，这里一并清掉
+        DelTree(ExpandConstant('{app}\arona-standalone'), True, True, True);
       end;
     end;
   end;

@@ -295,7 +295,7 @@ async fn gacha_pool_forward(server: GachaServer) -> OutgoingMessage {
     if characters.is_empty() {
         return OutgoingMessage::text(format!("当前没有{}的当期卡池", server.display_name()));
     }
-    let image_dir = arona::runtime::paths::images_root()
+    let image_dir = crate::image_dir()
         .join("gacha-pool")
         .join(server.display_name());
     // 并行解析每个角色的卡池图：命中缓存直接用，未命中才下载
@@ -403,7 +403,7 @@ fn trainer_config() -> TrainerConfig {
 }
 
 fn trainer_file_path() -> PathBuf {
-    arona::runtime::paths::standalone_root().join("trainer_config.yml")
+    crate::config_dir().join("trainer_config.yml")
 }
 
 /// 读取独立的 trainer_config.yml（对应原版 TrainerCommand 的别名配置文件）

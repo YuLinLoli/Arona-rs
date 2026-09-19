@@ -1,14 +1,18 @@
 //! /备份 与 /恢复 命令（对应原版 StandaloneBackup）
-//! 打包 arona.yml + onebot.yml + data 目录；恢复时校验后覆盖并热重载。
+//! 打包框架 arona.yml + onebot.yml + 本插件 config/bluearchive/arona.yml + 本插件 data 目录；
+//! 恢复时校验后覆盖并热重载。
 
 use crate::db;
 use arona::config;
+use arona::config::plugin_config;
 use arona::quartz;
 use arona::runtime::message::OutgoingMessage;
-use arona::runtime::paths;
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+
+/// 插件自己的 arona.yml 在压缩包里的条目名（框架那份叫 arona.yml，两者不能撞名）
+const PLUGIN_CONFIG_ENTRY: &str = "plugin-arona.yml";
 
 /// /备份 [list|列表]
 pub fn backup(arguments: &[String]) -> OutgoingMessage {
@@ -32,7 +36,7 @@ pub fn restore(name: Option<&str>) -> OutgoingMessage {
     if name.contains('/') || name.contains('\\') || name == ".." {
         return OutgoingMessage::text(format!("非法的备份文件名: {name}"));
     }
-    let zip_file = paths::backups_dir().join(name);
+    let zip_file = crate::backups_dir().join(name);
     if !zip_file.is_file() {
         return OutgoingMessage::text(format!("备份文件不存在: {name}"));
     }
@@ -72,6 +76,18 @@ fn do_restore(zip_file: &Path, temp_dir: &Path, name: &str) -> OutgoingMessage {
     if let Err(err) = restore_data_dir(&temp_dir.join("data")) {
         return fail_restore(format!("恢复数据目录失败: {err}"));
     }
+    // 插件自己的配置区：旧备份里没有这一项，缺省时保持现状不动
+    let restored_plugin_config = temp_dir.join(PLUGIN_CONFIG_ENTRY);
+    if restored_plugin_config.is_file() {
+        let target = plugin_config::config_file(crate::PLUGIN_ID);
+        if let Some(parent) = target.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Err(err) = std::fs::copy(&restored_plugin_config, &target) {
+            return fail_restore(format!("覆盖插件配置失败: {err}"));
+        }
+        plugin_config::reload_all();
+    }
     let _ = config::standalone::init(arona_file);
     let _ = db::start();
     let _ = quartz::resume_all();
@@ -94,7 +110,7 @@ fn create_backup() -> OutgoingMessage {
     if !arona_file.is_file() {
         return OutgoingMessage::text("arona.yml 不存在，无法备份");
     }
-    let backups_dir = paths::backups_dir();
+    let backups_dir = crate::backups_dir();
     let _ = std::fs::create_dir_all(&backups_dir);
     let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
     let zip_file = backups_dir.join(format!("arona-backup-{stamp}.zip"));
@@ -112,9 +128,18 @@ fn create_backup() -> OutgoingMessage {
         if onebot_file.is_file() {
             write_entry(&mut zip, options, "onebot.yml", &onebot_file)?;
         }
-        let data_dir = paths::data_root();
+        let own_config = plugin_config::config_file(crate::PLUGIN_ID);
+        if own_config.is_file() {
+            write_entry(&mut zip, options, PLUGIN_CONFIG_ENTRY, &own_config)?;
+        }
+        let data_dir = crate::data_dir();
         if data_dir.is_dir() {
+            let backups_dir = crate::backups_dir();
             for file in collect_files(&data_dir) {
+                // 备份目录本身就在 data 下：不排掉的话每次备份都会把历史备份再套一层
+                if file.starts_with(&backups_dir) {
+                    continue;
+                }
                 let relative = file
                     .strip_prefix(&data_dir)
                     .unwrap_or(&file)
@@ -156,7 +181,7 @@ fn write_entry<W: Write + std::io::Seek>(
 }
 
 fn list_backups() -> OutgoingMessage {
-    let backups_dir = paths::backups_dir();
+    let backups_dir = crate::backups_dir();
     if !backups_dir.is_dir() {
         return OutgoingMessage::text("还没有任何备份");
     }
@@ -226,7 +251,7 @@ fn restore_data_dir(restored_data: &Path) -> Result<(), String> {
     if !restored_data.is_dir() {
         return Ok(());
     }
-    let data_dir = paths::data_root();
+    let data_dir = crate::data_dir();
     for file in collect_files(restored_data) {
         let relative = file
             .strip_prefix(restored_data)

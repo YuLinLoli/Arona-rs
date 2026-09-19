@@ -1,9 +1,11 @@
-//! arona 业务配置（对应原版 runtime/AronaConfig + AronaConfigLoader）
+//! arona 框架业务配置（`config/arona.yml`）
 //!
-//! 框架只理解「通用授权/黑名单/分群开关」这几项（groups/managers/global_blacklist/group_settings）；
-//! 各功能插件自己的配置区（如碧蓝档案的 notify / trainer）以原始 YAML 形式保存在
-//! [`AronaConfig::sections`] 里，框架不认识其内容，只在生成 arona.yml 时回调插件注册的
-//! [`ConfigSection`] 渲染器写出带注释片段，并据此避免把插件的键当成未知键。
+//! 本文件只管框架自己认识的几项：groups / managers / global_blacklist / group_settings /
+//! disabled_plugins。功能插件的配置不住这里——每个插件各有一份 `config/<插件>/arona.yml`，
+//! 由 [`super::plugin_config`] 负责生成模板、加载与热重载。
+//! 插件在 install 阶段用 [`register_section`] 登记自己那几块配置（带上自己的插件 id），
+//! 框架据此识别合法键、生成带注释模板，并把旧版还写在框架 arona.yml 顶层的同名键
+//! 搬进插件自己的文件（见 [`super::plugin_config::absorb_legacy`]）。
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
 use std::collections::BTreeMap;
@@ -18,15 +20,24 @@ pub struct GroupSetting {
     pub disabled_features: Vec<String>,
     /// 该群内的用户黑名单（这些 QQ 在本群不触发机器人）
     pub blacklist: Vec<i64>,
+    /// 该群整体禁用的插件 id：插件在该群的事件/命令一律不响应（GUI「群管理」里的开关）
+    pub disabled_plugins: Vec<String>,
 }
 
 impl GroupSetting {
     pub fn feature_enabled(&self, key: &str) -> bool {
         !self.disabled_features.iter().any(|item| item == key)
     }
+
+    /// 该设置里是否还有任何内容（清理空条目时用）
+    pub fn is_empty(&self) -> bool {
+        self.disabled_features.is_empty()
+            && self.blacklist.is_empty()
+            && self.disabled_plugins.is_empty()
+    }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AronaConfig {
     /// 允许响应的群号列表，留空表示响应所有群
@@ -37,27 +48,16 @@ pub struct AronaConfig {
     pub global_blacklist: Vec<i64>,
     /// 分群设置：群号(字符串) -> 功能开关 / 群内成员黑名单
     pub group_settings: BTreeMap<String, GroupSetting>,
-    /// 插件自持有的顶层配置区（notify/trainer…）：原样保存的 YAML 片段，框架不理解内容。
-    /// 派生序列化里跳过——由 [`save`] 通过注册的 [`ConfigSection`] 渲染器手动写出。
-    #[serde(skip)]
-    pub sections: BTreeMap<String, Value>,
+    /// 全局禁用的插件 id（GUI「插件管理」的总开关）：列在这里的插件不装配、不接收任何事件。
+    /// 取插件的 `meta().id`，大小写不敏感。
+    pub disabled_plugins: Vec<String>,
 }
 
-impl Default for AronaConfig {
-    fn default() -> Self {
-        AronaConfig {
-            groups: Vec::new(),
-            managers: Vec::new(),
-            global_blacklist: Vec::new(),
-            group_settings: BTreeMap::new(),
-            sections: BTreeMap::new(),
-        }
-    }
-}
-
-/// 插件持有的 arona.yml 顶层配置区。框架据此识别合法键、生成带注释模板并回调渲染。
-/// 插件在 install 阶段用 [`register_section`] 登记，之后自己用 [`super::standalone::section_value`]
-/// 读原样值、[`super::standalone::set_section`] 写回。
+/// 插件持有的一块配置（写在该插件自己的 `config/<插件>/arona.yml` 里）。
+/// 框架不理解内容，只负责：识别合法顶层键、生成模板时回调 [`ConfigSection::render`]
+/// 写出带注释片段。插件在 install 阶段用 [`register_section`] 登记，
+/// 之后自己用 [`super::plugin_config::section_value`] 读原样值、
+/// [`super::plugin_config::set_section`] 写回。
 pub trait ConfigSection: Send + Sync + 'static {
     /// 顶层键名（如 "notify"）
     fn key(&self) -> &'static str;
@@ -66,33 +66,57 @@ pub trait ConfigSection: Send + Sync + 'static {
     /// 渲染该区的带注释 YAML 片段（以 "key:" 开头，末尾不留空行）。实现里通常把 `value`
     /// 反序列化成自己的强类型配置后按字段输出，从而顺带过滤掉未知子键。
     fn render(&self, value: &Value) -> String;
-    /// 这块配置写在 arona.yml 里哪个框架顶层键的后面（`None` = 文件末尾）。
-    /// 同一位置上按 [`register_section`] 的注册顺序依次写出。
-    ///
-    /// 插件用它把自己那块放回原来的位置（例如碧蓝档案的 notify 一直紧跟 managers），
-    /// 框架因此不必知道任何插件的键名。
-    fn after_key(&self) -> Option<&'static str> {
-        None
-    }
 }
 
-static SECTIONS: RwLock<Vec<Arc<dyn ConfigSection>>> = RwLock::new(Vec::new());
+/// 已登记的配置区：(归属插件 id, 渲染器)，按登记顺序写出
+static SECTIONS: RwLock<Vec<(String, Arc<dyn ConfigSection>)>> = RwLock::new(Vec::new());
 
-/// 登记一个插件配置区（install 阶段调用；key 重复时保留首个）
-pub fn register_section(section: Arc<dyn ConfigSection>) {
+/// 登记一个插件配置区（install 阶段调用；键重复时保留先登记的）
+pub fn register_section(plugin: &str, section: Arc<dyn ConfigSection>) {
     let mut sections = SECTIONS.write().unwrap();
-    if !sections.iter().any(|s| s.key() == section.key()) {
-        sections.push(section);
+    if !sections.iter().any(|(_, item)| item.key() == section.key()) {
+        sections.push((plugin.to_string(), section));
     }
 }
 
-fn sections() -> Vec<Arc<dyn ConfigSection>> {
+fn sections() -> Vec<(String, Arc<dyn ConfigSection>)> {
     SECTIONS.read().unwrap().clone()
+}
+
+/// 某个插件登记的配置区（按登记顺序）
+pub fn sections_of(plugin: &str) -> Vec<Arc<dyn ConfigSection>> {
+    sections()
+        .into_iter()
+        .filter(|(owner, _)| owner == plugin)
+        .map(|(_, section)| section)
+        .collect()
+}
+
+/// 登记了配置区的插件 id（去重，按首次登记顺序）——框架据此决定要给谁生成配置文件
+pub fn section_owners() -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    for (owner, _) in sections() {
+        if !ids.contains(&owner) {
+            ids.push(owner);
+        }
+    }
+    ids
+}
+
+/// 某块配置属于哪个插件
+pub fn section_owner(key: &str) -> Option<String> {
+    sections()
+        .into_iter()
+        .find(|(_, section)| section.key() == key)
+        .map(|(owner, _)| owner)
 }
 
 /// 已登记的插件配置区键名列表
 pub fn section_keys() -> Vec<String> {
-    sections().iter().map(|s| s.key().to_string()).collect()
+    sections()
+        .into_iter()
+        .map(|(_, section)| section.key().to_string())
+        .collect()
 }
 
 fn read_text(path: &Path) -> std::io::Result<String> {
@@ -109,7 +133,13 @@ fn write_text(path: &Path, content: &str) -> std::io::Result<()> {
 }
 
 /// 框架自身认识的顶层键（除这些之外的顶层键交给插件配置区/未知键逻辑处理）
-const GENERIC_TOP_KEYS: [&str; 4] = ["groups", "managers", "global_blacklist", "group_settings"];
+const GENERIC_TOP_KEYS: [&str; 5] = [
+    "groups",
+    "managers",
+    "global_blacklist",
+    "group_settings",
+    "disabled_plugins",
+];
 
 /// 曾经写在 arona.yml、现已迁到 onebot.yml 的键：单独提示，避免和普通笔误混在一条日志里
 const MOVED_TOP_KEYS: [&str; 1] = ["send_image_as_file"];
@@ -131,7 +161,7 @@ pub fn load(file: &Path) -> Result<AronaConfig, String> {
                 }
             }
         }
-        // 2) 从旧 onebot.yml/yaml 迁移 groups/managers 与已登记插件配置区
+        // 2) 从旧 onebot.yml/yaml 迁移 groups/managers（插件配置区同样搬进各自的文件）
         let legacy = read_legacy_from_onebot(file);
         let config = AronaConfig {
             groups: legacy
@@ -142,9 +172,7 @@ pub fn load(file: &Path) -> Result<AronaConfig, String> {
                 .as_ref()
                 .map(|l| l.managers.clone())
                 .unwrap_or_default(),
-            global_blacklist: Vec::new(),
-            group_settings: BTreeMap::new(),
-            sections: legacy.map(|l| l.sections).unwrap_or_default(),
+            ..Default::default()
         };
         save(file, &config).map_err(|e| format!("写入 arona.yml 失败: {e}"))?;
         return Ok(config);
@@ -156,11 +184,12 @@ fn parse(file: &Path) -> Result<AronaConfig, String> {
     let text = read_text(file).map_err(|e| format!("读取 {} 失败: {e}", file.display()))?;
     let value: Value = serde_yaml::from_str(&text)
         .map_err(|e| format!("arona.yml 解析失败，请检查格式（参考同目录说明）: {e}"))?;
-    let mut config: AronaConfig = serde_yaml::from_value(value.clone())
+    let config: AronaConfig = serde_yaml::from_value(value.clone())
         .map_err(|e| format!("arona.yml 解析失败，请检查格式（参考同目录说明）: {e}"))?;
     // 未知顶层键：serde 默认静默忽略（例如把 onebot.yml 的 connections 写进本文件），
-    // 用户会以为配置生效了，这里逐个写进日志提示；已登记插件配置区的键原样收进 sections。
+    // 用户会以为配置生效了，这里逐个写进日志提示；已登记的插件配置区键则搬去插件自己的文件。
     let registered = section_keys();
+    let mut moved: Vec<String> = Vec::new();
     if let Some(map) = value.as_mapping() {
         for (key, val) in map {
             let Some(name) = key.as_str() else { continue };
@@ -170,16 +199,26 @@ fn parse(file: &Path) -> Result<AronaConfig, String> {
                 crate::runtime::log::warning(format!(
                     "arona.yml 的「{name}」已移动到 onebot.yml（本项已忽略），请在 onebot.yml 里设置，或用管理面板「OneBot 连接」页的「发送设置」勾选"
                 ));
-            } else if registered.iter().any(|k| k == name) {
-                config.sections.insert(name.to_string(), val.clone());
+            } else if let Some(owner) = section_owner(name) {
+                // 旧版把插件配置写在框架 arona.yml 顶层：交给插件配置模块搬进它自己的文件
+                super::plugin_config::absorb_legacy(name, val.clone(), &owner);
+                moved.push(name.to_string());
             } else {
                 crate::runtime::log::warning(format!(
-                    "arona.yml 存在无法识别的配置项「{name}」，已忽略；可用配置项: {} / {}",
+                    "arona.yml 存在无法识别的配置项「{name}」，已忽略；可用配置项: {} / 插件配置区: {}",
                     GENERIC_TOP_KEYS.join(" / "),
                     registered.join(" / ")
                 ));
             }
         }
+    }
+    // 搬完就把本文件里的插件键清掉：留着下次加载还会再“迁移”一遍，用户也看不出改哪
+    if !moved.is_empty() {
+        save(file, &config).map_err(|e| format!("重写 arona.yml 失败: {e}"))?;
+        crate::runtime::log::info(format!(
+            "arona.yml 里的插件配置区（{}）已搬进各自 config/<插件>/arona.yml",
+            moved.join(" / ")
+        ));
     }
     Ok(config)
 }
@@ -196,10 +235,10 @@ pub fn default_file() -> std::path::PathBuf {
 struct LegacyExtra {
     groups: Vec<i64>,
     managers: Vec<i64>,
-    sections: BTreeMap<String, Value>,
 }
 
-/// 旧版 onebot.yml 中可能存在的业务字段：迁移 groups/managers，以及已登记插件配置区的同名顶层键
+/// 旧版 onebot.yml 中可能存在的业务字段：迁移框架的 groups/managers；
+/// 已登记插件配置区的同名顶层键交给插件配置模块接管
 fn read_legacy_from_onebot(arona_file: &Path) -> Option<LegacyExtra> {
     let parent = arona_file.parent()?;
     let new_file = parent.join("onebot.yml");
@@ -228,25 +267,24 @@ fn read_legacy_from_onebot(arona_file: &Path) -> Option<LegacyExtra> {
         extra.managers = managers;
     }
     for key in section_keys() {
-        if let Some(val) = map.get(&key) {
-            extra.sections.insert(key, val.clone());
+        if let (Some(val), Some(owner)) = (map.get(&key), section_owner(&key)) {
+            super::plugin_config::absorb_legacy(&key, val.clone(), &owner);
         }
     }
     Some(extra)
 }
 
-/// 生成带注释的模板文本
+/// 生成带注释的模板文本（只含框架自身的项；插件配置在 config/<插件>/arona.yml）
 fn template(config: &AronaConfig) -> String {
     let mut out = String::new();
     out.push_str("# ==================== Arona 框架配置 ====================\n");
     out.push_str("# Rust 移植版（arona-rs）独立运行模式使用本文件，修改后保存即自动热重载。\n");
-    out.push_str("# OneBot 协议连接配置见同目录 onebot.yml；本文件只放非 OneBot 的配置。\n");
-    out.push_str("# 下面框架自身的项是固定的；功能插件的配置区由插件自己补在它声明的位置。\n\n");
+    out.push_str("# 本文件只放框架自身的项：授权、黑名单、分群开关与插件开关。\n");
+    out.push_str("# OneBot 协议连接配置见同目录 onebot.yml；功能插件的配置在各自的 config/<插件>/arona.yml。\n\n");
     out.push_str("# 允许响应的群号列表，留空表示响应所有群\n");
     out.push_str(&format!("groups: {:?}\n", config.groups));
     out.push_str("# 管理员 QQ 号列表，可执行管理命令\n");
     out.push_str(&format!("managers: {:?}\n", config.managers));
-    render_sections(&mut out, Some("managers"), config);
     out.push('\n');
     out.push_str("# ==================== 黑名单与分群功能开关 ====================\n");
     out.push_str("# 全局用户黑名单：这些 QQ 在任何群/私聊都不触发机器人（管理员不受限）\n");
@@ -254,8 +292,7 @@ fn template(config: &AronaConfig) -> String {
         "global_blacklist: {:?}\n",
         config.global_blacklist
     ));
-    render_sections(&mut out, Some("global_blacklist"), config);
-    out.push_str("# 分群设置：群号 -> 关闭的功能(disabled_features) / 群内成员黑名单(blacklist)\n");
+    out.push_str("# 分群设置：群号 -> 关闭的功能(disabled_features) / 禁用的插件(disabled_plugins) / 群内成员黑名单(blacklist)\n");
     out.push_str("# 可用功能 key: ");
     out.push_str(&crate::runtime::config::feature_keys_text());
     out.push('\n');
@@ -263,6 +300,13 @@ fn template(config: &AronaConfig) -> String {
         out.push_str("# group_settings:\n");
         out.push_str("#   \"123456789\":\n");
         out.push_str("#     disabled_features: [tarot]\n");
+        out.push_str(&format!(
+            "#     disabled_plugins: [{}]\n",
+            crate::plugin::metas()
+                .first()
+                .map(|meta| meta.id)
+                .unwrap_or("插件id")
+        ));
         out.push_str("#     blacklist: [10001]\n");
         out.push_str("group_settings: {}\n");
     } else {
@@ -276,27 +320,31 @@ fn template(config: &AronaConfig) -> String {
         }
     }
     out.push('\n');
+    out.push_str("# ==================== 插件开关 ====================\n");
+    out.push_str("# 全局禁用的插件：列在这里的插件启动时不装配、也不接收任何事件\n");
+    out.push_str("# 已安装的插件(id): ");
+    out.push_str(&plugin_ids_text());
+    out.push('\n');
+    if config.disabled_plugins.is_empty() {
+        out.push_str("disabled_plugins: []\n");
+    } else {
+        out.push_str(&format!(
+            "disabled_plugins: {:?}\n",
+            config.disabled_plugins
+        ));
+    }
+    out.push('\n');
     out.push_str("# 提示: 本地图片的发送方式(send_image_as_file)属于 onebot.yml，在那里配置。\n");
-    // 插件自持有的配置区（notify/trainer…）：各自按 after_key 插回原位，
-    // 没声明位置的按注册顺序排在文件末尾。
-    render_sections(&mut out, Some("group_settings"), config);
-    render_sections(&mut out, None, config);
     out
 }
 
-/// 写出紧跟在某个框架顶层键之后的插件配置区（同一位置按注册顺序）
-fn render_sections(out: &mut String, after: Option<&str>, config: &AronaConfig) {
-    for section in sections() {
-        if section.after_key() != after {
-            continue;
-        }
-        let value = config
-            .sections
-            .get(section.key())
-            .cloned()
-            .unwrap_or_else(|| section.default_value());
-        out.push('\n');
-        out.push_str(&section.render(&value));
+/// 已安装插件的 id 列表（模板注释里据此告诉用户能禁用谁）
+fn plugin_ids_text() -> String {
+    let ids: Vec<&str> = crate::plugin::metas().iter().map(|meta| meta.id).collect();
+    if ids.is_empty() {
+        "(无)".to_string()
+    } else {
+        ids.join(", ")
     }
 }
 
@@ -304,7 +352,7 @@ fn render_sections(out: &mut String, after: Option<&str>, config: &AronaConfig) 
 mod tests {
     use super::*;
 
-    /// 回归：不认识的顶层键只记日志、不报错（例如把 onebot.yml 的 connections 写进 arona.yml），
+    /// 回归：不认识的顶层键只记日志、不报错（例如把 onebot.yml 的 connections 写进本文件），
     /// 一个笔误不该让程序起不来。
     #[test]
     fn unknown_top_level_keys_are_ignored() {
@@ -317,8 +365,7 @@ mod tests {
         let config = load(&file).expect("未知顶层键不应导致加载失败");
         assert_eq!(config.groups, vec![10001]);
         assert_eq!(config.managers, vec![20002]);
-        // 未登记的顶层键（connections）不进 sections，会被丢弃
-        assert!(config.sections.is_empty());
+        assert!(config.disabled_plugins.is_empty());
         let _ = std::fs::remove_file(&file);
     }
 
@@ -331,8 +378,6 @@ mod tests {
             .expect("写入测试配置失败");
         let config = load(&file).expect("已迁移的旧键不应导致加载失败");
         assert_eq!(config.groups, vec![10001]);
-        // 已迁移的旧键不进 sections（不写回，避免残留）
-        assert!(config.sections.is_empty());
         let _ = std::fs::remove_file(&file);
     }
 }

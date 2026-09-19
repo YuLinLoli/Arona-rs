@@ -1,5 +1,5 @@
 //! Arona 管理 GUI（egui/eframe 原生窗口）
-//! 功能：分群功能开关、群成员黑名单、OneBot 连接配置（支持多实例）与热重载、实时日志。
+//! 功能：插件管理（全局/分群停用）、分群功能开关、群成员黑名单、OneBot 连接配置（支持多实例）与热重载、实时日志。
 //! 构建：cargo build --release（GUI 默认启用，--no-default-features 可关闭）；
 //! 运行：arona-rs 默认打开本面板，arona-rs --nogui 只启动命令行(黑窗口)
 use crate::admin;
@@ -21,12 +21,13 @@ enum Msg {
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum Tab {
     Groups,
+    Plugins,
     Connections,
     Logs,
     About,
 }
 
-/// 界面外观偏好（持久化到 arona-standalone/gui.txt）
+/// 界面外观偏好（持久化到 config/gui.txt）
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum ThemePref {
     /// 跟随系统（首次启动的默认值）
@@ -72,9 +73,9 @@ impl ThemePref {
     }
 }
 
-/// 外观偏好的存放位置（arona-standalone/gui.txt，只有一行）
+/// 外观偏好的存放位置（config/gui.txt，只有一行）
 fn theme_file() -> std::path::PathBuf {
-    paths::prepare_standalone_root().join("gui.txt")
+    paths::gui_preference_file()
 }
 
 fn load_theme() -> ThemePref {
@@ -397,6 +398,8 @@ struct AronaGui {
     loading_members: bool,
     member_filter: String,
     only_blacklisted: bool,
+    // 插件管理
+    plugins: Vec<admin::PluginInfo>,
     // OneBot 连接
     onebot: Option<OneBotConfig>,
     onebot_error: Option<String>,
@@ -435,6 +438,7 @@ impl AronaGui {
             loading_members: false,
             member_filter: String::new(),
             only_blacklisted: false,
+            plugins: Vec::new(),
             onebot: None,
             onebot_error: None,
             new_type: ConnectionType::WebSocket,
@@ -648,6 +652,7 @@ impl AronaGui {
         ui.horizontal(|ui| {
             for (tab, label) in [
                 (Tab::Groups, "群管理"),
+                (Tab::Plugins, "插件管理"),
                 (Tab::Connections, "OneBot 连接"),
                 (Tab::Logs, "实时日志"),
                 (Tab::About, "关于"),
@@ -764,7 +769,7 @@ impl AronaGui {
             self.empty_state(
                 ui,
                 "还没有选择群",
-                "在左侧点一个群，就能配置功能开关与成员黑名单",
+                "在左侧点一个群，就能配置插件开关、功能开关与成员黑名单",
             );
             return;
         };
@@ -843,6 +848,51 @@ impl AronaGui {
                         ui.end_row();
                     }
                 });
+        });
+        ui.add_space(10.0);
+        card_row(ui, dark, |ui| {
+            section_title(ui, "插件开关");
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(
+                        "取消勾选即在本群停用该插件：它名下的命令与事件一律不响应，\
+                         配置和数据不受影响（在「插件管理」页整体停用时这里会显示为灰色）",
+                    )
+                    .size(12.0)
+                    .weak(),
+                )
+                .selectable(false),
+            );
+            ui.add_space(4.0);
+            let metas = crate::plugin::metas();
+            if metas.is_empty() {
+                ui.weak("未加载任何功能插件。");
+            }
+            let disabled = admin::group_disabled_plugins(group_id);
+            for meta in metas {
+                let mut enabled = !disabled.iter().any(|id| id.eq_ignore_ascii_case(meta.id));
+                ui.horizontal(|ui| {
+                    if !runtime_config::plugin_enabled(meta.id) {
+                        ui.colored_label(warn_color(dark), "●");
+                        ui.weak(meta.name);
+                        ui.weak("(已在「插件管理」页整体停用)");
+                    } else if ui
+                        .checkbox(&mut enabled, meta.name)
+                        .on_hover_text(meta.description)
+                        .changed()
+                    {
+                        self.note(
+                            admin::set_group_plugin_enabled(group_id, meta.id, enabled).map(|()| {
+                                format!(
+                                    "插件 {} 在本群已{}",
+                                    meta.name,
+                                    if enabled { "启用" } else { "停用" }
+                                )
+                            }),
+                        );
+                    }
+                });
+            }
         });
         ui.add_space(10.0);
         card_row(ui, dark, |ui| {
@@ -976,6 +1026,127 @@ impl AronaGui {
                         });
                 });
         });
+    }
+
+    // ==================== 插件管理 ====================
+
+    /// 已编译进本程序的插件清单，以及每个插件的整体停用/启用开关
+    fn plugin_manager(&mut self, ui: &mut egui::Ui) {
+        let dark = ui.visuals().dark_mode;
+        section_title(ui, "插件管理");
+        ui.add_space(6.0);
+        ui.weak(
+            "插件随程序一起编译，安装/升级由安装包负责；这里的「停用」= 不装配、\
+             不接收任何消息与事件，配置和数据都原样保留，随时可以再打开。\n\
+             只想在某个群里停用某插件：去「群管理」→ 选中群 → 插件开关。",
+        );
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            if ui.button("刷新").clicked() {
+                self.plugins = admin::plugin_list();
+            }
+            ui.weak(format!(
+                "插件开关写在 {} 的 disabled_plugins，改完保存即热生效",
+                admin::arona_file()
+            ));
+        });
+        ui.add_space(6.0);
+
+        let plugins = self.plugins.clone();
+        if plugins.is_empty() {
+            ui.weak("未加载任何功能插件（框架只提供 OneBot 通道与管理面板）。");
+            return;
+        }
+        let mut toggle: Option<(String, bool)> = None;
+        for info in plugins {
+            let mut pending = None;
+            card_row(ui, dark, |ui| {
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(info.name.as_str()).strong().size(15.0),
+                        )
+                        .selectable(false),
+                    );
+                    ui.colored_label(accent(dark), format!("v{}", info.version));
+                    let mut enabled = info.enabled;
+                    let state = if enabled { "已启用" } else { "已停用" };
+                    if ui.checkbox(&mut enabled, state).changed() {
+                        pending = Some((info.id.clone(), enabled));
+                    }
+                    if !info.enabled {
+                        ui.colored_label(warn_color(dark), "(不装配、不响应事件)");
+                    }
+                });
+                if !info.description.is_empty() {
+                    ui.weak(info.description.as_str());
+                }
+                // 功能清单最长，塞进 Grid 会把列撑到超出面板，单独一行才跟着窗口宽度换行
+                ui.horizontal_wrapped(|ui| {
+                    ui.weak("功能");
+                    if info.features.is_empty() {
+                        ui.weak("无（不占用分群功能开关）");
+                    } else {
+                        let text = info
+                            .features
+                            .iter()
+                            .map(|feature| format!("{} {}", feature.key, feature.name))
+                            .collect::<Vec<_>>()
+                            .join(" / ");
+                        ui.label(text);
+                    }
+                });
+                ui.add_space(2.0);
+                egui::Grid::new(format!("plugin_{}_grid", info.id))
+                    .num_columns(2)
+                    .spacing([12.0, 4.0])
+                    .show(ui, |ui| {
+                        ui.weak("插件 id");
+                        ui.label(egui::RichText::new(info.id.as_str()).monospace().size(12.5));
+                        ui.end_row();
+                        ui.weak("事件钩子");
+                        ui.label(if info.hooks.is_empty() {
+                            "未订阅".to_string()
+                        } else {
+                            info.hooks.join(" / ")
+                        });
+                        ui.end_row();
+                        ui.weak("配置文件");
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new(info.config_file.display().to_string())
+                                    .monospace()
+                                    .size(12.0),
+                            );
+                            if ui.button("打开").clicked() {
+                                open_dir(&info.config_file);
+                            }
+                        });
+                        ui.end_row();
+                        ui.weak("数据目录");
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new(info.data_dir.display().to_string())
+                                    .monospace()
+                                    .size(12.0),
+                            );
+                            if ui.button("打开").clicked() {
+                                open_dir(&info.data_dir);
+                            }
+                        });
+                        ui.end_row();
+                    });
+            });
+            if let Some(changed) = pending {
+                toggle = Some(changed);
+            }
+            ui.add_space(8.0);
+        }
+        if let Some((id, enabled)) = toggle {
+            self.note(admin::set_plugin_enabled(&id, enabled));
+            // 停用会 stop() 掉定时任务、启用会补 configure()+start()：重新取一份列表才看得到
+            self.plugins = admin::plugin_list();
+        }
     }
 
     // ==================== OneBot 连接 ====================
@@ -1376,7 +1547,7 @@ impl eframe::App for AronaGui {
                         );
                     } else {
                         ui.weak(
-                            "提示：修改功能开关/黑名单立即写入 arona.yml 并热生效；连接改动需点「保存并热重载」",
+                            "提示：插件/功能开关/黑名单改动立即写入 arona.yml 并热生效；连接改动需点「保存并热重载」",
                         );
                     }
                 });
@@ -1392,6 +1563,16 @@ impl eframe::App for AronaGui {
                 egui::CentralPanel::default()
                     .frame(pane_frame(ctx))
                     .show(ctx, |ui| self.group_detail(ui, ctx));
+            }
+            Tab::Plugins => {
+                if self.plugins.is_empty() {
+                    self.plugins = admin::plugin_list();
+                }
+                egui::CentralPanel::default()
+                    .frame(pane_frame(ctx))
+                    .show(ctx, |ui| {
+                        scroll_y(ui, |ui| self.plugin_manager(ui));
+                    });
             }
             Tab::Connections => {
                 egui::CentralPanel::default()
@@ -1627,25 +1808,6 @@ impl AronaGui {
         ui.add_space(12.0);
 
         card_row(ui, dark, |ui| {
-            section_title(ui, "已加载插件");
-            ui.add_space(4.0);
-            let metas = crate::plugin::metas();
-            if metas.is_empty() {
-                ui.weak("未加载任何功能插件（框架只提供 OneBot 通道与管理面板）。");
-            }
-            for meta in metas {
-                ui.horizontal(|ui| {
-                    ui.label(meta.name);
-                    ui.colored_label(accent(dark), format!("v{}", meta.version));
-                    if !meta.description.is_empty() {
-                        ui.weak(meta.description);
-                    }
-                });
-            }
-        });
-        ui.add_space(10.0);
-
-        card_row(ui, dark, |ui| {
             section_title(ui, "项目地址");
             ui.hyperlink_to(
                 "https://github.com/YuLinLoli/Arona-rs",
@@ -1669,11 +1831,18 @@ impl AronaGui {
         ui.add_space(10.0);
 
         card_row(ui, dark, |ui| {
-            section_title(ui, "数据目录");
-            ui.label(paths::standalone_root().display().to_string());
+            section_title(ui, "运行目录");
+            ui.label(paths::root().display().to_string());
+            ui.weak(
+                "配置在 config\\（框架 arona.yml、onebot.yml 与各插件的 arona.yml），\
+                 数据在 data\\<插件>\\，已装插件见 plugins\\<插件>\\。",
+            );
             ui.horizontal(|ui| {
-                if ui.button("打开数据目录").clicked() {
+                if ui.button("打开运行目录").clicked() {
                     open_data_dir();
+                }
+                if ui.button("打开配置目录").clicked() {
+                    open_dir(&paths::config_root());
                 }
                 if ui.button("打开日志目录").clicked() {
                     open_logs_dir();
@@ -1681,7 +1850,7 @@ impl AronaGui {
             });
         });
         ui.add_space(12.0);
-        ui.weak("提示：右上角「外观」可切换白天 / 黑夜模式，选择会保存到数据目录的 gui.txt。");
+        ui.weak("提示：右上角「外观」可切换白天 / 黑夜模式，选择会保存到 config\\gui.txt。");
     }
 }
 
@@ -1785,9 +1954,9 @@ fn open_logs_dir() {
     open_dir(&paths::logs_dir());
 }
 
-/// 用系统文件管理器打开数据目录（arona-standalone）
+/// 用系统文件管理器打开运行目录（config / data / logs / plugins 都在这下面）
 fn open_data_dir() {
-    open_dir(&paths::standalone_root());
+    open_dir(&paths::root());
 }
 
 /// 安装中文字体（优先系统黑体/雅黑）

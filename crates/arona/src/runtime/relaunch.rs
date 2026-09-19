@@ -56,7 +56,7 @@ fn build_command(
 ) -> Result<Command, String> {
     let exe = std::env::current_exe().map_err(|err| format!("获取自身路径失败: {err}"))?;
     let mut command = Command::new(&exe);
-    // 继承工作目录：子进程也要按同样的规则找 softgl\ 与 arona-standalone\
+    // 继承工作目录：子进程也要按同样的规则找 softgl\ 与 config\ / data\
     if let Ok(cwd) = std::env::current_dir() {
         command.current_dir(cwd);
     }
