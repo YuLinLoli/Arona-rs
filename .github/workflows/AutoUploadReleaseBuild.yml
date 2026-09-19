@@ -2,11 +2,12 @@
 # 参考: https://github.com/YuLinLoli/arona/blob/1.2.0-testonebot/.github/workflows/AutoUploadReleaseBuild.yml
 #
 # 用法:
-#   1. 改 Cargo.toml 里的 version (例如 0.2.2)
-#   2. git tag v0.2.2 && git push origin v0.2.2
+#   1. 改 crates/arona-host/Cargo.toml 里的 version（框架/入口版本，例如 1.0.0）
+#   2. git tag v1.0.0 && git push origin v1.0.0
 #   3. Actions 自动构建 -> 上传工件 -> 创建 Release
-#      产物: arona-rs-0.2.2-win-x64.zip（便携版, 内含 arona-rs.exe + softgl/, 带版本号）
-#            arona-rs-0.2.2-setup-win-x64.exe（安装包, 含程序介绍与 AGPLv3 全文）
+#      产物: arona-rs-1.0.0-win-x64.zip（便携版, 内含 arona-rs.exe + softgl/ + DXC DLL, 带版本号）
+#            arona-rs-1.0.0-setup-win-x64.exe（安装包, 含程序介绍与 AGPLv3 全文）
+#      渲染运行库全部随包发布: 解压/安装后无需装任何依赖就能打开管理面板
 #      裸 exe 不上传: 要单文件就用安装包（或自己解压 zip）, 这样 Release 里不会有
 #      名字相同、无法区分版本的 arona-rs.exe
 # 也可以在 Actions 页面手动 Run workflow（手动触发时跳过版本校验、只构建不发布）。
@@ -56,17 +57,18 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      # 标签和 Cargo.toml 版本号对不上时（如 tag v0.2.2 但 Cargo.toml 还是 0.2.1）直接失败,
+      # 标签和 arona-host 版本号对不上时（如 tag v1.0.0 但 Cargo.toml 还是 0.9.0）直接失败,
       # 避免产出与 Release 名字不一致的产物。手动触发时会跳过这一步。
       - name: Verify tag matches Cargo.toml version
         if: startsWith(github.ref, 'refs/tags/')
         shell: pwsh
         run: |
           $meta = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
-          $version = $meta.packages[0].version
+          # workspace 里有多个包，产物版本取可执行入口 arona-host 的
+          $version = ($meta.packages | Where-Object { $_.name -eq 'arona-host' }).version
           $tag = "${{ github.ref_name }}".TrimStart('v')
           if ($tag -ne $version) {
-            Write-Error "标签 ${{ github.ref_name }} 与 Cargo.toml 版本 $version 不一致"
+            Write-Error "标签 ${{ github.ref_name }} 与 arona-host 版本 $version 不一致"
             exit 1
           }
           Write-Host "版本校验通过: $version"
@@ -92,20 +94,36 @@ jobs:
           }
           Write-Host "softgl OK: $((Get-ChildItem softgl | Measure-Object -Property Length -Sum).Sum / 1MB) MB"
 
+      # 着色器编译器运行时(Microsoft 官方 DXC 发布包): DX12 后端优先用它编译着色器,
+      # 是渲染降级链的第一档。约 30MB, 不入库(.gitignore 忽略了 /dxc/), 构建时现拉。
+      # 同样必须在 dist/installer 之前: 它们把 dxc/*.dll 复制到 target/release/(exe 同级)。
+      - name: Fetch DXC shader compiler
+        shell: pwsh
+        run: ./scripts/fetch-dxc.ps1
+
+      - name: Verify DXC payload
+        shell: pwsh
+        run: |
+          if (-not (Test-Path dxc/dxcompiler.dll)) {
+            Write-Error "dxc/ 拉取失败: 缺少 dxcompiler.dll"
+            exit 1
+          }
+          Write-Host "dxc OK: $((Get-ChildItem dxc | Measure-Object -Property Length -Sum).Sum / 1MB) MB"
+
       # 等价于 cargo dist, 这里写全命令以免依赖 .cargo/config.toml 的别名
       # 该用例会做 cargo build --release, 产物主程序固定为 target/release/arona-rs.exe(不带版本号)
       - name: Build dist
-        run: cargo test dist_build --release -- --ignored --nocapture --test-threads=1
+        run: cargo test -p arona-host dist_build --release -- --ignored --nocapture --test-threads=1
 
       - name: Get Artifact Name
         shell: pwsh
         run: |
-          # 主程序固定叫 arona-rs.exe(不带版本号, 便于覆盖升级); 版本号从 Cargo.toml 读,
+          # 主程序固定叫 arona-rs.exe(不带版本号, 便于覆盖升级); 版本号从 arona-host 读,
           # 只用于便携 zip / 安装包的文件名
           $exe = "target/release/arona-rs.exe"
           if (-not (Test-Path $exe)) { Write-Error "未找到构建产物 $exe"; exit 1 }
           $meta = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
-          $version = $meta.packages[0].version
+          $version = ($meta.packages | Where-Object { $_.name -eq 'arona-host' }).version
           Write-Host "构建产物: $exe (版本 $version)"
           "APP_VERSION=$version" >> $env:GITHUB_ENV
           "ARTIFACT_PATH=$exe" >> $env:GITHUB_ENV
@@ -118,7 +136,7 @@ jobs:
 
       # 等价于 cargo installer: 调用 ISCC 生成 arona-rs-<版本号>-setup-win-x64.exe
       - name: Build installer
-        run: cargo test installer_build --release -- --ignored --nocapture --test-threads=1
+        run: cargo test -p arona-host installer_build --release -- --ignored --nocapture --test-threads=1
 
       - name: Package zip
         shell: pwsh
@@ -128,6 +146,11 @@ jobs:
             $paths += "target/release/softgl"
           } else {
             Write-Warning "缺少 softgl, 压缩包内不含软件 OpenGL"
+          }
+          # DXC 是 exe 同级的散装 DLL, 便携 zip 解压后必须保持同级才能被加载
+          foreach ($dll in @('dxcompiler.dll', 'dxil.dll')) {
+            $p = "target/release/$dll"
+            if (Test-Path $p) { $paths += $p } else { Write-Warning "缺少 $dll, 压缩包内不含 DXC" }
           }
           $zip = "target/release/$($env:ARTIFACT_NAME)-win-x64.zip"
           Compress-Archive -Path $paths -DestinationPath $zip -Force

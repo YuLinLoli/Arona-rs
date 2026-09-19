@@ -77,12 +77,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "anyhow"
-version = "1.0.104"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
-
-[[package]]
 name = "arbitrary"
 version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -112,22 +106,18 @@ dependencies = [
 ]
 
 [[package]]
-name = "arona-rs"
-version = "0.3.4"
+name = "arona"
+version = "1.0.0"
 dependencies = [
- "anyhow",
  "axum",
  "base64",
  "chrono",
  "eframe",
- "fontdue",
  "futures-util",
  "image",
  "log",
  "once_cell",
- "rand 0.8.8",
  "reqwest",
- "rusqlite",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -135,7 +125,14 @@ dependencies = [
  "tokio-tungstenite 0.24.0",
  "uuid",
  "wgpu",
- "zip",
+]
+
+[[package]]
+name = "arona-host"
+version = "1.0.0"
+dependencies = [
+ "arona",
+ "bluearchive-plugin",
 ]
 
 [[package]]
@@ -278,6 +275,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2c132eebf10f5cad5289222520a4a058514204aed6d791f1cf4fe8088b82d15f"
 dependencies = [
  "objc2 0.5.2",
+]
+
+[[package]]
+name = "bluearchive-plugin"
+version = "0.3.4"
+dependencies = [
+ "arona",
+ "chrono",
+ "fontdue",
+ "futures-util",
+ "image",
+ "log",
+ "once_cell",
+ "rand 0.8.8",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tokio",
+ "tokio-tungstenite 0.24.0",
+ "uuid",
+ "zip",
 ]
 
 [[package]]
@@ -1733,12 +1753,6 @@ name = "log"
 version = "0.4.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
-
-[[package]]
-name = "mach-dxcompiler-rs"
-version = "0.1.4+2024.11.22-df583a3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0e3cd67e8ea2ba061339150970542cf1c60ba44c6d17e31279cbc133a4b018f8"
 
 [[package]]
 name = "malloc_buf"
@@ -3931,7 +3945,6 @@ dependencies = [
  "libc",
  "libloading",
  "log",
- "mach-dxcompiler-rs",
  "metal",
  "naga",
  "ndk-sys 0.5.0+25.2.9519653",

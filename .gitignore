@@ -1,8 +1,11 @@
 /target
-/arona-standalone
+arona-standalone/
 .codex/
 .idea/
 
 # 软件 OpenGL 兜底依赖(Mesa llvmpipe, 约 62MB): 用 scripts/fetch-softgl.ps1 现场获取, 不入库
 /softgl/
 .tmp-mesa/
+
+# DXC 着色器编译器运行时(dxcompiler.dll + dxil.dll, 约 30MB): 用 scripts/fetch-dxc.ps1 现场获取, 不入库
+/dxc/

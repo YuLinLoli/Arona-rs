@@ -3,7 +3,7 @@
   Arona-rs 应用程序清单：随 exe 一起嵌入（build.rs 里作为 RT_MANIFEST 资源编译进 .res）。
 
   requestedExecutionLevel = asInvoker
-    这里故意保持 asInvoker，不要求系统在启动时强制提权。原因见 src/runtime/elevate.rs：
+    这里故意保持 asInvoker，不要求系统在启动时强制提权。原因见 crates/arona/src/runtime/elevate.rs：
     这份资源是通过 cargo:rustc-link-arg-bins 挂到 bin 目标上的，而 cargo 的测试运行器
     也从同一个 bin 目标构建，一旦声明为强制管理员权限，测试进程会一起要求提权，
     cargo test 就跑不起来了。管理员权限改在运行期申请，效果一样是启动即弹 UAC。
@@ -14,6 +14,11 @@
 
   longPathAware
     允许超过 260 字符的路径。
+
+  dpiAware / dpiAwareness
+    声明 PerMonitorV2 DPI 感知。窗口尺寸由 winit 按「逻辑点 x 缩放比」换算，而缩放比在建窗口
+    那一刻就要拿到，只能靠清单声明；删掉它，150% 缩放的屏幕上界面会按 1.5 排版却塞进 100%
+    大小的窗口，右边和底下整块看不见。
 -->
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
   <assemblyIdentity type="win32" name="YuLinLoli.Arona-rs" version="1.0.0.0" processorArchitecture="*"/>
@@ -34,6 +39,8 @@
   </compatibility>
   <application xmlns="urn:schemas-microsoft-com:asm.v3">
     <windowsSettings>
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2, PerMonitor</dpiAwareness>
       <longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>
     </windowsSettings>
   </application>

@@ -59,11 +59,12 @@
 
 1. 从 [Releases](https://github.com/YuLinLoli/Arona-rs/releases) 下载 `arona-rs-<版本号>-setup-win-x64.exe` 并运行。
    安装向导会先展示程序介绍与 AGPLv3 许可证全文，同意后才能继续。
-2. 默认的**完整安装**会一并装上 CPU 软件渲染依赖 `softgl\`（约 62 MB，Mesa llvmpipe）。
-   服务器 / 虚拟机 / 没有显卡驱动或没有 DX12 的机器上，硬件渲染后端会全部失败甚至**静默卡住**，
-   程序会自动切到这套 CPU 渲染把管理面板画出来，所以服务器上也能正常开 GUI；
-   正常带显卡的机器会优先用硬件渲染，这份依赖平时不会被加载。
-   只在正常带显卡的机器上用的话，安装时选「自定义安装」可以把这项取消，省下 62 MB。
+2. 默认的**完整安装**会一并装上全部渲染运行库：DXC 着色器编译器（`dxcompiler.dll` + `dxil.dll`，
+   约 30 MB）与 CPU 软件渲染依赖 `softgl\`（约 62 MB，Mesa llvmpipe）。
+   服务器 / 虚拟机 / 没有显卡驱动或没有 DX12 的机器上，硬件渲染后端会全部失败甚至**静默卡住或闪退**，
+   程序会自动沿降级链切到 CPU 渲染把管理面板画出来，所以服务器上也能正常开 GUI；
+   正常带显卡的机器会优先用硬件渲染，`softgl\` 那份平时不会被加载。
+   只在正常带显卡的机器上用的话，安装时选「自定义安装」可以把 `softgl\` 这项取消，省下 62 MB。
 3. 安装目录（默认 `%LOCALAPPDATA%\Programs\Arona-rs`）里会释放一份默认配置
    （`arona-standalone\onebot.yml`、`arona.yml`、`trainer_config.yml`）。
    这些文件**只在缺失时写入**，升级安装不会覆盖你改过的配置；万一缺失或损坏，
@@ -94,7 +95,8 @@ HKEY_CURRENT_USER\Software\YuLinLoli\Arona-rs      # 选「为所有用户安装
 ### 方式二：便携版
 
 1. 从 [Releases](https://github.com/YuLinLoli/Arona-rs/releases) 下载 `arona-rs-<版本号>-win-x64.zip`
-   解压（里面是 `arona-rs.exe` 与 `softgl/`；裸 exe 不再单独发布，需要单文件就用安装包）。
+   解压（里面是 `arona-rs.exe`、`dxcompiler.dll`、`dxil.dll` 与 `softgl/`，渲染运行库全部随包；
+   裸 exe 不再单独发布，需要单文件就用安装包）。解压后这些文件保持同级即可。
 2. 在你想作为数据目录的位置运行一次，会在**当前工作目录**下自动生成 `arona-standalone/`（`arona.yml`、`onebot.yml`、`data/`、`logs/`、`images/`、`backups/`）。
 3. 编辑 `onebot.yml` 填机器人账号和连接方式，编辑 `arona.yml` 填服务群和管理员。
 4. 重新启动。
@@ -179,12 +181,15 @@ trainer:
 
 - `--gui`（默认）：打开管理面板（群功能开关 / 群成员黑名单 / OneBot 连接配置与热重载）
 - `--nogui`：不打开面板，只启动命令行(黑窗口)模式
-- `--renderer=glow|wgpu|softgl`：只试指定的渲染后端（默认自动：硬件 `glow` → `wgpu` 多种配置 → 软件 OpenGL 兜底）
+- `--renderer=glow|wgpu|softgl`：只试指定的渲染后端（默认自动：**从高到低** —— 硬件 `glow` →
+  `wgpu` + 随包 DXC → `wgpu` + 系统 FXC → 软件 OpenGL 兜底）
 - `--softgl`：强制用 Mesa 软件 OpenGL(llvmpipe) 渲染（见下文「Windows Server / 虚拟机」）
 - `ARONA_SOFTGL=1` / `ARONA_SOFTGL_DIR=<目录>`：等价开关 / 指定 softgl 目录
 - `ARONA_RENDERER=glow|wgpu|softgl`：等价于 `--renderer=`（方便在服务器上固定后端）
 - `ARONA_GUI_TIMEOUT=<秒>`：某个渲染后端多久没出窗口就判定为卡死并换下一个（支持小数；
   默认 wgpu 6 秒、glow/软渲染 20 秒，设 `0` 关闭看门狗）
+- `ARONA_GUI_GUARDED`：由闪退看门狗自动设置，标记「这份进程已经被盯着了」，别自己盯自己
+  （见下文「闪退看门狗」；一般不用手动设）
 - `ARONA_LOG=info|debug|trace|off`：三方库(wgpu/glutin 等)的日志级别，默认 `debug` 但只对 wgpu* 生效
 - `--config=<路径>`：指定 `onebot.yml` 路径
 - `--arona-config=<路径>`：指定 `arona.yml` 路径
@@ -200,14 +205,17 @@ trainer:
 需要 Rust 1.85 或更新版本（`edition = "2024"`）。
 
 ```bash
-cargo build --release      # 发布构建(默认含管理 GUI), 产物: target/release/arona-rs[.exe]
-cargo dist                 # 发布构建 + 整理产物: target/release/arona-rs[.exe]
-                           # （主程序固定不带版本号, 升级时直接覆盖同名文件；顺手清理旧的 arona-rs-<版本号>.exe）
-cargo run --release        # 构建并运行(默认打开管理 GUI)
-cargo run-nogui            # 以纯命令行(黑窗口)模式运行
-cargo build-nogui          # 精简命令行版: 不含 GUI, 体积更小(--no-default-features)
-cargo installer            # 发布构建 + 打 Windows 安装包: target/release/arona-rs-<版本号>-setup-win-x64.exe
+cargo build-release      # 发布构建(默认含管理 GUI), 产物: target/release/arona-rs[.exe]
+cargo dist               # 发布构建 + 整理产物: target/release/arona-rs[.exe]
+                         # （主程序固定不带版本号, 升级时直接覆盖同名文件；顺手清理旧的 arona-rs-<版本号>.exe）
+cargo run-release        # 构建并运行(默认打开管理 GUI)
+cargo run-nogui          # 以纯命令行(黑窗口)模式运行
+cargo build-nogui        # 精简命令行版: 不含 GUI, 体积更小(--no-default-features)
+cargo installer          # 发布构建 + 打 Windows 安装包: target/release/arona-rs-<版本号>-setup-win-x64.exe
 ```
+
+这些是 `.cargo/config.toml` 里的别名，都固定打在 `-p arona-host` 上；也可以直接写全
+`cargo build --release -p arona-host`。
 
 安装包由 [Inno Setup 6](https://jrsoftware.org/isinfo.php) 编译，脚本见 [`installer/arona-rs.iss`](installer/arona-rs.iss)：
 
@@ -215,34 +223,40 @@ cargo installer            # 发布构建 + 打 Windows 安装包: target/releas
   找不到时会提示先执行 `winget install --id JRSoftware.InnoSetup`。
 - 安装包内含程序介绍（[`installer/intro.txt`](installer/intro.txt)）、AGPLv3 全文与中文译本、
   默认配置模板（[`installer/defaults/`](installer/defaults)，`onlyifdoesntexist` 释放）。
+  `defaults/arona.yml` 里只有框架自己的项（群授权 / 管理员），功能插件的配置区由插件在首次运行时
+  按声明的位置自动补上，安装包不需要跟着插件改。
 - 约 62 MB 的 `softgl/`（CPU 软件渲染依赖）与 exe **分开存储**，安装时释放到安装目录的 `softgl\`
   （程序就在 exe 同级的 `softgl\` 找它）。安装类型默认「完整安装」会勾上它，
   选「自定义安装」则可以取消；仓库里没有 `softgl/` 时安装包会自动不含该组件（`/DHasSoftgl` 控制）。
+- DXC 着色器编译器（`dxcompiler.dll` + `dxil.dll`，约 30 MB）属于 `main` 组件、**必装**，
+  直接放在 exe 同级（仓库里没有 `dxc/` 时自动不含，`/DHasDxc` 控制；此时程序降到系统 FXC）。
 - 安装目录写入 `HKCU\Software\YuLinLoli\Arona-rs`（`InstallPath` / `Version` / `ExeName` /
   `UninstallString` / `SoftglInstalled`），再次运行安装包会据此自动装回原目录并跳过简介与协议页。
 - **主程序固定叫 `arona-rs.exe`（不带版本号）**：升级时覆盖同名文件即可，快捷方式、计划任务与
   注册表里的 `ExeName` 都不用跟着版本号改；版本号只体现在安装包名、「应用和功能」列表和
   面板的「关于」页面里。安装时会自动清掉老版本留下的 `arona-rs-<版本号>.exe`。
 
-可选：拉取**软件 OpenGL 兜底依赖**（Mesa llvmpipe，约 62MB，不入库）——没有显卡驱动 / 没有 DX12 的服务器靠它打开管理面板，详见下文「Windows Server / 虚拟机」：
+可选：拉取**渲染运行库**（都不入库，`cargo dist` / `cargo installer` 会自动复制到产物目录）——
+DXC 是降级链第一档用的着色器编译器，softgl 让没有显卡驱动 / 没有 DX12 的服务器也能打开管理面板：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts/fetch-softgl.ps1   # 产出仓库根目录的 softgl\，cargo dist 会一并复制到产物目录
+powershell -ExecutionPolicy Bypass -File scripts/fetch-dxc.ps1      # 产出 dxc\dxcompiler.dll + dxil.dll（约 30MB）
+powershell -ExecutionPolicy Bypass -File scripts/fetch-softgl.ps1   # 产出 softgl\（约 62MB，Mesa llvmpipe）
 ```
 
-**程序图标**：[`build.rs`](build.rs) 会在编译时把 [`assets/arona.ico`](assets/arona.ico) 编译成 `.res` 并链接进 Windows 产物（源立绘见 `assets/source/`；调用 Windows SDK 的 `rc.exe`，查找顺序为 `ARONA_RC` 环境变量 → `WindowsSdkDir` → 注册表 → 常见安装路径 → `PATH`）。需要换图标时，改裁切参数后重新生成：
+**程序图标**：[`crates/arona-host/build.rs`](crates/arona-host/build.rs) 会在编译时把 [`assets/arona.ico`](assets/arona.ico) 与 [`assets/arona.manifest`](assets/arona.manifest) 编译成 `.res` 并链接进 Windows 产物（源立绘见 `assets/source/`；调用 Windows SDK 的 `rc.exe`，查找顺序为 `ARONA_RC` 环境变量 → `WindowsSdkDir` → 注册表 → 常见安装路径 → `PATH`）。同一个脚本还负责读 `plugins.toml` 生成功能插件注册代码。需要换图标时，改裁切参数后重新生成：
 
 ```powershell
 pwsh -File scripts/make-icon.ps1     # 从 assets/source 的立绘取上半部分裁成正方形 -> assets/arona.ico + assets/arona.png
 ```
 
 找不到 `rc.exe` 时只输出 `cargo:warning`，不影响编译（产物只是没有图标）；非 Windows 目标自动跳过。
-推送 `v*` 标签会触发 [`.github/workflows/AutoUploadReleaseBuild.yml`](.github/workflows/AutoUploadReleaseBuild.yml)：在 Windows 上跑测试、拉取 `softgl`、构建主程序 exe，再用 Inno Setup 编译安装包，最终发布两样东西并自动创建 GitHub Release：
+推送 `v*` 标签会触发 [`.github/workflows/AutoUploadReleaseBuild.yml`](.github/workflows/AutoUploadReleaseBuild.yml)：在 Windows 上跑测试、拉取 `dxc` 与 `softgl`、构建主程序 exe，再用 Inno Setup 编译安装包，最终发布两样东西并自动创建 GitHub Release：
 
 | 产物 | 说明 |
 | --- | --- |
-| `arona-rs-<版本号>-win-x64.zip` | 便携版：`arona-rs.exe`（主程序固定不带版本号）+ `softgl/` |
-| `arona-rs-<版本号>-setup-win-x64.exe` | 安装包：程序介绍 + AGPLv3 全文 + 默认配置 + 可选 `softgl/` 组件 |
+| `arona-rs-<版本号>-win-x64.zip` | 便携版：`arona-rs.exe`（主程序固定不带版本号）+ DXC 两个 dll + `softgl/` |
+| `arona-rs-<版本号>-setup-win-x64.exe` | 安装包：程序介绍 + AGPLv3 全文 + 默认配置 + DXC（必装）+ 可选 `softgl/` 组件 |
 
 裸 `arona-rs.exe` 只是构建中间产物（本地 `cargo dist` 产出、安装包与 zip 都从它取材），
 不再单独上传到 Release——否则 Release 里会躺着一个不带版本号、下载下来分不清版本的 exe。
@@ -261,24 +275,27 @@ cargo smoke-birthday       # 学生生日数据流端到端（联网）
 
 ## 目录结构
 
+本项目是「框架 + 插件」的 Cargo 虚拟 workspace（`resolver = "2"`），功能一律以插件形式插入框架：
+
 ```
-src/
-  onebot/       OneBot 11 协议：四种连接方式、事件分发、API 调用、消息发送
-  runtime/      运行期基础设施：配置、日志、控制台颜色、命令分发、数据目录
-  standalone/   独立模式：命令注册与各命令实现（抽卡/攻略/活动/塔罗/名字/管理）
-  admin/        管理后端：群/成员查询、功能开关与黑名单读写、OneBot 配置读写与热重载
-  gui/          管理面板（eframe/egui，默认启用，启动即打开；含群管理/OneBot 连接/实时日志）
-  data/         外部数据源：GameKee、SchaleDB 生日、kivo 学生、arona 云端图片库
-  image/        纯 Rust 图片渲染：抽卡结果图、活动日历图、字体与绘图工具
-  activity/     活动日历同步与推送 / 预警调度
-  db/           SQLite 持久层
-  quartz/       定时任务
-assets/         程序图标（arona.ico）、预览图与源立绘（source/）
-scripts/        辅助脚本（make-icon.ps1 生成图标、fetch-softgl.ps1 拉取软件 OpenGL）
-installer/      Windows 安装包：arona-rs.iss(Inno Setup 脚本)、intro.txt(程序介绍)、
-                defaults/(默认配置模板)、languages/(简体中文向导翻译)
-build.rs        构建脚本：把图标嵌入 Windows 产物
+Cargo.toml               workspace 清单（成员 + 三方依赖版本集中声明）
+plugins.toml             功能插件清单：host 编译期据此静态注册插件（改它不用动 Rust 代码）
+crates/arona/            框架库：OneBot 连接、管理面板、群授权/功能开关、命令分发骨架、生命周期
+  onebot/   runtime/   config/   admin/   gui/   services/   plugin.rs   quartz.rs
+crates/arona-host/       宿主可执行：产物 bin = arona-rs
+  build.rs  把图标与清单编进 Windows 产物，并依 plugins.toml 生成插件注册代码
+  src/main.rs  register_plugins() -> arona::run(args)
+plugins/bluearchive/     碧蓝档案功能插件（BluearchivePlugin）：抽卡/活动/攻略/塔罗/名字/备份…
+  standalone/   activity/   data/   image/   db/   runtime/   config.rs   lib.rs
+assets/                  程序图标（arona.ico）、预览图与源立绘（source/）、arona.manifest
+scripts/                 辅助脚本（make-icon.ps1 生成图标、fetch-dxc.ps1 拉取 DXC 着色器编译器、
+                         fetch-softgl.ps1 拉取软件 OpenGL）
+installer/               Windows 安装包：arona-rs.iss(Inno Setup 脚本)、intro.txt(程序介绍)、
+                         defaults/(默认配置模板)、languages/(简体中文向导翻译)
 ```
+
+框架 `arona` 不依赖任何插件，插件单向依赖框架；要在不装 OneBot 的情况下换/加功能包，
+只改 `plugins.toml` 与 host 的 `Cargo.toml` 即可。开发新插件见 [PLUGIN_DEVELOPMENT.md](PLUGIN_DEVELOPMENT.md)。
 
 ## 管理 GUI
 
@@ -294,9 +311,10 @@ target/release/arona-rs --gui    # 显式打开面板（默认行为，等价于
 Windows 上含 GUI 的产物使用 windows 子系统，GUI 模式不会多出控制台窗口；`--nogui`
 会自动附加上级终端（cmd/PowerShell）或新建控制台，日志与颜色照常输出。
 
-渲染后端默认自动：有硬件 OpenGL 时先试 `glow`，之后是 `wgpu`（DX12/Vulkan，含 WARP 软件渲染），
-最后是随程序附带的软件 OpenGL(llvmpipe)。可用 `--renderer=glow` / `--renderer=wgpu` /
-`--renderer=softgl` 强制指定。
+渲染后端**从高档到低档**自动逐个尝试（详见下文「Windows Server / 虚拟机」）：桌面上先试硬件
+OpenGL(`glow`)，之后是 `wgpu`（DX12/Vulkan，着色器优先用**随包附带**的 DXC，其次系统 FXC；
+DX12 之下还有 WARP 软件渲染），最后才是随程序附带的软件 OpenGL(llvmpipe，纯 CPU)。
+可用 `--renderer=glow` / `--renderer=wgpu` / `--renderer=softgl` 强制指定。
 
 每个后端都带**看门狗**：规定时间内没出窗口就判定为卡死（wgpu 在部分 Windows Server 上会
 静默卡住 —— 不报错、不出窗口、也没有任何日志），自动换下一个后端重启自己；实在不行就退回
@@ -337,20 +355,26 @@ Windows 上含 GUI 的产物使用 windows 子系统，GUI 模式不会多出控
 
 ### Windows Server / 虚拟机（没有可用显卡驱动）
 
-管理面板的渲染后端会**逐个尝试**，第一个成功就停：
+管理面板的渲染后端会**从高档到低档逐个尝试**，第一个成功就停：
 
 | 顺序 | 后端 | 说明 |
 | --- | --- | --- |
 | 1 | `glow`（硬件 OpenGL） | 桌面上最快；注册表里没有 OpenGL ICD 时跳过（只有 GDI 的 1.1 必然失败） |
-| 2 | `wgpu`（DX12/Vulkan） | DX12 之下有 **WARP 软件渲染**（Microsoft Basic Render Driver），无显卡驱动也能画 |
-| 3 | `wgpu`（全部后端 / DX12+FXC） | 备用配置；万一静态 DXC 容器创建失败、或需要 GL 后端时兜底 |
-| 4 | `glow` + 软件 OpenGL(llvmpipe) | 前几步**卡死或失败**时自动换到它，改走 Mesa 的 CPU 软件渲染 |
+| 2 | `wgpu(DX12/Vulkan+DXC)` | 默认这条：显卡渲染 + **随包附带的 DXC** 编译着色器。DX12 之下还有 **WARP 软件渲染**（Microsoft Basic Render Driver），无显卡驱动也能画 |
+| 3 | `wgpu(全部后端+DXC)` | 备用配置：PRIMARY 挑不到适配器、或机器只有 GL/Metal 后端时兜底 |
+| 4 | `wgpu(DX12/Vulkan+FXC)` | 换成系统自带的 FXC（`d3dcompiler_47.dll`）编译着色器；exe 同级没有 DXC 两个 dll 时，这条就是第一档 |
+| 5 | `wgpu(全部后端+FXC)` | 最后一档 wgpu |
+| 6 | `glow(软件 OpenGL llvmpipe)` | 前面几步**卡死、失败或闪退**时自动换到它，改走 Mesa 的 CPU 软件渲染（安装包必带 `softgl\`） |
 
 - **卡死看门狗**：每个后端最多等一段时间（wgpu 默认 6 秒、glow/软渲染 20 秒，可用
   `ARONA_GUI_TIMEOUT=<秒>` 调整）。超时即判定它卡死 —— 卡死在 wgpu 里的线程没法在进程内干掉，
   所以程序会**另起一个进程**换下一个后端（子进程继承管理员令牌，不会二次弹 UAC；带 1.5 秒
-  启动延迟，避免和旧进程抢端口/数据库）。四个后端都不行时退回命令行模式重启，机器人继续跑。
+  启动延迟，避免和旧进程抢端口/数据库）。全部后端都不行时退回命令行模式重启，机器人继续跑。
   日志里能看到 `判定为卡死` 与 `已用下一个渲染后端重新启动管理面板`。
+- **闪退看门狗**：高档后端有时不是返回错误，而是**直接把进程干掉**（显卡驱动炸了，什么都来不及写）。
+  所以双击启动（没带 `--renderer=` / `--softgl` / `--nogui`）且本地有 `softgl\` 时，会由一份父进程
+  盯着子进程的退出码：子进程正常关窗就一起收工；子进程异常退出则父进程接着跑，并把 CPU 软件渲染
+  提到降级链最前面。日志里能看到 `管理面板进程异常退出（exit code: …）`。
 - 强制指定：`--renderer=wgpu` / `--renderer=glow` / `--renderer=softgl`（不加则按上表自动）。
   `--renderer=glow` 在没有 ICD 但带了 `softgl\` 时会自动落到软件 OpenGL，而不是必然失败。
 - 日志里会打印全部候选适配器与最终选中的那个，例如
@@ -359,7 +383,7 @@ Windows 上含 GUI 的产物使用 windows 子系统，GUI 模式不会多出控
 #### 软件 OpenGL 兜底（llvmpipe）
 
 有些服务器既没有 OpenGL 2.0（只有 GDI 的 1.1），又没有可用的 DX12（例如系统缺少
-`d3d12.dll`），这时前三个后端都会失败。为此本项目支持把 Mesa 的软件渲染版 `opengl32.dll`
+`d3d12.dll`），这时前面几档后端都会失败。为此本项目支持把 Mesa 的软件渲染版 `opengl32.dll`
 放到 exe 同级的 `softgl\` 目录，用 CPU 把界面画出来：
 
 ```powershell
@@ -373,19 +397,27 @@ arona-rs.exe --softgl
 - 环境变量：`ARONA_SOFTGL=1` 等价于 `--softgl`；`ARONA_SOFTGL_DIR=<目录>` 直接指定目录。
 - `cargo dist` 与 GitHub Actions 发布包会自动带上 `softgl/`（发布 zip 解压后 exe 与 `softgl\` 同级即生效）。
 
-**运行库与着色器编译器（真正“免安装”）**：除了 Windows 自带的系统 DLL，产物不再依赖任何外部文件。
+**运行库与着色器编译器（真正“免安装”）**：除了 Windows 自带的系统 DLL，产物只额外依赖
+随包放在 exe 同级的渲染运行库（`dxcompiler.dll` / `dxil.dll` / `softgl\`），不需要装任何东西。
 
 - **MSVC 运行库静态链接**：`.cargo/config.toml` 里的 `+crt-static` 已把 VCRUNTIME/UCRT 编进 exe，
   不再依赖 `VCRUNTIME140.dll`，服务器上**无需安装** VC++ Redistributable。
-- **DX12 着色器编译器用静态 DXC**：`Cargo.toml` 里 `wgpu` 开了 `static-dxc`（`mach-dxcompiler-rs`），
-  DXC 被直接编进 exe，因此**不需要**随包附带 `dxcompiler.dll` / `dxil.dll`。
+- **DX12 着色器编译器随包附带 DXC，系统 FXC 只做兜底**：`Cargo.toml` 里 `wgpu` **不开** `static-dxc`——
+  那条路链接的预编译 `dxcompiler` 静态库引用 ATL 符号 `_AtlBaseModule`，会强迫每台开发机去装 VS 的
+  「ATL/MFC」组件（缺了就 `LNK1104 atls.lib`）。改成 `Dx12Compiler::DynamicDxc` 后由程序运行时
+  `LoadLibrary` 加载，于是 `dxcompiler.dll` + `dxil.dll`（约 30 MB，`scripts/fetch-dxc.ps1` 从
+  Microsoft 官方 DXC 发布包取）**随安装包与 zip 一起发到 exe 同级**，仍然是「不装任何依赖就能开面板」。
+  万一这两个 dll 不见了，降级链会自动改用系统自带的 FXC（`d3d12.dll` + `d3dcompiler_47.dll`，
+  Win10+ 与服务器上都有），只是着色器编译慢一点。
 - **`d3dcompiler_47.dll` 改成延迟加载**：`build.rs` 通过 `/DELAYLOAD:d3dcompiler_47.dll`
-  把它从“启动即必需”降级为“用到才加载”。本项目默认走 StaticDxc，FXC 路径只在备用方案里才碰，
-  所以即使系统里没有这个 DLL（部分 Server 精简安装就是这样），程序也能正常启动。
+  把它从“启动即必需”降级为“用到才加载”。部分 Server 精简安装里没有这个 DLL，
+  程序照样能正常启动。
 - **`opengl32.dll` 也改成延迟加载**：`build.rs` 用 `/DELAYLOAD:opengl32.dll`。`glutin_wgl_sys`
   是用 `#[link(name = "opengl32")]` 静态导入它的，不改成延迟加载的话进程一启动就会加载系统那份
-  OpenGL 1.1，上面第 4 步就没机会换成 `softgl\` 里的 Mesa 了。
-- 代价是体积：带 GUI 的发布产物约 **40 MB**（绝大部分是内嵌的 DXC）；`softgl/` 是额外的约 62MB 目录。
+  OpenGL 1.1，最后一步就没机会换成 `softgl\` 里的 Mesa 了。
+- 体积：主程序 exe 约 **19 MB**（不再内嵌 DXC，比原版小了一半），随包的渲染运行库另占约
+  30 MB（`dxcompiler.dll` + `dxil.dll`）与 62 MB（`softgl\`）；`--no-default-features`
+  的精简命令行版约 10 MB。安装包/zip 都按「完整交付」带上前者与 `softgl\`。
 
 #### 出问题时怎么先看到原因
 
@@ -435,6 +467,11 @@ group_settings:
 ```
 
 修改会在下次读取时生效；通过 GUI 保存的分群设置会立即写盘并应用。
+
+`arona.yml` 里还可以出现 `notify`（每日推送）、`trainer`（`/攻略`）这类**插件自持有**的顶层配置区：
+框架只把它们当原样 YAML 片段保存、生成模板时回调插件写的渲染器，具体内容与读写命令都归插件实现
+（见 [PLUGIN_DEVELOPMENT.md](PLUGIN_DEVELOPMENT.md) §7）。加新插件时它自己的配置区同样写在这里，
+不需要改框架。
 ## 移植声明与许可
 
 本项目是 [diyigemt/arona](https://github.com/diyigemt/arona) 的 Rust 移植版：命令行为、配置项、文案与数据结构均移植自该项目的 AGPLv3 源码（含其独立运行模式），仅保留 OneBot 独立模式、移除全部 Mirai 相关实现。

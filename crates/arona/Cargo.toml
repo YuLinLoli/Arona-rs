@@ -1,0 +1,34 @@
+[package]
+name = "arona"
+version = "1.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Arona 框架：OneBot 连接、管理面板(GUI)、群授权与命令分发；功能由插件提供"
+
+[lib]
+name = "arona"
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { workspace = true }
+axum = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+reqwest = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+base64 = { workspace = true }
+once_cell = { workspace = true }
+log = { workspace = true }
+image = { workspace = true }
+# GUI 管理面板：由 host 通过 `arona/gui` 打开（插件依赖本 crate 时不会强制启用）
+eframe = { workspace = true, optional = true }
+wgpu = { workspace = true, optional = true }
+
+[features]
+default = ["gui"]
+gui = ["dep:eframe", "dep:wgpu"]

@@ -6,7 +6,7 @@
     Windows Server / 没有显卡驱动的虚拟机只有 GDI 自带的 OpenGL 1.1，而 egui 需要
     OpenGL 2.0+；一旦 wgpu 的 DX12/WARP 也不可用（例如系统缺少 d3d12.dll），管理面板
     在这类机器上根本打不开。把 Mesa 的软件渲染 opengl32.dll 放到 exe 同级的 softgl\
-    目录即可用 CPU 把界面画出来（详见 src/runtime/softgl.rs）。
+    目录即可用 CPU 把界面画出来（详见 crates/arona/src/runtime/softgl.rs）。
 
     下载 mesa-dist-win 的 MSVC 发布包，只解出 x64 需要的三个文件：
       opengl32.dll         Mesa 的 WGL 前端

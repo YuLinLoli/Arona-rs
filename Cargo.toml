@@ -1,12 +1,14 @@
-[package]
-name = "arona-rs"
-version = "0.3.4"
+[workspace]
+resolver = "2"
+members = ["crates/arona", "crates/arona-host", "plugins/bluearchive"]
+
+[workspace.package]
 edition = "2024"
 license = "AGPL-3.0-only"
 repository = "https://github.com/YuLinLoli/Arona-rs"
-description = "碧蓝档案 QQ 机器人 arona 的 Rust 移植版（OneBot 独立模式，无 Mirai）"
 
-[dependencies]
+# 三方依赖版本集中在这里声明，各 crate 用 `workspace = true` 继承
+[workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["ws"] }
 tokio-tungstenite = "0.24"
@@ -21,25 +23,19 @@ uuid = { version = "1", features = ["v4"] }
 rand = "0.8"
 base64 = "0.22"
 once_cell = "1"
-# 三方库(wgpu/glutin/winit...)的诊断只走 log 门面, 必须自己装 logger 才能看到
 log = "0.4"
-anyhow = "1"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 fontdue = "0.8"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
-
 # GUI 管理面板（默认启用）: --no-default-features 可编译不含 GUI 的精简命令行版
 # glow(OpenGL) 为主，wgpu(DX12/Vulkan，可用 WARP 软件渲染) 作为服务器/无显卡环境的备选后端
-eframe = { version = "0.31", default-features = false, features = ["glow", "wgpu", "default_fonts"], optional = true }
+eframe = { version = "0.31", default-features = false, features = ["glow", "wgpu", "default_fonts"] }
 # eframe 默认只给 wgpu 打开 metal/webgpu，DX12 必须自己开：
-# 只有 DX12 后端才有 WARP 软件适配器，Windows 服务器/无显卡虚拟机靠它才能渲染
-wgpu = { version = "24", default-features = false, features = ["dx12", "static-dxc"], optional = true }
-
-[features]
-# 默认包含 GUI：启动即打开管理面板，加 --nogui 只启动命令行(黑窗口)模式
-default = ["gui"]
-# 管理面板（群功能开关/成员黑名单/OneBot 连接热重载）
-gui = ["dep:eframe", "dep:wgpu"]
+# 只有 DX12 后端才有 WARP 软件适配器，Windows 服务器/无显卡虚拟机靠它才能渲染。
+# 不开 static-dxc：它链接的预编译 dxcompiler 静态库会引用 ATL 的 _AtlBaseModule，
+# 从而强制要求 VS 的「ATL/MFC」组件里的 atls.lib（开发机常缺）；运行期改为动态加载
+# 着色器编译器即可。管理面板在服务器上的兜底路径是 glow(OpenGL)+softgl，与 DXC 无关。
+wgpu = { version = "24", default-features = false, features = ["dx12"] }
 
 [profile.release]
 opt-level = 2

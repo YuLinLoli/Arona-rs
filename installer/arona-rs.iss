@@ -3,15 +3,17 @@
 ;
 ;  编译方式（二选一）：
 ;    1) 项目内：cargo installer
-;       （等价于 cargo test installer_build --release -- --ignored --nocapture）
-;    2) 手动：  ISCC.exe /DAppVersion=0.2.3 /DHasSoftgl=1 arona-rs.iss
+;       （等价于 cargo test -p arona-host installer_build --release -- --ignored --nocapture）
+;    2) 手动：  ISCC.exe /DAppVersion=1.0.0 /DHasSoftgl=1 /DHasDxc=1 arona-rs.iss
 ;
 ;  可选命令行宏（不传则用下面的默认值）：
-;    /DAppVersion=0.2.3      版本号，默认 0.0.0
-;    /DAppSourceDir=..\target\release     exe 与 softgl/ 所在目录
+;    /DAppVersion=1.0.0      版本号，默认 0.0.0
+;    /DAppSourceDir=..\target\release     exe、softgl/ 与 DXC DLL 所在目录
 ;    /DOutputDir=..\target\release        安装包输出目录
 ;    /DHasSoftgl=1                        包里带上 {#AppSourceDir}\softgl（CPU 软件渲染依赖）
 ;                                        不传则该组件不存在；传了也允许在「自定义安装」里取消勾选
+;    /DHasDxc=1                           包里带上 {#AppSourceDir}\dxcompiler.dll + dxil.dll
+;                                        （DX12 着色器编译器，渲染降级链的第一档）
 ;
 ;  安装/更新行为：
 ;    - 安装目录会写进注册表 HKA\Software\YuLinLoli\Arona-rs（InstallPath / Version / ExeName）
@@ -82,7 +84,7 @@ MinVersion=6.1sp1
 ; 也避免装进 Program Files 后普通用户写不了数据目录（arona-standalone/）
 ;
 ; 注意：这里只管「安装程序」本身的权限；主程序 arona-rs.exe 启动时会自己申请
-; 管理员权限（UAC 自提权，见 src/runtime/elevate.rs），与安装范围无关。
+; 管理员权限（UAC 自提权，见 crates/arona/src/runtime/elevate.rs），与安装范围无关。
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
 ; 升级/卸载时检测正在运行的程序（数据目录里有 DLL 被占用时也能正确提示）
@@ -138,6 +140,13 @@ Source: "defaults\trainer_config.yml"; DestDir: "{app}\arona-standalone"; Flags:
 ;      程序在 exe 同级目录寻找 softgl\，找不到就跳过软渲染，不影响机器人功能
 #ifdef HasSoftgl
 Source: "{#AppSourceDir}\softgl\*"; DestDir: "{app}\softgl"; Flags: ignoreversion restartreplace recursesubdirs createallsubdirs; Components: softgl
+#endif
+; ---- DXC 着色器编译器（DX12 用它编译着色器，是渲染降级链的第一档）----
+;      必须放在 exe 同级：wgpu 用 DynamicDxc 按需 LoadLibrary 这两个 DLL，
+;      找不到就自动降到「系统自带的 FXC」档（慢一点，但仍能开面板）
+#ifdef HasDxc
+Source: "{#AppSourceDir}\dxcompiler.dll"; DestDir: "{app}"; Flags: ignoreversion restartreplace; Components: main
+Source: "{#AppSourceDir}\dxil.dll"; DestDir: "{app}"; Flags: ignoreversion restartreplace; Components: main
 #endif
 
 [Icons]
