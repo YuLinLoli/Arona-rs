@@ -61,6 +61,10 @@ fn context(sender: Arc<CaptureSender>, text: &str) -> Arc<CommandContext> {
         sender_name: Some("测试老师".to_string()),
         is_admin: true,
         sender_role: None,
+        message_id: None,
+        time: 0,
+        quoted: None,
+        segments: Vec::new(),
         sender,
     })
 }

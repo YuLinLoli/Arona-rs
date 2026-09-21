@@ -193,6 +193,18 @@ pub async fn get_bytes(url: &str, referer: &str) -> Result<Vec<u8>, String> {
     get_bytes_with(url, &headers).await
 }
 
+/// 探一张网络图片此刻还取不取到：QQ 的图床直链会过期，还原引用前得先问一次。
+/// 只索要第一个字节，5 秒内没有成功响应就当作已过期。
+pub async fn url_alive(url: &str) -> bool {
+    let request = client()
+        .get(url)
+        .timeout(Duration::from_secs(5))
+        .header("range", "bytes=0-0")
+        .header("user-agent", USER_AGENT_VALUE)
+        .header("accept", IMAGE_ACCEPT);
+    matches!(request.send().await, Ok(response) if response.status().is_success())
+}
+
 /// 通用表单 POST（保留给后续非 GameKee 接口使用）
 pub async fn post_form(url: &str, form: &[(&str, &str)]) -> Result<String, String> {
     let headers: Vec<(&str, String)> = vec![

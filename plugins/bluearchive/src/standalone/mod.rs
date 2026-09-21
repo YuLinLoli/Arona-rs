@@ -2,6 +2,7 @@
 pub mod api;
 pub mod commands;
 pub mod dispatcher;
+pub mod history;
 
 #[cfg(test)]
 mod onebot_print_test;

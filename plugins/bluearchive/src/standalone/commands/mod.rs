@@ -50,7 +50,7 @@ where
             }
             let reply = f(context.clone(), arguments).await;
             if let Some(message) = reply {
-                context.reply_message(message).await;
+                crate::standalone::history::reply(&context, message).await;
             }
             None
         }
@@ -75,7 +75,7 @@ where
             }
             let reply = f(context.clone()).await;
             if let Some(message) = reply {
-                context.reply_message(message).await;
+                crate::standalone::history::reply(&context, message).await;
             }
             None
         }

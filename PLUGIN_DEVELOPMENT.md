@@ -97,6 +97,7 @@ arona-host  ──depends──▶  arona (框架)
 | `broadcastAndDumpInterceptedExceptions`（插件异常不冒泡到宿主） | 命令/钩子/兜底三侧统一过 `guarded()`：panic 被 `catch_unwind` 吃掉、记账、连续达阈值自动停用该插件 | `plugin/health.rs` |
 | `GroupMessageEvent` / `FriendMessageEvent` / `NudgedEvent` 事件族 | `EventBody`（强类型事件体）+ `BodyFilter` 子类型订阅：`ctx.on_group_message(..)`、`ctx.listen_where(&[BodyFilter::..], ..)` | `onebot/hooks.rs` |
 | `MessageChain` / `Element`（At、Image、Source、QuoteReply、Face、FlashMessage…） | `MessageSegment` 14 段（文本/@/@全体/引用/图片/表情/语音/视频/文件/戳一戳/位置/json/xml/合并转发），收发双向同一套类型 | §19 |
+| `AbstractMessage.source()` / `quoteReply`（引用的那条消息还能不能拿到） | 框架只负责**让引用对命令可见**：`CommandContext::{quoted, segments, message_id, time}`。至于协议层已经引用不到的旧消息，由插件自己记聊天记录还原（§21） | `runtime/dispatcher.rs` + `plugins/bluearchive/src/standalone/history.rs` |
 | `EventPriority`（Monitor→Normal→High→Low→Lowest） | `ListenerPriority` / `CommandPriority`（同一份 `runtime::priority::Priority`） | `runtime/priority.rs` |
 | `event.intercept()` | `HookFlow::Handled` | `onebot/hooks.rs` |
 | `plugin.instance.coroutineScope.launch` | `ctx.spawn(..)` / `PluginScope` | `plugin/scope.rs` |
@@ -321,9 +322,15 @@ fn configure(&self, ctx: &PluginContext) -> Result<(), String> {
 - **不用（也没机会）填插件 id**：`ctx` 自带归属，框架按它做停用与回收。
 - **群里 @机器人 后跟命令能直接命中**：框架在查命令表之前就把"@机器人本身""@全体成员""引用""图片"
   这些召唤性前导段剥掉了（`onebot::protocol::command_text`，对齐 mirai 进 `CommandManager` 前剥 `At(bot)`）。
-  `context.text` 就是剥过的那份；`context.text` 之外的原始段落仍在 `EventContext::segments` 里（§9、§19）。
+  `context.text` 就是剥过的那份；没剥之前的原始段落见 `context.segments`（上面一条与 §19）。
 - **处理器 `Some(OutgoingMessage)` 由框架发回**（发向 = 群聊回群、私聊回人），不用再自己 `reply`；
   已经自己 `reply` 过的返回 `None`，不会重复发。
+- **命令处理器拿得到整条消息**：`CommandContext` 除了 `text`（剥过召唤前缀的命令文本）还带
+  `message_id`（本条消息的 id）、`time`（秒级时间戳）、`quoted`（这条消息引用了哪条，无引用为 `None`）、
+  `segments`（剥之前的完整消息段，@、引用、图片都在里面）。mirai 的 `Source`/`QuoteReply` 靠的就是这几项：
+  插件要判断"用户引用了谁的话、引用的那条还在不在"，不必去钩子里另找一份。
+  `text` 与 `segments` 的区别只在于前者剥了前导的 @机器人/引用/图片（`protocol::command_text`），
+  后者原样保留（`protocol::extract_segments`）。
 - 命令名撞上别家插件时框架只记告警、按 `priority` 定胜出方（同优先级先到先得），**其余命令照常登记**，
   不会因为一家冲突就整批失败。分发时同名命令只调用排在最前的那一家，别家不会跟着响应一遍。
 - 前缀匹配默认关闭（一个字母能撞上一堆命令），单个命令用 `with_prefix_match(true)` 打开，
@@ -795,3 +802,46 @@ let framework = arona::framework::Framework::builder()
 
 读回来用 `framework.options()`，隔离名单看 `framework.health()`。
 默认实例（`Framework::global()`）用的是默认选项，GUI 与 `arona.yml` 的行为不受影响。
+
+## 21. 旧消息引用还原（插件侧聊天记录）
+
+**问题**：用户引用一条消息再触发指令时，那条被引用的消息**未必还拿得到**。QQ 的引用段（`reply`）只被
+OneBot 实现端的本地缓存认账，NTQQ 系实现（NapCat / LLOWeb / Lagrange）对十几二十分钟前的 `message_id`
+就查不到原消息了——要么丢掉引用段静默发送，要么整个 `send_group_msg` 报错。所以"引用一条半小时前的
+消息再 `/攻略`"这件事，光靠协议层做不到。
+
+**框架只做一半**：把引用暴露给命令（`CommandContext::quoted` / `segments` / `message_id` / `time`，见 §8），
+不碰存储——框架 crate 不依赖 rusqlite，把聊天记录表塞进框架会让 GUI 那侧的静态链接构建白白变大。
+**剩下的一半归插件**：bluearchive 的 `standalone/history.rs` 是参考实现。
+
+插件侧要做的三件事：
+
+1. **记账**。`configure` 阶段订阅消息事件（`ctx.listen_where(&[BodyFilter::GroupMessage, BodyFilter::PrivateMessage], ListenerPriority::Monitor, ..)`），
+   把听到的每条消息写进自己的表；机器人**自己发出去**的那条也要记（引用还原最常遇到的就是"用户引用了机器人的回复"），
+   所以在统一回复出口里拿 `MessageReceipt::message_id` 补一条出站记录。
+   `Monitor` 优先级保证排在别家钩子之前——别人 `HookFlow::Handled` 短路也短掉不了记账。
+   隐私边界由框架兜着：消息事件在进钩子之前已经过群授权与黑名单过滤，未授权的群和黑名单用户根本不会产生记录。
+2. **裁决 + 还原**。回复时看被引用那条的时间：还在窗口内（默认 30 分钟）就挂原生 `MessageSegment::Reply(id)`，
+   QQ 上是真引用；过窗就用本地记录拼一段文字头（`[引用 谁 时间]` + 原文）+ 图片，随本条回复一起发出。
+   库里查不到的 id 退回去问一次 `get_msg`，问到就顺手回填——机器人上线前的历史消息能被逐步补进库。
+   **图片只存原链接**（QQ 图床直链带签名、会过期），发出前先探一次（`Range: bytes=0-0` 的 GET，5 秒超时）；
+   探不到就回一句「图片已过期」，而不是默默少发一张图。机器人自己渲染的图存的是本地路径，探测方式是文件还在不在。
+3. **清理**。默认只留 2 天，每 4 天删一次 2 天前的记录（`ctx.repeat_job(间隔秒, "ChatLogPurge", ..)`，
+   首次立即执行）。注意这两项组合起来的**实际**保留时长是 2~6 天，磁盘峰值按 6 天算。
+
+配置住在插件自己的 `config/bluearchive/arona.yml`（`PluginConfig` + `typed_section::<ChatLogConfig>("chatlog")`，见 §12）：
+
+```yaml
+chatlog:
+  # 是否记录聊天记录（关闭后不再还原引用）
+  enable: true
+  # 本地保留几天的聊天消息
+  keep_days: 2
+  # 每隔几天清理一次过期记录
+  purge_interval_days: 4
+  # 多少分钟内的引用仍由 OneBot 实现端直接引用，超过才改走本地还原
+  quote_ttl_minutes: 30
+```
+
+改这几项不必重启：框架热重载后回调 `on_config_reload`，插件在里面比对间隔天数，变了才重建清理任务
+（开关关掉时直接把任务移除）。清理与还原两处都按 `chatlog.enable` 现读现判，所以关掉开关后立刻停止记账。

@@ -93,9 +93,23 @@ CREATE TABLE IF NOT EXISTS image (
   hash TEXT NOT NULL,
   type INTEGER NOT NULL DEFAULT 1
 );
+-- 聊天记录（引用还原用）：QQ 的引用只认实现端缓存里的近期消息，久了就引用不到，
+-- 所以自己留一份。image 存图片的原始链接（入站）或本地路径（机器人生成的），
+-- 原始链接会过期，取用时要先探一次。grp=0 表示私聊。
+CREATE TABLE IF NOT EXISTS chat_message (
+  message_id INTEGER PRIMARY KEY,
+  grp INTEGER NOT NULL DEFAULT 0,
+  qq INTEGER NOT NULL DEFAULT 0,
+  from_bot INTEGER NOT NULL DEFAULT 0,
+  name TEXT NOT NULL DEFAULT '',
+  time INTEGER NOT NULL,
+  text TEXT NOT NULL DEFAULT '',
+  image TEXT NOT NULL DEFAULT ''
+);
 CREATE INDEX IF NOT EXISTS idx_activity_server ON activity_calendar(server);
 CREATE INDEX IF NOT EXISTS idx_image_name ON image(name);
 CREATE INDEX IF NOT EXISTS idx_history_group_pool ON gacha_history(grp, pool);
+CREATE INDEX IF NOT EXISTS idx_chat_time ON chat_message(time);
 "#;
 
 /// 初始化数据库连接并建表，返回是否成功

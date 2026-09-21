@@ -178,6 +178,8 @@ impl AronaPlugin for BluearchivePlugin {
     fn configure(&self, ctx: &PluginContext) -> Result<(), String> {
         // 把本插件的全部命令与兜底登记进框架的命令表（内部会注册全部服务）
         standalone::dispatcher::register(ctx, ctx.onebot_config.clone());
+        // 聊天记录钩子 + 清理任务：引用还原要靠它，旧消息在协议层已经引用不到了
+        standalone::history::install(ctx);
 
         // --test-notify：20 秒后完整跑一次每日推送，便于联调验证
         if ctx.test_notify {
@@ -225,20 +227,17 @@ impl AronaPlugin for BluearchivePlugin {
         Ok(())
     }
 
-    fn on_config_reload(&self, _ctx: &PluginContext) {
+    fn on_config_reload(&self, ctx: &PluginContext) {
         // 框架在每次热重载/写入后都会回调这里；只有推送小时真的变了才重建每日任务。
         let hour = config::notify().every_day_hour.clamp(0, 23);
         let previous = LAST_NOTIFY_HOUR.swap(hour, Ordering::SeqCst);
-        if previous == hour {
-            return;
+        if previous != hour && arona::quartz::exists(DAILY_NOTIFY_JOB) {
+            arona::quartz::remove(DAILY_NOTIFY_JOB);
+            activity::notify::enable_daily_job(hour as u32);
+            arona::runtime::log::info(format!("推送小时变更，重建每日任务: 每天 {hour} 点"));
         }
-        // enable_service 在启动阶段已经建过一次；任务还在才需要按新小时重建
-        if !arona::quartz::exists(DAILY_NOTIFY_JOB) {
-            return;
-        }
-        arona::quartz::remove(DAILY_NOTIFY_JOB);
-        activity::notify::enable_daily_job(hour as u32);
-        arona::runtime::log::info(format!("推送小时变更，重建每日任务: 每天 {hour} 点"));
+        // 聊天记录的保留期/清理间隔与开关也在这里校准（内部只在真的变了才重建任务）
+        standalone::history::on_config_reload(ctx);
     }
 
     fn stop(&self, _ctx: &PluginContext) {

@@ -215,7 +215,7 @@ pub fn numeric_reply() -> Arc<dyn FallbackHandler> {
         if let Some(message) =
             crate::standalone::commands::trainer::resolve_numeric_reply(context.clone()).await
         {
-            context.reply_message(message).await;
+            crate::standalone::history::reply(&context, message).await;
         }
     })
 }
@@ -263,7 +263,7 @@ where
         async move {
             let reply = f(context.clone(), arguments).await;
             if let Some(message) = reply {
-                context.reply_message(message).await;
+                crate::standalone::history::reply(&context, message).await;
             }
             None
         }

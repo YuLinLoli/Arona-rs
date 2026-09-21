@@ -1,10 +1,10 @@
-//! 碧蓝档案插件自持有的业务配置（notify 每日推送 / trainer 攻略）。
+//! 碧蓝档案插件自持有的业务配置（notify 每日推送 / trainer 攻略 / chatlog 聊天记录）。
 //!
-//! 这两块配置住在框架给本插件划的配置文件 `config/bluearchive/arona.yml` 里（顶层键
-//! `notify` / `trainer`），框架不理解其内容：插件只写 serde 结构 + 实现
+//! 这几块配置住在框架给本插件划的配置文件 `config/bluearchive/arona.yml` 里（顶层键
+//! `notify` / `trainer` / `chatlog`），框架不理解其内容：插件只写 serde 结构 + 实现
 //! [`arona::config::arona::PluginConfig`] 给出字段注释，[`register_sections`] 把它们登记
 //! 给框架，带注释模板的生成、原样 YAML 的加载与文件改动后的热重载全部由框架完成。
-//! 运行期用 [`notify`] / [`trainer`] 读取，`/config` 改这两区时用 [`set_notify`] 写回。
+//! 运行期用 [`notify`] / [`trainer`] / [`chat_log`] 读取，`/config` 改 notify 时用 [`set_notify`] 写回。
 
 use arona::config::arona::{PluginConfig, typed_section};
 use arona::config::plugin_config::ConfigEntry;
@@ -18,6 +18,15 @@ fn default_hour() -> i32 {
 }
 fn default_notify_text() -> String {
     "碧蓝档案预警".to_string()
+}
+fn default_keep_days() -> i64 {
+    2
+}
+fn default_purge_days() -> i64 {
+    4
+}
+fn default_quote_ttl() -> i64 {
+    30
 }
 
 /// 每日活动推送配置（原框架 config/arona.rs 迁入，属插件私有语义）
@@ -101,6 +110,38 @@ pub struct TrainerFileConfig {
     pub overrides: Vec<TrainerOverride>,
 }
 
+/// 聊天记录 / 引用还原配置（对应本插件 standalone::history）
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ChatLogConfig {
+    /// 是否记录聊天记录（关掉后既不写库也不还原引用）
+    #[serde(default = "default_true")]
+    pub enable: bool,
+    /// 本地留几天的聊天消息
+    #[serde(default = "default_keep_days")]
+    #[serde(rename = "keep_days")]
+    pub keep_days: i64,
+    /// 每隔几天清一次过期记录
+    #[serde(default = "default_purge_days")]
+    #[serde(rename = "purge_interval_days")]
+    pub purge_interval_days: i64,
+    /// 多少分钟内的引用仍能让 OneBot 实现端直接引用（超过就改走本地还原）
+    #[serde(default = "default_quote_ttl")]
+    #[serde(rename = "quote_ttl_minutes")]
+    pub quote_ttl_minutes: i64,
+}
+
+impl Default for ChatLogConfig {
+    fn default() -> Self {
+        ChatLogConfig {
+            enable: true,
+            keep_days: default_keep_days(),
+            purge_interval_days: default_purge_days(),
+            quote_ttl_minutes: default_quote_ttl(),
+        }
+    }
+}
+
 /// notify 配置项：框架按 (插件 id, 顶层键) 定位到本插件的配置文件
 fn notify_entry() -> ConfigEntry<NotifyConfig> {
     ConfigEntry::new(crate::PLUGIN_ID, "notify")
@@ -111,6 +152,11 @@ fn trainer_entry() -> ConfigEntry<TrainerConfig> {
     ConfigEntry::new(crate::PLUGIN_ID, "trainer")
 }
 
+/// chatlog 配置项
+fn chatlog_entry() -> ConfigEntry<ChatLogConfig> {
+    ConfigEntry::new(crate::PLUGIN_ID, "chatlog")
+}
+
 /// 读 notify 配置（缺失或格式错时回退默认值）
 pub fn notify() -> NotifyConfig {
     notify_entry().get()
@@ -119,6 +165,11 @@ pub fn notify() -> NotifyConfig {
 /// 读 trainer 配置（缺失或格式错时回退默认值）
 pub fn trainer() -> TrainerConfig {
     trainer_entry().get()
+}
+
+/// 读聊天记录配置（缺失或格式错时回退默认值）
+pub fn chat_log() -> ChatLogConfig {
+    chatlog_entry().get()
 }
 
 /// 把修改后的 notify 配置写回 config/bluearchive/arona.yml（触发插件配置热重载）
@@ -160,7 +211,23 @@ impl PluginConfig for TrainerConfig {
     }
 }
 
-/// install 阶段登记本插件的两块配置区：框架据此在 config/bluearchive/arona.yml 里
+impl PluginConfig for ChatLogConfig {
+    const TITLE: &'static str = "聊天记录/引用还原";
+    const DOC: &'static str =
+        "机器人听到与说出的消息留在 arona.db，用来还原协议层已引用不到的旧消息";
+
+    fn comment(path: &str) -> Option<&'static str> {
+        Some(match path {
+            "enable" => "是否记录聊天记录（关闭后不再还原引用）",
+            "keep_days" => "本地保留几天的聊天消息",
+            "purge_interval_days" => "每隔几天清理一次过期记录",
+            "quote_ttl_minutes" => "多少分钟内的引用仍由 OneBot 实现端直接引用，超过才改走本地还原",
+            _ => return None,
+        })
+    }
+}
+
+/// install 阶段登记本插件的配置区：框架据此在 config/bluearchive/arona.yml 里
 /// 按这里的顺序生成带注释模板（键名撞车时框架保留先登记的那家）
 pub fn register_sections(framework: &arona::framework::Framework) {
     framework
@@ -169,6 +236,9 @@ pub fn register_sections(framework: &arona::framework::Framework) {
     framework
         .sections()
         .register(crate::PLUGIN_ID, typed_section::<TrainerConfig>("trainer"));
+    framework
+        .sections()
+        .register(crate::PLUGIN_ID, typed_section::<ChatLogConfig>("chatlog"));
 }
 
 #[cfg(test)]
@@ -187,6 +257,9 @@ mod tests {
         framework
             .sections()
             .register(plugin_id, typed_section::<TrainerConfig>("trainer"));
+        framework
+            .sections()
+            .register(plugin_id, typed_section::<ChatLogConfig>("chatlog"));
         framework
     }
 
@@ -207,6 +280,13 @@ mod tests {
         )
         .unwrap();
         store.init();
+
+        // 没写过的 chatlog 应回退到"留 2 天、每 4 天清一次、引用窗口 30 分钟"
+        let chat_log = ConfigEntry::<ChatLogConfig>::in_store(store, PLUGIN, "chatlog").get();
+        assert!(chat_log.enable);
+        assert_eq!(chat_log.keep_days, 2);
+        assert_eq!(chat_log.purge_interval_days, 4);
+        assert_eq!(chat_log.quote_ttl_minutes, 30);
 
         let notify = ConfigEntry::<NotifyConfig>::in_store(store, PLUGIN, "notify");
         let original = notify.get();
@@ -232,6 +312,14 @@ mod tests {
         assert!(
             text.contains("trainer:"),
             "未登记的 trainer 默认块未渲染: {text}"
+        );
+        assert!(
+            text.contains("chatlog:") && text.contains("keep_days: 2"),
+            "聊天记录的默认块未渲染: {text}"
+        );
+        assert!(
+            text.contains("# 每隔几天清理一次过期记录"),
+            "chatlog 的字段注释应由框架渲染: {text}"
         );
         assert!(
             !text.contains("managers:"),

@@ -60,6 +60,10 @@ async fn ten_pull_outputs_image_into_standalone() {
         sender_name: Some("测试老师".to_string()),
         is_admin: true,
         sender_role: None,
+        message_id: None,
+        time: 0,
+        quoted: None,
+        segments: Vec::new(),
         sender: sender.clone(),
     });
 
