@@ -818,36 +818,166 @@ impl AronaGui {
             section_title(ui, "功能开关");
             ui.add(
                 egui::Label::new(
-                    egui::RichText::new("取消勾选即在该群关闭对应功能")
-                        .size(12.0)
-                        .weak(),
+                    egui::RichText::new(
+                        "按插件分组（默认收起）：点插件名展开/收起，组头的「全部」一次开关该插件在本群\
+                         的所有功能，展开后也能只关其中一项",
+                    )
+                    .size(12.0)
+                    .weak(),
                 )
                 .selectable(false),
             );
             ui.add_space(4.0);
-            let features: Vec<(String, String, String, bool)> = admin::features()
-                .iter()
-                .map(|feature| {
-                    (
-                        feature.key.to_string(),
-                        feature.name.to_string(),
-                        feature.description.to_string(),
-                        runtime_config::feature_enabled(Some(group_id), feature.key),
-                    )
-                })
-                .collect();
-            egui::Grid::new("feature_grid")
-                .num_columns(2)
-                .spacing([16.0, 6.0])
-                .show(ui, |ui| {
-                    for (key, name, description, mut enabled) in features {
-                        if ui.checkbox(&mut enabled, &name).changed() {
-                            self.note(admin::set_group_feature(group_id, &key, enabled));
+            // 功能清单本身是登记顺序，按归属插件聚在一起即可（不重排插件先后）
+            let mut groups: Vec<(String, Vec<(runtime_config::Feature, bool)>)> = Vec::new();
+            for feature in admin::features() {
+                let enabled = runtime_config::feature_enabled(Some(group_id), feature.key);
+                let owner = runtime_config::feature_owner(feature.key).unwrap_or_default();
+                match groups.iter_mut().find(|(plugin, _)| *plugin == owner) {
+                    Some((_, rows)) => rows.push((feature, enabled)),
+                    None => groups.push((owner, vec![(feature, enabled)])),
+                }
+            }
+            let names = crate::plugin::metas();
+            if groups.is_empty() {
+                ui.weak(
+                    "这里没有可关的功能：功能由各插件登记，插件被整体停用时它名下功能不再列出\
+                     （要到「插件管理」页恢复启用）",
+                );
+            }
+            for (plugin, rows) in &groups {
+                let display = names
+                    .iter()
+                    .find(|meta| meta.id == plugin)
+                    .map(|meta| meta.name.to_string())
+                    .unwrap_or_else(|| {
+                        if plugin.is_empty() {
+                            "未归属插件".to_string()
+                        } else {
+                            plugin.clone()
                         }
-                        ui.weak(description);
-                        ui.end_row();
+                    });
+                // 插件在本群停用期间它的功能必然全关（门控连带判掉），整组开关点了也不会生效，
+                // 所以组头只留提示，勾不动
+                let plugin_on = plugin.is_empty()
+                    || runtime_config::plugin_enabled_in_group(plugin, Some(group_id));
+                let on = rows.iter().filter(|(_, enabled)| *enabled).count();
+                let mut all_on = on == rows.len();
+                let id = ui.make_persistent_id(("group_feature_panel", group_id, plugin));
+                // 默认收起：一个插件登记十几项功能，全展开会把群详情撑得看不到别的卡片
+                let mut state =
+                    egui::containers::collapsing_header::CollapsingState::load_with_default_open(
+                        ui.ctx(),
+                        id,
+                        false,
+                    );
+                let mut batch: Option<bool> = None;
+                let mut single: Option<(String, String, bool)> = None;
+                ui.horizontal(|ui| {
+                    // 展开箭头自绘：默认字体里没有 ▸/▾ 这个字形，画出来才不会出现方框
+                    let (caret_id, caret_rect) =
+                        ui.allocate_space(egui::vec2(ui.spacing().indent, ui.spacing().icon_width));
+                    let caret = ui.interact(caret_rect, caret_id, egui::Sense::click());
+                    egui::containers::collapsing_header::paint_default_icon(
+                        ui,
+                        if state.is_open() { 1.0 } else { 0.0 },
+                        &caret,
+                    );
+                    let title = ui.add(
+                        egui::Label::new(egui::RichText::new(display.as_str()).strong().size(14.5))
+                            .selectable(false)
+                            .sense(egui::Sense::click()),
+                    );
+                    if caret.clicked() || title.clicked() {
+                        state.toggle(ui);
+                    }
+                    title.on_hover_text("点一下展开/收起本组功能");
+                    if !plugin_on {
+                        ui.colored_label(warn_color(dark), "(本插件已在「插件开关」里停用)");
+                        return;
+                    }
+                    if ui
+                        .checkbox(&mut all_on, "全部")
+                        .on_hover_text("勾上=本组功能在该群全部开启，去掉=全部关闭")
+                        .changed()
+                    {
+                        batch = Some(all_on);
+                    }
+                    let off = rows.len() - on;
+                    if off == rows.len() {
+                        ui.weak("全部已关闭");
+                    } else if off > 0 {
+                        ui.colored_label(
+                            warn_color(dark),
+                            format!("已关 {off} / {} 项", rows.len()),
+                        );
                     }
                 });
+                // 展开状态直接决定画不画，不走 show_body_indented：那条路径按动画插值取可见性，
+                // 插值首帧是 0，得靠重绘才推进，收起/展开的观感反而不确定
+                if state.is_open() {
+                    ui.indent(id, |ui| {
+                        if !plugin_on {
+                            ui.weak("以下开关要先到「插件开关」里启用该插件才会生效");
+                            ui.disable();
+                        }
+                        ui.horizontal(|ui| {
+                            if ui.button("全部启用").clicked() {
+                                batch = Some(true);
+                            }
+                            if ui.button("全部停用").clicked() {
+                                batch = Some(false);
+                            }
+                        });
+                        egui::Grid::new(("feature_grid", group_id, plugin))
+                            .num_columns(2)
+                            .spacing([16.0, 6.0])
+                            .show(ui, |ui| {
+                                for (feature, enabled) in rows {
+                                    let mut enabled = *enabled;
+                                    if ui.checkbox(&mut enabled, feature.name).changed() {
+                                        single = Some((
+                                            feature.key.to_string(),
+                                            feature.name.to_string(),
+                                            enabled,
+                                        ));
+                                    }
+                                    ui.weak(feature.description);
+                                    ui.end_row();
+                                }
+                            });
+                    });
+                }
+                state.store(ui.ctx());
+                let keys = rows
+                    .iter()
+                    .map(|(feature, _)| feature.key)
+                    .collect::<Vec<_>>();
+                if let Some(enabled) = batch {
+                    self.note(
+                        admin::set_group_features(group_id, &keys, enabled).map(|()| {
+                            format!(
+                                "{display} 在本群的 {} 项功能已{}",
+                                keys.len(),
+                                if enabled {
+                                    "全部启用"
+                                } else {
+                                    "全部停用"
+                                }
+                            )
+                        }),
+                    );
+                }
+                if let Some((key, name, enabled)) = single {
+                    self.note(admin::set_group_feature(group_id, &key, enabled).map(|()| {
+                        format!(
+                            "{name} 在本群已{}（写入 {}）",
+                            if enabled { "启用" } else { "关闭" },
+                            admin::arona_file()
+                        )
+                    }));
+                }
+            }
         });
         ui.add_space(10.0);
         card_row(ui, dark, |ui| {
@@ -1562,7 +1692,10 @@ impl eframe::App for AronaGui {
                     .show(ctx, |ui| self.group_list(ui, ctx));
                 egui::CentralPanel::default()
                     .frame(pane_frame(ctx))
-                    .show(ctx, |ui| self.group_detail(ui, ctx));
+                    .show(ctx, |ui| {
+                        // 同连接页：CentralPanel 不滚动，群详情卡片一多下面就被裁掉
+                        scroll_y(ui, |ui| self.group_detail(ui, ctx));
+                    });
             }
             Tab::Plugins => {
                 if self.plugins.is_empty() {
@@ -1906,7 +2039,7 @@ fn warn_color(dark: bool) -> egui::Color32 {
 }
 
 /// 日志行颜色：普通行跟随外观（黑夜白色 / 白天黑色），
-/// [Arona]/[OneBot] 仍是绿色、WARNING/ERROR 仍是黄/红——这些特殊色只是按背景深浅调暗，
+/// [Arona]/[OneBot] 绿色、[插件名] 淡紫、WARNING/ERROR 黄/红——这些特殊色只是按背景深浅调暗，
 /// 保证在白色背景上同样看得清。
 fn log_line_color(text: &str, stderr: bool, dark: bool) -> egui::Color32 {
     use crate::runtime::console::Color;
@@ -1918,9 +2051,19 @@ fn log_line_color(text: &str, stderr: bool, dark: bool) -> egui::Color32 {
                 egui::Color32::from_rgb(0, 120, 0)
             }
         }
+        Some(Color::BrightMagenta) => plugin_color(dark),
         Some(Color::BrightYellow) | Some(Color::Yellow) => warn_color(dark),
         None if stderr => error_color(dark),
         None => default_text_color(dark),
+    }
+}
+
+/// 插件日志的淡紫：白底上压深一档，否则浅紫在白背景上几乎发灰
+fn plugin_color(dark: bool) -> egui::Color32 {
+    if dark {
+        egui::Color32::from_rgb(197, 170, 240)
+    } else {
+        egui::Color32::from_rgb(112, 60, 176)
     }
 }
 
@@ -2741,6 +2884,8 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
         .build()
         .map_err(|err| format!("创建 tokio 运行时失败: {err}"))?;
     let handle = runtime.handle().clone();
+    // 面板线程没有 runtime 上下文，插件在面板上被停用→重新启用时要靠这个句柄投递任务
+    crate::runtime::reactor::set(handle.clone());
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let bot_args = args.clone();
     handle.spawn(async move {

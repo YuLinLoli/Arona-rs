@@ -80,12 +80,24 @@ impl Gating {
         }
     }
 
-    /// 功能清单（GUI 展示用）
+    /// 功能清单（GUI 展示用）：被整体禁用的插件，它的功能不再列出
+    ///
+    /// 只是展示层收口，不改任何判定 —— [`Gating::feature_enabled`] 早就让插件级停用连带
+    /// 关掉它名下的功能，这里省得在群功能页摆一排永远勾不上的复选框（要恢复请去「插件管理」页
+    /// 重新启用该插件）。因此 `features_of` 与 `feature_keys_text` **不做**同样的过滤：
+    /// 前者是插件卡片上"本插件提供哪些功能"的清单（卡片自己带 `enabled`），
+    /// 后者要写进配置文件模板，停用中也得让人看见 key 叫什么名字。
     pub fn features(&self) -> Vec<Feature> {
+        let disabled = self.disabled_plugins();
         self.features
             .read()
             .unwrap()
             .iter()
+            .filter(|registered| {
+                !disabled
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(&registered.plugin))
+            })
             .map(|registered| registered.feature.clone())
             .collect()
     }
@@ -149,23 +161,22 @@ impl Gating {
         let Some(group_id) = group_id else {
             return true;
         };
-        match self.group_settings().get(&group_id.to_string()) {
-            None => true,
-            Some(setting) => {
-                setting.feature_enabled(key)
-                    && match &owner {
-                        Some(plugin) => self.plugin_enabled_in_group(plugin, Some(group_id)),
-                        // 没人登记过的 key（老配置里的残留）不做插件判断，按功能开关结论放行
-                        None => true,
-                    }
-            }
-        }
+        // 功能开关与该群的插件名单在同一次持锁里读完
+        self.with_group_setting(group_id, |setting| {
+            setting.feature_enabled(key)
+                && match &owner {
+                    Some(plugin) => setting_plugin_enabled(setting, plugin),
+                    // 没人登记过的 key（老配置里的残留）不做插件判断，按功能开关结论放行
+                    None => true,
+                }
+        })
+        .unwrap_or(true)
     }
 
     /// 插件是否全局启用（不在 arona.yml 的 disabled_plugins 里就是启用）
     pub fn plugin_enabled(&self, plugin: &str) -> bool {
-        !self
-            .disabled_plugins()
+        let disabled = self.config.disabled_plugins.read().unwrap();
+        !disabled
             .iter()
             .any(|name| name.eq_ignore_ascii_case(plugin))
     }
@@ -175,27 +186,47 @@ impl Gating {
         let Some(group_id) = group_id else {
             return true;
         };
-        match self.group_settings().get(&group_id.to_string()) {
-            Some(setting) => !setting
-                .disabled_plugins
-                .iter()
-                .any(|name| name.eq_ignore_ascii_case(plugin)),
-            None => true,
-        }
+        self.with_group_setting(group_id, |setting| setting_plugin_enabled(setting, plugin))
+            .unwrap_or(true)
     }
 
     /// 用户是否被拉黑（管理员不参与判断，由调用方保证）
     pub fn is_blacklisted(&self, user_id: i64, group_id: Option<i64>) -> bool {
-        if self.global_blacklist().contains(&user_id) {
+        if self
+            .config
+            .global_blacklist
+            .read()
+            .unwrap()
+            .contains(&user_id)
+        {
             return true;
         }
         match group_id {
-            Some(group_id) => match self.group_settings().get(&group_id.to_string()) {
-                Some(setting) => setting.blacklist.contains(&user_id),
-                None => false,
-            },
+            Some(group_id) => self
+                .with_group_setting(group_id, |setting| setting.blacklist.contains(&user_id))
+                .unwrap_or(false),
             None => false,
         }
+    }
+
+    /// 该群在不在授权名单里（名单为空 = 所有群都授权）；私聊没有群号，一律放行
+    pub fn group_authorized(&self, group_id: Option<i64>) -> bool {
+        let Some(group_id) = group_id else {
+            return true;
+        };
+        let groups = self.config.groups.read().unwrap();
+        groups.is_empty() || groups.contains(&group_id)
+    }
+
+    /// 持锁**就地**读某个群的设置：这几道判断在热路径上（每条事件、每个钩子都会问一遍），
+    /// 不该为此把整张 `group_settings` 克隆出来
+    fn with_group_setting<T>(
+        &self,
+        group_id: i64,
+        read: impl FnOnce(&GroupSetting) -> T,
+    ) -> Option<T> {
+        let settings = self.config.group_settings.read().unwrap();
+        settings.get(&group_id.to_string()).map(read)
     }
 
     pub fn set_global_blacklist(&self, users: Vec<i64>) {
@@ -216,7 +247,8 @@ impl Gating {
 
     /// 取某个群的设置（不存在则返回默认值）
     pub fn group_setting(&self, group_id: i64) -> GroupSetting {
-        self.group_settings()
+        let settings = self.config.group_settings.read().unwrap();
+        settings
             .get(&group_id.to_string())
             .cloned()
             .unwrap_or_default()
@@ -284,6 +316,14 @@ impl Gating {
     }
 }
 
+/// 某份群设置里，这个插件是不是启用的（名单比对忽略大小写）
+fn setting_plugin_enabled(setting: &GroupSetting, plugin: &str) -> bool {
+    !setting
+        .disabled_plugins
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(plugin))
+}
+
 fn gating() -> &'static Gating {
     Framework::global().gating()
 }
@@ -293,12 +333,14 @@ pub fn register_feature(feature: Feature, plugin: &str) {
     gating().register_feature(feature, plugin);
 }
 
-/// 功能清单（GUI 展示用）
+/// 功能清单（GUI 展示用）：被全局停用的插件不在此列，判定请用 [`feature_enabled`]
+///
+/// 想知道"注册过哪些功能"（包括停用中的）请用 [`features_of`] 或 [`feature_keys_text`]。
 pub fn features() -> Vec<Feature> {
     gating().features()
 }
 
-/// 某个插件提供的功能清单（GUI「插件管理」页展示）
+/// 某个插件提供的功能清单（GUI「插件管理」页展示，停用中也照常列出）
 pub fn features_of(plugin: &str) -> Vec<Feature> {
     gating().features_of(plugin)
 }
@@ -418,4 +460,107 @@ pub fn disabled_plugins() -> Vec<String> {
 
 pub fn set_disabled_plugins(plugins: Vec<String>) {
     gating().set_disabled_plugins(plugins);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 门控改成「持锁就地读」之后，判断结果必须和整体克隆的版本一致：
+    /// 这几道是每条事件、每个钩子都要过的，改坏了就是全线误放行或误杀
+    #[test]
+    fn group_gating_reads_in_place() {
+        let gating = Gating::default();
+        gating.register_feature(
+            Feature {
+                key: "gacha",
+                name: "抽卡",
+                description: "",
+            },
+            "bluearchive",
+        );
+        let mut settings = BTreeMap::new();
+        settings.insert(
+            "100".to_string(),
+            GroupSetting {
+                disabled_features: vec!["gacha".to_string()],
+                blacklist: vec![7],
+                disabled_plugins: vec!["other".to_string()],
+            },
+        );
+        gating.set_group_settings(settings);
+
+        // 该群关掉的 key 不放行，没登记过的残留 key 不做插件判断
+        assert!(!gating.feature_enabled(Some(100), "gacha"));
+        assert!(gating.feature_enabled(Some(100), "leftover"));
+        // 私聊没有群号，一律不受分群开关限制
+        assert!(gating.feature_enabled(None, "gacha"));
+        // 群内插件名单（比对忽略大小写），没设置的群一律放行
+        assert!(!gating.plugin_enabled_in_group("Other", Some(100)));
+        assert!(gating.plugin_enabled_in_group("bluearchive", Some(100)));
+        assert!(gating.plugin_enabled_in_group("other", Some(200)));
+        assert!(gating.feature_enabled(Some(200), "gacha"));
+        // 群内黑名单只在那个群里成立
+        assert!(gating.is_blacklisted(7, Some(100)));
+        assert!(!gating.is_blacklisted(7, Some(200)));
+        gating.set_global_blacklist(vec![7]);
+        assert!(gating.is_blacklisted(7, None));
+        // 全局停用插件连带它名下的功能（名单比对同样忽略大小写）
+        gating.set_disabled_plugins(vec!["BLUEARCHIVE".to_string()]);
+        assert!(!gating.plugin_enabled("bluearchive"));
+        assert!(!gating.feature_enabled(Some(200), "gacha"));
+        // 取单群设置不必克隆整张表
+        assert_eq!(
+            gating.group_setting(100).disabled_features,
+            vec!["gacha".to_string()]
+        );
+        assert!(gating.group_setting(200).is_empty());
+    }
+
+    /// 授权名单为空 = 所有群都放行；非空时只认名单里的群
+    #[test]
+    fn group_authorized_follows_the_allowlist() {
+        let gating = Gating::default();
+        assert!(gating.group_authorized(Some(100)));
+        assert!(gating.group_authorized(None));
+        gating.set_groups(vec![100]);
+        assert!(gating.group_authorized(Some(100)));
+        assert!(!gating.group_authorized(Some(200)));
+        assert!(gating.group_authorized(None));
+    }
+
+    /// 功能清单只在「展示用」的那一份上过滤停用插件：另两处（插件卡片、配置文件模板）
+    /// 停用中也要报出 key，否则人就再也不知道这个功能叫什么名字了
+    #[test]
+    fn features_display_skips_disabled_plugins() {
+        let gating = Gating::default();
+        gating.register_feature(
+            Feature {
+                key: "gacha",
+                name: "抽卡",
+                description: "",
+            },
+            "bluearchive",
+        );
+        gating.register_feature(
+            Feature {
+                key: "whoami",
+                name: "谁叫",
+                description: "",
+            },
+            "who-is-arona",
+        );
+        assert_eq!(gating.features().len(), 2);
+        gating.set_disabled_plugins(vec!["BlueArchive".to_string()]);
+        assert_eq!(
+            gating
+                .features()
+                .iter()
+                .map(|feature| feature.key)
+                .collect::<Vec<&str>>(),
+            vec!["whoami"]
+        );
+        assert_eq!(gating.features_of("bluearchive").len(), 1);
+        assert!(gating.feature_keys_text().contains("gacha"));
+    }
 }

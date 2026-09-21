@@ -9,7 +9,9 @@ use crate::config::onebot::OneBotConfig;
 use crate::config::plugin_config::ConfigEntry;
 use crate::framework::Framework;
 use crate::onebot::api::OneBotApi;
-use crate::onebot::hooks::{BodyFilter, EventHandler, EventKind, ListenerPriority};
+use crate::onebot::hooks::{
+    BodyFilter, EventHandler, EventKind, ListenerPriority, OutboundHandler,
+};
 use crate::plugin::scope::PluginScope;
 use crate::runtime::config::Feature;
 use crate::runtime::dispatcher::{CommandRegistration, FallbackHandler};
@@ -184,9 +186,13 @@ impl PluginContext {
 
     /// 带优先级的兜底：想让别人先看就用 [`ListenerPriority::Lowest`]
     pub fn fallback_at(&self, handler: Arc<dyn FallbackHandler>, priority: ListenerPriority) {
-        self.framework()
-            .commands()
-            .register_fallback(self.plugin_id(), handler, priority);
+        for problem in
+            self.framework()
+                .commands()
+                .register_fallback(self.plugin_id(), handler, priority)
+        {
+            crate::runtime::log::warning(format!("[{}] {problem}", self.plugin_id()));
+        }
     }
 
     /// 本插件名下的命令概览（自绘帮助页用）
@@ -227,6 +233,25 @@ impl PluginContext {
             .subscribe_where(self.plugin_id(), filters, priority, handler);
     }
 
+    /// 订阅并绑到本插件的某个分群功能开关上（`feature` 是 install 阶段
+    /// [`Self::feature`] 登记的 key）：该群关掉这个功能时，这条钩子在群里不再投递，
+    /// 和同名命令一起消失——不留"功能显示已关闭、统计钩子还在收所有消息"的尾巴。
+    pub fn listen_feature(
+        &self,
+        feature: &'static str,
+        filters: &[BodyFilter],
+        priority: ListenerPriority,
+        handler: Arc<dyn EventHandler>,
+    ) {
+        self.framework().hooks().subscribe_feature(
+            self.plugin_id(),
+            feature,
+            filters,
+            priority,
+            handler,
+        );
+    }
+
     /// 只订阅群消息（默认优先级）
     pub fn on_group_message(&self, handler: Arc<dyn EventHandler>) {
         self.listen_where(
@@ -257,6 +282,21 @@ impl PluginContext {
         self.listen(&[EventKind::Meta], ListenerPriority::default(), handler);
     }
 
+    /// 订阅**出站**消息（mirai 的 `MessagePreSendEvent`）：机器人每条要说的话，
+    /// 在发给 OneBot 实现端之前都先交给你——`context.rewrite(..)` 改写内容，
+    /// `context.cancel()` 拦停这条。默认优先级；要在别家之后收尾（例如统一加后缀）
+    /// 用 [`Self::on_outgoing_at`]。
+    pub fn on_outgoing(&self, handler: Arc<dyn OutboundHandler>) {
+        self.on_outgoing_at(handler, ListenerPriority::default());
+    }
+
+    /// 带优先级的出站订阅
+    pub fn on_outgoing_at(&self, handler: Arc<dyn OutboundHandler>, priority: ListenerPriority) {
+        self.framework()
+            .hooks()
+            .subscribe_outbound(self.plugin_id(), "", priority, handler);
+    }
+
     // ==================== 后台任务与定时任务 ====================
 
     /// 在本插件作用域内跑后台任务：插件停用时自动取消
@@ -266,6 +306,17 @@ impl PluginContext {
         F::Output: Send + 'static,
     {
         self.inner.scope.spawn(task)
+    }
+
+    /// 在本插件作用域内跑后台任务，并把它的日志前缀细化成 `[插件名:动作]`
+    /// （如 `[BluearchivePlugin:定时推送]`）。任务会跨 `await` 在工作线程间搬动，
+    /// 所以动作名必须走这里随任务下发，`plugin::action` 的线程局部来源撑不过一次挂起。
+    pub fn spawn_as<F>(&self, action: &str, task: F) -> tokio::task::JoinHandle<F::Output>
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.inner.scope.spawn_as(action, task)
     }
 
     /// 每天固定小时触发（任务组自动归属本插件，停用即整组取消）
@@ -299,6 +350,31 @@ impl PluginContext {
     /// 取消本插件的一个定时任务
     pub fn remove_job(&self, name: &str) -> bool {
         self.framework().jobs().remove(name)
+    }
+
+    /// 登记一条过期数据清理任务：每 `every_days` 天删掉 `keep_days` 天前的数据。
+    /// 排期与播报都在框架里（日志挂 `[Arona]`），本插件被停用时框架按归属整组回收。
+    pub fn purge_job(
+        &self,
+        name: &str,
+        title: &str,
+        every_days: i64,
+        keep_days: i64,
+        purge: crate::runtime::purge::PurgeFn,
+    ) {
+        crate::runtime::purge::schedule(
+            self.plugin_id(),
+            name,
+            title,
+            every_days,
+            keep_days,
+            purge,
+        );
+    }
+
+    /// 取消一条清理任务（配置里关掉清理时用）
+    pub fn cancel_purge_job(&self, name: &str) {
+        crate::runtime::purge::cancel(name);
     }
 
     // ==================== 配置 ====================

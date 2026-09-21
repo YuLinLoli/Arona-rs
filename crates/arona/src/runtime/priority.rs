@@ -1,7 +1,7 @@
 //! 调度优先级（框架内共用一份序：数值越小越先执行）。
 //!
 //! 语义取自 mirai 的 `EventPriority`：声明顺序即执行顺序
-//! `Monitor -> Normal -> High -> Low -> Lowest`。
+//! `Monitor -> High -> Normal -> Low -> Lowest`。
 //! Monitor 排最前，用来做"先看一眼、必要时短路"的观察者；
 //! Lowest 排最后，是兜底实现（如模糊匹配、默认回复）。
 
@@ -10,10 +10,10 @@
 pub enum Priority {
     /// 最先执行：监控、审计、必要时短路
     Monitor = 0,
+    /// 比默认更早
+    High = 50,
     /// 默认档
     Normal = 100,
-    /// 比默认更早
-    High = 200,
     /// 比默认更晚
     Low = 300,
     /// 最后执行：兜底实现
@@ -48,3 +48,21 @@ impl Default for Priority {
 pub type ListenerPriority = Priority;
 /// 命令匹配优先级
 pub type CommandPriority = Priority;
+
+#[cfg(test)]
+mod tests {
+    use super::Priority;
+
+    /// 变体的声明顺序、数值大小、`Ord` 结果三者必须一致，
+    /// 否则文档里"声明顺序即执行顺序"就是假的（`High` 曾经是这一条的漏网之鱼）。
+    #[test]
+    fn order_matches_declaration() {
+        assert!(Priority::Monitor < Priority::High);
+        assert!(Priority::High < Priority::Normal);
+        assert!(Priority::Normal < Priority::Low);
+        assert!(Priority::Low < Priority::Lowest);
+        assert_eq!(Priority::Monitor.order(), 0);
+        assert!(Priority::High.order() < Priority::Normal.order());
+        assert_eq!(Priority::default(), Priority::Normal);
+    }
+}

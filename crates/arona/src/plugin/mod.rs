@@ -27,6 +27,7 @@ pub mod manager;
 pub mod scope;
 
 use crate::runtime::log;
+use std::future::Future;
 use std::sync::Arc;
 
 pub use context::{PluginContext, PluginRegistrar};
@@ -100,6 +101,60 @@ pub fn metas() -> Vec<PluginMeta> {
 /// 某个插件的元信息（按 id 查，GUI「插件管理」页用）
 pub fn meta_of(id: &str) -> Option<PluginMeta> {
     manager().find(id).map(|plugin| plugin.meta().clone())
+}
+
+/// 插件 id → 显示名（日志前缀用）：插件代码里打的日志挂它自己的名字，不再顶着 `[Arona]`。
+/// 空 id 视为框架自己，未知 id 原样回显。
+pub fn display_name(id: &str) -> String {
+    if id.is_empty() {
+        return "Arona".to_string();
+    }
+    meta_of(id)
+        .map(|meta| meta.name.to_string())
+        .unwrap_or_else(|| id.to_string())
+}
+
+/// 插件 id + 动作 → 日志来源（`BluearchivePlugin:定时推送`）：框架在进入插件代码的每个
+/// 入口用它换掉 `[Arona]`，动作名按入口给粗粒度默认值，插件可在内部再细化（[`action`]）。
+pub fn log_source(id: &str, action: &str) -> String {
+    if id.is_empty() {
+        // 框架自己的任务：不带动作，仍是 `[Arona]`
+        return display_name(id);
+    }
+    format!("{}:{action}", display_name(id))
+}
+
+/// 把当前插件的日志前缀细化成 `[插件名:动作]`，只在 `f` 执行期间有效（同步段）。
+///
+/// 框架已按入口给了粗粒度动作名（`装配`、`命令 活动`、`事件 群消息`、`定时 DailyNotify`…），
+/// 插件在关键动作上包一层就更精确：`action("定时推送", || ..)`、`action("踢人", || ..)`。
+/// 跨 `await` 的后台任务请用 [`PluginContext::spawn_as`]（线程局部的来源撑不过 await）。
+pub fn action<R>(name: &str, f: impl FnOnce() -> R) -> R {
+    crate::runtime::log::with_action(name, f)
+}
+
+/// [`action`] 的异步版：动作名覆盖返回 future 的每次轮询，中间的 await 不会丢掉它。
+///
+/// 一次外部调用就是一个动作：`action_async("发送消息", services::send_message(..)).await`。
+pub fn action_async<F>(name: &str, future: F) -> impl Future<Output = F::Output>
+where
+    F: Future,
+{
+    crate::runtime::log::with_action_async(name, future)
+}
+
+/// 这个名字是不是某个已登记插件的显示名（控制台与 GUI 按它把插件日志染成淡紫）
+pub fn is_plugin_name(name: &str) -> bool {
+    manager()
+        .snapshot()
+        .iter()
+        .any(|plugin| plugin.meta().name == name)
+}
+
+/// 按 id 取回该插件的后台任务作用域：定时任务体里要起异步活儿时用它。
+/// 裸 `tokio::spawn` 起的任务不受插件停用回收，日志也认不出归属。
+pub fn scope_of(id: &str) -> Option<Arc<PluginScope>> {
+    manager().find(id).map(|plugin| plugin.scope_handle())
 }
 
 /// 某个插件当前状态（按 id 查）
@@ -220,7 +275,7 @@ mod tests {
             _target: MessageTarget,
             _message: OutgoingMessage,
         ) -> BoxFuture<'a, MessageReceipt> {
-            Box::pin(async { MessageReceipt { message_id: None } })
+            Box::pin(async { MessageReceipt::default() })
         }
     }
 
@@ -396,6 +451,82 @@ mod tests {
 
         // install 阶段会在磁盘上留下插件目录三件套，跑完抹掉，别污染工作区
         for id in ["ContractAlpha", "ContractBeta"] {
+            let _ = std::fs::remove_dir_all(crate::runtime::paths::plugin_dir(id));
+            let _ = std::fs::remove_dir_all(crate::runtime::paths::plugin_config_dir(id));
+            let _ = std::fs::remove_dir_all(crate::runtime::paths::plugin_data_dir(id));
+        }
+    }
+
+    /// configure 里 panic 的插件要折算成"该家装配失败"（标 Failed + 回收它已登记的命令），
+    /// 既不许掀翻宿主，也不许连累同批装配的另一家。
+    /// 回归点：五个生命周期回调以前都是裸调，panic 会顺着 configure_all 冒到宿主。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn panicking_configure_fails_only_that_plugin() {
+        const CRASHER: &str = "LifecyclePanicCrasher";
+        const BYSTANDER: &str = "LifecyclePanicBystander";
+
+        struct Panics(&'static str);
+
+        impl AronaPlugin for Panics {
+            fn meta(&self) -> PluginMeta {
+                PluginMeta::new(self.0, "生命周期 panic 自检", "1.0.0", "panic 隔离自检")
+            }
+
+            fn configure(&self, ctx: &PluginContext) -> Result<(), String> {
+                let slot = if self.0 == CRASHER { 1 } else { 2 };
+                // 先登记一条命令再 panic：回收必须把它一起带走
+                ctx.command(CommandRegistration::new(
+                    vec![format!("/panic自检{slot}")],
+                    "panic 隔离自检",
+                    handler(|_c: Arc<CommandContext>, _a: Vec<String>| async move { None }),
+                ));
+                if self.0 == CRASHER {
+                    panic!("装配阶段炸弹");
+                }
+                Ok(())
+            }
+        }
+
+        let framework = crate::framework::Framework::new();
+        let manager = framework.plugins().clone();
+        assert!(manager.register(Arc::new(Panics(CRASHER))));
+        assert!(manager.register(Arc::new(Panics(BYSTANDER))));
+        let options = LifecycleOptions {
+            onebot_config: onebot_config(),
+            test_notify: false,
+        };
+        assert!(manager.install_all().is_empty());
+
+        let failures = manager.configure_all(&options);
+        assert_eq!(
+            failures
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .collect::<Vec<_>>(),
+            vec![CRASHER],
+            "只该报出事那一家: {failures:?}"
+        );
+        assert!(
+            failures[0].1.contains("panic"),
+            "失败原因要点名 panic: {:?}",
+            failures[0]
+        );
+        assert!(
+            matches!(
+                manager.find(CRASHER).unwrap().state(),
+                PluginState::Failed(_)
+            ),
+            "出事插件应标 Failed"
+        );
+        assert_eq!(manager.find(BYSTANDER).unwrap().state(), PluginState::Ready);
+        assert!(
+            !framework.commands().has_commands_of(CRASHER),
+            "出事插件 panic 前登记的命令应被 revoke 收干净"
+        );
+        assert!(framework.commands().has_commands_of(BYSTANDER));
+        manager.stop_all();
+
+        for id in [CRASHER, BYSTANDER] {
             let _ = std::fs::remove_dir_all(crate::runtime::paths::plugin_dir(id));
             let _ = std::fs::remove_dir_all(crate::runtime::paths::plugin_config_dir(id));
             let _ = std::fs::remove_dir_all(crate::runtime::paths::plugin_data_dir(id));

@@ -1020,6 +1020,8 @@ pub struct CanSend {
 pub struct MessageInfo {
     pub time: i64,
     pub message_id: i64,
+    /// NapCat / LLOWeb 回查时另外给的号，撤回只认它
+    pub real_id: Option<i64>,
     pub real_params: Map<String, Value>,
     pub message_type: String,
     pub sub_type: String,

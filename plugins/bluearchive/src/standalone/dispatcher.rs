@@ -5,24 +5,34 @@ use crate::standalone::commands::{self, emergency::EmergencyStop};
 use arona::config::onebot::{ConnectionConfig, ConnectionType, OneBotConfig};
 use arona::plugin::PluginContext;
 use arona::runtime::dispatcher::{
-    CommandContext, CommandHandler, CommandRegistration, FallbackHandler, fallback, handler,
+    CommandContext, CommandHandler, CommandInfo, CommandRegistration, FallbackHandler, Permission,
+    fallback, handler,
 };
 use arona::runtime::message::OutgoingMessage;
 use arona::services;
+use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 /// 把本插件的全部命令与兜底登记进框架的命令表（configure 阶段调用）。
 /// 命令名与别家插件撞车时由框架按优先级裁决并记日志，本插件其余命令照常生效。
 pub fn register(ctx: &PluginContext, config: OneBotConfig) {
-    ctx.commands(registrations(config, ctx.service_board().clone()));
+    let overview = {
+        let ctx = ctx.clone();
+        Arc::new(move || ctx.own_commands()) as CommandOverview
+    };
+    ctx.commands(registrations(config, ctx.service_board().clone(), overview));
     ctx.fallback(numeric_reply());
 }
+
+/// 本插件命令表的现读句柄：帮助页要的是**登记成功**的那些命令，而不是这里手写的一份清单
+pub type CommandOverview = Arc<dyn Fn() -> Vec<CommandInfo> + Send + Sync>;
 
 /// 本插件的全部命令登记项（装配与自测共用一份，避免两处漂移）
 pub fn registrations(
     config: OneBotConfig,
     board: Arc<services::ServiceManager>,
+    overview: CommandOverview,
 ) -> Vec<CommandRegistration> {
     api::register_all(&board);
     let service = |name: &str| {
@@ -34,49 +44,47 @@ pub fn registrations(
 
     let status_config = config.clone();
     let status_board = board.clone();
+    let status_overview = overview.clone();
     let arona_status = plain_arg_handler(move |context, arguments| {
         let config = status_config.clone();
         let board = status_board.clone();
+        let overview = status_overview.clone();
         let arguments = arguments.clone();
         async move {
-            let text = handle_arona(&config, &board, &context, arguments).await;
+            let text = handle_arona(&config, &board, &overview, &context, arguments).await;
             Some(OutgoingMessage::text(text))
         }
     });
-    let help_config = config.clone();
+    let help_overview = overview.clone();
     let help_handler = plain_arg_handler(move |_context, arguments| {
         let _ = arguments;
-        let config = help_config.clone();
-        async move { Some(OutgoingMessage::text(help_text(&config))) }
+        let overview = help_overview.clone();
+        async move { Some(OutgoingMessage::text(help_text(&overview))) }
     });
 
     let registrations = vec![
-        CommandRegistration::new(
-            vec!["/arona".into(), "arona".into()],
-            "查看 Arona 状态与帮助",
-            arona_status,
-        ),
+        CommandRegistration::new(vec!["/arona".into()], "查看 Arona 状态与帮助", arona_status),
         CommandRegistration::new(
             vec!["/帮助".into(), "/help".into()],
             "查看独立模式帮助",
             help_handler,
         ),
         CommandRegistration::new(
-            vec!["/单抽".into(), "gacha_one".into()],
+            vec!["/单抽".into(), "/gacha_one".into()],
             "单抽一次, 可选服务器: /单抽 日服|国服|国际服",
             commands::guarded_arg_handler(service("抽卡单抽"), |context, arguments| async move {
                 commands::gacha_cmd::single_draw(context, arguments).await
             }),
         ),
         CommandRegistration::new(
-            vec!["/十连".into(), "gacha_multi".into()],
+            vec!["/十连".into(), "/gacha_multi".into()],
             "模拟十连, 可选服务器: /十连 日服|国服|国际服",
             commands::guarded_arg_handler(service("抽卡十连"), |context, arguments| async move {
                 commands::gacha_cmd::multi_draw(context, arguments).await
             }),
         ),
         CommandRegistration::new(
-            vec!["/抽卡服务器".into(), "gacha_server".into()],
+            vec!["/抽卡服务器".into(), "/gacha_server".into()],
             "设置默认抽卡服务器",
             commands::guarded_arg_handler(
                 service("抽卡服务器设置"),
@@ -86,56 +94,56 @@ pub fn registrations(
             ),
         ),
         CommandRegistration::new(
-            vec!["/狗叫".into(), "gacha_dog".into()],
+            vec!["/狗叫".into(), "/gacha_dog".into()],
             "查看抽出pick的人",
             commands::guarded_handler(service("抽卡狗叫查询"), |context| async move {
                 commands::gacha_cmd::dog_ranking(context).await
             }),
         ),
         CommandRegistration::new(
-            vec!["/历史".into(), "gacha_history".into()],
+            vec!["/历史".into(), "/gacha_history".into()],
             "抽卡历史记录",
             commands::guarded_handler(service("抽卡历史查询"), |context| async move {
                 commands::gacha_cmd::history_ranking(context).await
             }),
         ),
         CommandRegistration::new(
-            vec!["/游戏名".into(), "game_name".into()],
+            vec!["/游戏名".into(), "/game_name".into()],
             "记录游戏名与群名的对应关系",
             commands::guarded_arg_handler(service("游戏名记录"), |context, arguments| async move {
                 commands::name::game_name(context, arguments).await
             }),
         ),
         CommandRegistration::new(
-            vec!["/谁是".into(), "谁叫".into(), "game_name_search".into()],
+            vec!["/谁是".into(), "/谁叫".into(), "/game_name_search".into()],
             "根据游戏名反查群友",
             commands::guarded_arg_handler(service("游戏名反查"), |context, arguments| async move {
                 commands::name::search(context, arguments).await
             }),
         ),
         CommandRegistration::new(
-            vec!["/叫我".into(), "call_me".into()],
+            vec!["/叫我".into(), "/call_me".into()],
             "给自己自定义昵称",
             commands::guarded_arg_handler(service("自定义昵称"), |context, arguments| async move {
                 commands::name::call_me(context, arguments).await
             }),
         ),
         CommandRegistration::new(
-            vec!["/塔罗牌".into(), "tarot".into()],
+            vec!["/塔罗牌".into(), "/tarot".into()],
             "抽一张塔罗牌",
             commands::guarded_handler(service("塔罗牌"), |context| async move {
                 commands::tarot::tarot(context).await
             }),
         ),
         CommandRegistration::new(
-            vec!["/活动".into(), "active".into()],
+            vec!["/活动".into(), "/active".into()],
             "通过wiki获取活动列表",
             commands::guarded_arg_handler(service("活动查询"), |context, arguments| async move {
                 commands::activity::activity(context, arguments).await
             }),
         ),
         CommandRegistration::new(
-            vec!["/攻略".into(), "trainer".into()],
+            vec!["/攻略".into(), "/trainer".into()],
             "活动攻略/日程笔记/卡池/图片别名查询",
             commands::guarded_arg_handler(
                 service("地图与学生攻略"),
@@ -143,7 +151,7 @@ pub fn registrations(
             ),
         ),
         CommandRegistration::new(
-            vec!["/紧急停止".into(), "emergency_stop".into()],
+            vec!["/紧急停止".into(), "/emergency_stop".into()],
             "非管理员投票制停止服务",
             {
                 let emergency = emergency.clone();
@@ -157,35 +165,35 @@ pub fn registrations(
             },
         ),
         CommandRegistration::new(
-            vec!["/config".into(), "config".into()],
+            vec!["/config".into()],
             "查看/修改 Arona 配置",
             commands::guarded_arg_handler(service("配置管理"), |context, arguments| async move {
                 commands::config_cmd::handle(context, arguments).await
             }),
         ),
         CommandRegistration::new(
-            vec!["/抽卡".into(), "gacha".into()],
+            vec!["/抽卡".into(), "/gacha".into()],
             "抽卡配置管理",
             commands::guarded_arg_handler(service("抽卡配置"), |context, arguments| async move {
                 commands::gacha_cmd::gacha_admin(context, arguments).await
             }),
         ),
         CommandRegistration::new(
-            vec!["/任务".into(), "task".into()],
+            vec!["/任务".into(), "/task".into()],
             "查看/触发定时任务(管理员)",
             commands::guarded_arg_handler(service("定时任务"), |_context, arguments| async move {
                 Some(commands::task_cmd::handle(&arguments))
             }),
         ),
         CommandRegistration::new(
-            vec!["/备份".into(), "backup".into()],
+            vec!["/备份".into(), "/backup".into()],
             "备份配置与数据库(管理员)",
             commands::guarded_arg_handler(service("备份恢复"), |_context, arguments| async move {
                 Some(commands::backup::backup(&arguments))
             }),
         ),
         CommandRegistration::new(
-            vec!["/恢复".into(), "restore".into()],
+            vec!["/恢复".into(), "/restore".into()],
             "从备份恢复配置与数据库(管理员)",
             commands::guarded_arg_handler(service("备份恢复"), |_context, arguments| async move {
                 Some(commands::backup::restore(
@@ -215,7 +223,7 @@ pub fn numeric_reply() -> Arc<dyn FallbackHandler> {
         if let Some(message) =
             crate::standalone::commands::trainer::resolve_numeric_reply(context.clone()).await
         {
-            crate::standalone::history::reply(&context, message).await;
+            context.reply_with_quote(message).await;
         }
     })
 }
@@ -224,7 +232,10 @@ pub fn numeric_reply() -> Arc<dyn FallbackHandler> {
 #[cfg(test)]
 pub(crate) fn register_into_table(config: OneBotConfig) {
     use arona::runtime::priority::CommandPriority;
-    for registration in registrations(config, services::global_board()) {
+    let overview = {
+        Arc::new(|| arona::runtime::dispatcher::commands_of(crate::PLUGIN_ID)) as CommandOverview
+    };
+    for registration in registrations(config, services::global_board(), overview) {
         arona::runtime::dispatcher::register(crate::PLUGIN_ID, registration);
     }
     arona::runtime::dispatcher::register_fallback(
@@ -263,7 +274,7 @@ where
         async move {
             let reply = f(context.clone(), arguments).await;
             if let Some(message) = reply {
-                crate::standalone::history::reply(&context, message).await;
+                context.reply_with_quote(message).await;
             }
             None
         }
@@ -274,6 +285,7 @@ where
 async fn handle_arona(
     config: &OneBotConfig,
     board: &services::ServiceManager,
+    overview: &CommandOverview,
     context: &CommandContext,
     arguments: Vec<String>,
 ) -> String {
@@ -285,7 +297,7 @@ async fn handle_arona(
     {
         "" | "status" | "状态" => status_text(config),
         "version" | "版本" => version_text(),
-        "help" | "帮助" => help_text(config),
+        "help" | "帮助" => help_text(overview),
         "service" | "services" | "连接" => {
             handle_service(config, board, context, &arguments).await
         }
@@ -353,9 +365,37 @@ fn status_text(config: &OneBotConfig) -> String {
     )
 }
 
-fn help_text(config: &OneBotConfig) -> String {
-    let _ = config;
-    "Arona 独立模式命令\n/arona status - 查看运行状态\n/arona services - 查看 OneBot 连接\n/arona service list - 查看已注册服务\n/arona version - 查看版本信息\n/单抽 /十连 /狗叫 /历史 /抽卡服务器 - 抽卡\n/游戏名 /谁是 /叫我 - 名字记录\n/塔罗牌 /活动 /攻略 - 娱乐与攻略查询\n/紧急停止 - 投票停止服务\n/config - 查看/修改配置(管理员)\n/任务 /备份 /恢复 - 定时任务与备份恢复(管理员)\n/arona help - 查看本帮助".to_string()
+/// `/帮助` 与 `/arona help` 的正文：逐条取自框架命令表里本插件**登记成功**的命令，
+/// 所以增删命令、改描述、起别名都不必回来改这段文字（旧版手写清单就是这么过期的）。
+fn help_text(overview: &CommandOverview) -> String {
+    let mut commands = overview();
+    // 登记序号即插件自己的登记顺序；一条命令的多个别名里最先登记的是主名，别名不重复占行
+    commands.sort_by_key(|info| info.seq);
+    let mut lines: Vec<String> = vec!["Arona 独立模式命令".to_string()];
+    let mut listed: HashSet<(String, String, &'static str)> = HashSet::new();
+    for info in &commands {
+        let summary = if info.description.is_empty() {
+            info.usage.as_str()
+        } else {
+            info.description.as_str()
+        };
+        if summary.is_empty()
+            || !listed.insert((info.description.clone(), info.usage.clone(), info.feature))
+        {
+            continue;
+        }
+        let marker = match info.permission {
+            Permission::Anyone => "",
+            Permission::GroupAdmin => "（管理员）",
+            Permission::GroupOwner => "（群主）",
+        };
+        lines.push(format!("{} - {summary}{marker}", info.name));
+    }
+    // /arona 的子命令不是独立表项，只能在这里带一句
+    if commands.iter().any(|info| info.name == "/arona") {
+        lines.push("/arona status|services|service list|version - 状态与连接明细".to_string());
+    }
+    lines.join("\n")
 }
 
 fn version_text() -> String {
@@ -416,4 +456,60 @@ fn service_list_text(board: &services::ServiceManager) -> String {
         })
         .collect();
     format!("已注册服务:\n{}", lines.join("\n"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arona::runtime::priority::CommandPriority;
+
+    fn info(seq: u64, name: &str, description: &str, permission: Permission) -> CommandInfo {
+        CommandInfo {
+            plugin: crate::PLUGIN_ID.to_string(),
+            name: name.to_string(),
+            description: description.to_string(),
+            usage: String::new(),
+            feature: "",
+            priority: CommandPriority::default(),
+            permission,
+            seq,
+        }
+    }
+
+    /// 帮助页取自命令表，而不是这里手写的一份清单：别名不重复占行、权限标出来、按登记顺序排
+    #[test]
+    fn help_text_is_generated_from_the_command_table() {
+        let commands = vec![
+            info(3, "/help", "查看独立模式帮助", Permission::Anyone),
+            info(2, "/帮助", "查看独立模式帮助", Permission::Anyone),
+            info(4, "/备份", "备份数据库", Permission::GroupAdmin),
+            info(1, "/arona", "查看 Arona 状态与帮助", Permission::Anyone),
+        ];
+        let overview: CommandOverview = {
+            let commands = commands.clone();
+            Arc::new(move || commands.clone())
+        };
+        let text = help_text(&overview);
+        assert!(text.starts_with("Arona 独立模式命令"), "{text}");
+        // 传进来的顺序是乱的，正文必须按登记序号排
+        let lines: Vec<&str> = text.lines().skip(1).collect();
+        assert_eq!(lines[0], "/arona - 查看 Arona 状态与帮助", "{text}");
+        assert_eq!(lines[1], "/帮助 - 查看独立模式帮助", "{text}");
+        assert_eq!(lines[2], "/备份 - 备份数据库（管理员）", "{text}");
+        assert!(!text.contains("/help"), "别名不该再占一行：{text}");
+        // /arona 的子命令不是独立表项，靠最后一行补出来
+        assert!(text.contains("/arona status|services"), "{text}");
+    }
+
+    /// 命令表里没有 /arona 时不该硬塞那句子命令提示
+    #[test]
+    fn help_text_omits_the_subcommand_line_without_arona() {
+        let commands = vec![info(1, "/单抽", "单抽一次", Permission::Anyone)];
+        let overview: CommandOverview = {
+            let commands = commands.clone();
+            Arc::new(move || commands.clone())
+        };
+        let text = help_text(&overview);
+        assert_eq!(text, "Arona 独立模式命令\n/单抽 - 单抽一次", "{text}");
+    }
 }

@@ -7,7 +7,7 @@ use crate::runtime::message::{
     BoxFuture, ForwardMessage, MessageReceipt, MessageSegment, MessageSender, MessageTarget,
     OutgoingMessage,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -53,8 +53,17 @@ async fn send_via(
     connection: Option<Arc<dyn OneBotConnection>>,
     self_id: i64,
     target: MessageTarget,
-    message: OutgoingMessage,
+    mut message: OutgoingMessage,
 ) -> MessageReceipt {
+    // 出站钩子（mirai 的 MessagePreSendEvent）：插件可以改写内容，也可以整条拦下。
+    // 打印排在它后面，日志里看到的才是真正发出去的那份。
+    if !crate::framework::Framework::global()
+        .hooks()
+        .dispatch_outbound(target, &mut message)
+        .await
+    {
+        return MessageReceipt::default();
+    }
     console::print_outgoing(self_id, target, &message);
     // 合并转发段只能走 send_forward_msg，和别的段混在一条消息里时拆成两次发送：
     // 先发普通部分，再发转发，回执以先拿到的 message_id 为准（自动撤回只撤这一条）
@@ -80,14 +89,31 @@ async fn send_via(
     if !nodes.is_empty() {
         let forward_receipt = match &connection {
             Some(conn) => send_forward(conn.clone(), target, &nodes).await,
-            None => MessageReceipt { message_id: None },
+            None => MessageReceipt::default(),
         };
         if receipt.message_id.is_none() {
             receipt = forward_receipt;
         }
     }
+    // 出站记账：只有连机器人说出的话一起留档，才还原得了「用户引用了机器人的回复」
+    crate::runtime::chatlog::record_outgoing(target, &message, &receipt);
     schedule_revoke(connection, receipt.clone(), message.revoke_after_millis);
     receipt
+}
+
+/// 从发送响应里取回执：NapCat / LLOWeb 会连着给一个 `real_id`，
+/// 撤回与回查只认它，事件里带的 message_id 有时只是个临时号
+fn receipt_of(data: Option<Value>) -> MessageReceipt {
+    let map = data.and_then(|data| data.as_object().cloned());
+    let id = |key: &str| {
+        map.as_ref()
+            .and_then(|map| map.get(key))
+            .and_then(|value| value.as_i64())
+    };
+    MessageReceipt {
+        message_id: id("message_id"),
+        real_id: id("real_id"),
+    }
 }
 
 fn build_send_params(
@@ -129,12 +155,7 @@ async fn send_normal(
             echo: protocol::new_echo(),
         })
         .await;
-    let message_id = response
-        .and_then(|r| r.data)
-        .and_then(|d| d.as_object().cloned())
-        .and_then(|o| o.get("message_id").cloned())
-        .and_then(|v| v.as_i64());
-    MessageReceipt { message_id }
+    receipt_of(response.and_then(|r| r.data))
 }
 
 async fn send_forward(
@@ -158,16 +179,9 @@ async fn send_forward(
     // 合并转发节点常含大图 base64，实现端上传处理可能超过 15 秒才响应；
     // 只有实现端明确报错才降级为平铺发送，超时/异步受理时转发往往已实际发出，再发会重复
     match response {
-        Some(response) if response.success() => {
-            let message_id = response
-                .data
-                .and_then(|d| d.as_object().cloned())
-                .and_then(|o| o.get("message_id").cloned())
-                .and_then(|v| v.as_i64());
-            MessageReceipt { message_id }
-        }
+        Some(response) if response.success() => receipt_of(response.data),
         // retcode=1 / status=async：已提交处理，消息会随后发出
-        Some(response) if response.async_accepted() => MessageReceipt { message_id: None },
+        Some(response) if response.async_accepted() => MessageReceipt::default(),
         Some(response) => {
             crate::runtime::log::warning(format!(
                 "发送合并转发失败(status={}, retcode={})，降级为平铺消息重发",
@@ -188,7 +202,7 @@ async fn send_forward(
             crate::runtime::log::warning(
                 "发送合并转发后未收到响应(可能超时)，为避免重复消息不再平铺重发",
             );
-            MessageReceipt { message_id: None }
+            MessageReceipt::default()
         }
     }
 }
@@ -198,7 +212,8 @@ fn schedule_revoke(
     receipt: MessageReceipt,
     revoke_after_millis: Option<u64>,
 ) {
-    let Some(message_id) = receipt.message_id else {
+    // 自动撤回认实现端给的真实 id（NapCat 一类只认它），没有才退回 message_id
+    let Some(message_id) = receipt.real_id.or(receipt.message_id) else {
         return;
     };
     let Some(delay_millis) = revoke_after_millis else {

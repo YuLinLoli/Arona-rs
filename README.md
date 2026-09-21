@@ -158,7 +158,7 @@ connections:
 
 ### arona.yml
 
-框架那份 `config/arona.yml` 只管「谁能用、谁被停掉」：
+框架那份 `config/arona.yml` 只管「谁能用、谁被停掉」和框架自己的行为：
 
 ```yaml
 groups: []                  # 允许响应的群号，留空 = 所有群
@@ -172,6 +172,18 @@ group_settings:
     disabled_features: [tarot]
     disabled_plugins: [bluearchive]
     blacklist: [10001]
+
+# 框架行为（对位 mirai 的 MiraiInstance.new { }，改完保存即热生效）
+framework:
+  panic_disable_threshold: 5    # 同一插件连续 panic 多少次就自动隔离停用（0 = 只记日志、不停用）
+  prefix_match_by_default: false # 未声明 with_prefix_match 的命令是否也允许最短前缀匹配（开着时 /抽 会命中 /抽卡）
+
+# 聊天记录缓存：插件做「引用回复」与「按存储 id 撤回」的依据（data/arona/chatlog.db）
+chatlog:
+  enable: true              # 关掉后不再记账，引用还原与撤回时的 id 换算一起停
+  keep_days: 2              # 本地留几天的聊天消息
+  purge_interval_days: 4    # 每隔几天清一次过期记录
+  quote_ttl_minutes: 30     # 多少分钟内的引用仍由实现端直接挂原生引用，超过才本地还原
 ```
 
 玩法参数住在插件自己那份 `config/<插件>/arona.yml`（碧蓝档案插件即
@@ -246,7 +258,7 @@ cargo installer          # 发布构建 + 打 Windows 安装包: target/release/
   找不到时会提示先执行 `winget install --id JRSoftware.InnoSetup`。
 - 安装包内含程序介绍（[`installer/intro.txt`](installer/intro.txt)）、AGPLv3 全文与中文译本、
   默认配置模板（[`installer/defaults/`](installer/defaults)，`onlyifdoesntexist` 释放）。
-  `defaults/arona.yml` 里只有框架自己的项（群授权 / 管理员），功能插件的配置区由插件在首次运行时
+  `defaults/arona.yml` 里只有框架自己的项（群授权 / 管理员 / 框架行为 / 聊天记录缓存），功能插件的配置区由插件在首次运行时
   按声明的位置自动补上，安装包不需要跟着插件改。
 - 约 62 MB 的 `softgl/`（CPU 软件渲染依赖）与 exe **分开存储**，安装时释放到安装目录的 `softgl\`
   （程序就在 exe 同级的 `softgl\` 找它）。安装类型默认「完整安装」会勾上它，
@@ -321,8 +333,9 @@ installer/               Windows 安装包：arona-rs.iss(Inno Setup 脚本)、i
 只改 `plugins.toml` 与 host 的 `Cargo.toml` 即可。
 
 框架给插件留出的接口：OneBot v11 全量强类型动作（收发/撤回消息、群管、成员资料、群文件、请求处理…）、
-四类事件的订阅钩子（message/notice/request/meta）、统一的 `config/<插件>/` 与 `data/<插件>/` 落盘位置、
-功能开关与插件级启停门控。开发新插件见 [PLUGIN_DEVELOPMENT.md](PLUGIN_DEVELOPMENT.md)。
+四类事件的订阅钩子（message/notice/request/meta）、发送前的出站钩子（改写或拦停本机器人发出的消息）、
+统一的 `config/<插件>/` 与 `data/<插件>/` 落盘位置、功能开关与插件级启停门控。
+开发新插件见 [PLUGIN_DEVELOPMENT.md](PLUGIN_DEVELOPMENT.md)。
 
 ### 运行目录
 
@@ -332,12 +345,13 @@ installer/               Windows 安装包：arona-rs.iss(Inno Setup 脚本)、i
 ```
 <运行目录>/
   config/
-    arona.yml              框架配置：群授权 / 管理员 / 功能开关 / 插件开关
+    arona.yml              框架配置：群授权 / 管理员 / 功能开关 / 插件开关 / 框架行为 / 聊天记录缓存
     onebot.yml             OneBot 连接
     gui.txt                面板外观偏好
     <插件>/arona.yml        插件自己的配置（框架按注册表生成带注释的模板；插件升级新增的配置区会自动补齐，用户改过的值不动）
     <插件>/…               插件附带的其它配置文件（如 trainer_config.yml）
   data/
+    arona/chatlog.db        框架自己的聊天记录（引用回复与按存储 id 撤回的依据，图片只存原链接）
     <插件>/                 插件数据（如 data/bluearchive/ 下的 arona.db、image/、backups/）
   logs/                    按天滚动的日志
   plugins/
@@ -379,12 +393,14 @@ DX12 之下还有 WARP 软件渲染），最后才是随程序附带的软件 Op
 
 **群管理**
 - 左栏：搜索群号/群名，`●`/`○` 标记该群是否启用，右侧显示已关闭的功能数量与黑名单人数；可点「刷新群列表」从 OneBot 拉取。
-- 右栏：勾选「机器人在此群启用」；「插件开关」按插件逐个停用（本群不响应它名下的命令与事件，在「插件管理」页整体停用的插件这里显示为灰色）；再按功能 key 逐个开关（抽卡 / 名字 / 塔罗 / 活动 / 攻略 / 任务 / 备份 / 配置 / 紧急 / 帮助）。
+- 右栏（整页可鼠标滚轮滚动）：勾选「机器人在此群启用」；「插件开关」按插件逐个停用（本群不响应它名下的命令与事件，在「插件管理」页整体停用的插件这里显示为灰色）。
+- 「功能开关」按**提供它的插件分组**，每组默认收起，点插件名（或它左边的三角）展开/收起。组头的「全部」勾选框一次开关该插件在本群的全部功能（收起状态下也能点），展开后另有「全部启用 / 全部停用」两个按钮和逐项勾选框，可以只关其中一项；组头右侧不展开也看得到「全部已关闭」或「已关 N / M 项」。
+  清单只列**当前用得上**的 key：提供它的插件被整体停用时不再显示（勾了也不生效），到「插件管理」页恢复启用即重新出现；插件只在本群被停用时，这一组整组灰掉并注明原因（要先到「插件开关」里启用该插件）。
 - 「群成员黑名单」：点进群后自动拉取该群全部成员（管理员/群主/成员排序），每个成员有「本群」「全局」两个勾选框，可加入或移出黑名单，支持「只看黑名单」过滤。
 - 「清空该群设置」：删除该群的 `disabled_features`、`disabled_plugins` 与 `blacklist`，恢复默认。
 
 **插件管理**
-- 每个插件一张卡片：名称 / 版本 / 启用勾选框、说明、插件 id、它提供的功能开关、订阅的 OneBot 事件钩子、配置文件与数据目录（带「打开」按钮直接调资源管理器）。
+- 每个插件一张卡片：名称 / 版本 / 启用勾选框、说明、插件 id、它提供的功能开关（整体停用中也照常列出，这里看的是"它能提供什么"）、订阅的 OneBot 事件钩子（出站改写会单独列成「出站消息」）、配置文件与数据目录（带「打开」按钮直接调资源管理器）。
 - 取消勾选即整体停用：写进 `config/arona.yml` 的 `disabled_plugins`，热生效 —— 插件 `stop()`（定时任务一并取消）、不再装配、不接收任何消息与事件；配置和数据原样保留，重新勾选就恢复。
 - 只想在某个群里停用：用「群管理」页的「插件开关」。
 
@@ -528,7 +544,8 @@ group_settings:
     blacklist: [10002, 10003]
 ```
 
-修改会在下次读取时生效；通过 GUI 保存的分群设置会立即写盘并应用。
+修改会在下次读取时生效；通过 GUI 保存的分群设置会立即写盘并应用。同一文件末尾的 `framework:`
+段是框架自身的行为选项（panic 隔离阈值、最短前缀匹配），改完同样热生效，见上文 [arona.yml](#aronayml)。
 
 玩法参数不归框架管，住在各插件自己的 `config/<插件>/arona.yml`（如
 `config/bluearchive/arona.yml` 的 `notify`、`trainer`）：框架只把它当原样 YAML 片段保存、

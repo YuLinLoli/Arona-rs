@@ -1,7 +1,7 @@
 //! arona 框架业务配置（`config/arona.yml`）
 //!
 //! 本文件只管框架自己认识的几项：groups / managers / global_blacklist / group_settings /
-//! disabled_plugins。功能插件的配置不住这里——每个插件各有一份 `config/<插件>/arona.yml`，
+//! disabled_plugins / framework / chatlog。功能插件的配置不住这里——每个插件各有一份 `config/<插件>/arona.yml`，
 //! 由 [`super::plugin_config`] 负责生成模板、加载与热重载。
 //! 插件在 install 阶段用 [`register_section`] 登记自己那几块配置（带上自己的插件 id），
 //! 框架据此识别合法键、生成带注释模板，并把旧版还写在框架 arona.yml 顶层的同名键
@@ -37,6 +37,57 @@ impl GroupSetting {
     }
 }
 
+/// 框架自身的行为选项（arona.yml 的 `framework:` 段）。
+///
+/// 对位 mirai 的 `MiraiInstance.new { }`：以前 [`crate::framework::FrameworkOptions`]
+/// 只能由代码在构造时传入，配置文件里没有落点，等于没接通。放在这里就能热重载。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FrameworkSettings {
+    /// 同一插件连续 panic 多少次就隔离停用；0 表示只记日志、不停用
+    pub panic_disable_threshold: u32,
+    /// 未显式声明 `with_prefix_match` 的命令，是否也允许最短前缀匹配
+    pub prefix_match_by_default: bool,
+}
+
+impl Default for FrameworkSettings {
+    fn default() -> Self {
+        let options = crate::framework::FrameworkOptions::default();
+        FrameworkSettings {
+            panic_disable_threshold: options.panic_disable_threshold,
+            prefix_match_by_default: options.prefix_match_by_default,
+        }
+    }
+}
+
+/// 聊天记录缓存（arona.yml 的 `chatlog:` 段，实现见 [`crate::runtime::chatlog`]）。
+///
+/// 这件事不属于任何一家插件：QQ 的引用只认实现端本地缓存里的近期消息，旧消息要能
+/// 引用回复、要能按存下来的 id 撤回，机器人都得先自己记一份。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ChatLogSettings {
+    /// 是否记录聊天记录（关掉后既不写库也不还原引用、不再撤回时换算 id）
+    pub enable: bool,
+    /// 本地留几天的聊天消息
+    pub keep_days: i64,
+    /// 每隔几天清一次过期记录
+    pub purge_interval_days: i64,
+    /// 多少分钟内的引用仍能让 OneBot 实现端直接引用（超过就改走本地还原）
+    pub quote_ttl_minutes: i64,
+}
+
+impl Default for ChatLogSettings {
+    fn default() -> Self {
+        ChatLogSettings {
+            enable: true,
+            keep_days: 2,
+            purge_interval_days: 4,
+            quote_ttl_minutes: 30,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AronaConfig {
@@ -51,6 +102,10 @@ pub struct AronaConfig {
     /// 全局禁用的插件 id（GUI「插件管理」的总开关）：列在这里的插件不装配、不接收任何事件。
     /// 取插件的 `meta().id`，大小写不敏感。
     pub disabled_plugins: Vec<String>,
+    /// 框架行为选项（panic 隔离阈值、命令前缀匹配）
+    pub framework: FrameworkSettings,
+    /// 聊天记录缓存（引用还原与按存储 id 撤回的依据）
+    pub chatlog: ChatLogSettings,
 }
 
 /// 插件持有的一块配置（写在该插件自己的 `config/<插件>/arona.yml` 里）。
@@ -202,10 +257,6 @@ pub struct SectionRegistry {
 }
 
 impl SectionRegistry {
-    fn snapshot(&self) -> Vec<(String, Arc<dyn ConfigSection>)> {
-        self.items.read().unwrap().clone()
-    }
-
     /// 登记一个插件配置区（install 阶段调用；键重复时保留先登记的）
     pub fn register(&self, plugin: &str, section: Arc<dyn ConfigSection>) {
         let mut items = self.items.write().unwrap();
@@ -216,19 +267,21 @@ impl SectionRegistry {
 
     /// 某个插件登记的配置区（按登记顺序）
     pub fn sections_of(&self, plugin: &str) -> Vec<Arc<dyn ConfigSection>> {
-        self.snapshot()
-            .into_iter()
+        self.items
+            .read()
+            .unwrap()
+            .iter()
             .filter(|(owner, _)| owner == plugin)
-            .map(|(_, section)| section)
+            .map(|(_, section)| section.clone())
             .collect()
     }
 
     /// 登记了配置区的插件 id（去重，按首次登记顺序）——框架据此决定要给谁生成配置文件
     pub fn owners(&self) -> Vec<String> {
         let mut ids: Vec<String> = Vec::new();
-        for (owner, _) in self.snapshot() {
-            if !ids.contains(&owner) {
-                ids.push(owner);
+        for (owner, _) in self.items.read().unwrap().iter() {
+            if !ids.contains(owner) {
+                ids.push(owner.clone());
             }
         }
         ids
@@ -236,16 +289,19 @@ impl SectionRegistry {
 
     /// 某块配置属于哪个插件
     pub fn owner(&self, key: &str) -> Option<String> {
-        self.snapshot()
-            .into_iter()
+        let items = self.items.read().unwrap();
+        items
+            .iter()
             .find(|(_, section)| section.key() == key)
-            .map(|(owner, _)| owner)
+            .map(|(owner, _)| owner.clone())
     }
 
     /// 已登记的插件配置区键名列表
     pub fn keys(&self) -> Vec<String> {
-        self.snapshot()
-            .into_iter()
+        self.items
+            .read()
+            .unwrap()
+            .iter()
             .map(|(_, section)| section.key().to_string())
             .collect()
     }
@@ -294,12 +350,14 @@ fn write_text(path: &Path, content: &str) -> std::io::Result<()> {
 }
 
 /// 框架自身认识的顶层键（除这些之外的顶层键交给插件配置区/未知键逻辑处理）
-const GENERIC_TOP_KEYS: [&str; 5] = [
+const GENERIC_TOP_KEYS: [&str; 7] = [
     "groups",
     "managers",
     "global_blacklist",
     "group_settings",
     "disabled_plugins",
+    "framework",
+    "chatlog",
 ];
 
 /// 曾经写在 arona.yml、现已迁到 onebot.yml 的键：单独提示，避免和普通笔误混在一条日志里
@@ -456,7 +514,7 @@ fn template(config: &AronaConfig) -> String {
     let mut out = String::new();
     out.push_str("# ==================== Arona 框架配置 ====================\n");
     out.push_str("# Rust 移植版（arona-rs）独立运行模式使用本文件，修改后保存即自动热重载。\n");
-    out.push_str("# 本文件只放框架自身的项：授权、黑名单、分群开关与插件开关。\n");
+    out.push_str("# 本文件只放框架自身的项：授权、黑名单、分群开关、插件开关与聊天记录缓存。\n");
     out.push_str("# OneBot 协议连接配置见同目录 onebot.yml；功能插件的配置在各自的 config/<插件>/arona.yml。\n\n");
     out.push_str("# 允许响应的群号列表，留空表示响应所有群\n");
     out.push_str(&format!("groups: {:?}\n", config.groups));
@@ -511,6 +569,40 @@ fn template(config: &AronaConfig) -> String {
         ));
     }
     out.push('\n');
+    out.push_str("# ==================== 框架行为 ====================\n");
+    out.push_str("# 同一插件连续 panic 多少次就自动隔离停用（0 = 只记日志、不停用）\n");
+    out.push_str(&format!(
+        "framework:\n  panic_disable_threshold: {}\n",
+        config.framework.panic_disable_threshold
+    ));
+    out.push_str(
+        "  # 未声明 with_prefix_match 的命令是否也允许最短前缀匹配（开着时 /抽 会命中 /抽卡）\n",
+    );
+    out.push_str(&format!(
+        "  prefix_match_by_default: {}\n",
+        config.framework.prefix_match_by_default
+    ));
+    out.push('\n');
+    out.push_str("# ==================== 聊天记录缓存 ====================\n");
+    out.push_str("# QQ 的引用只认 OneBot 实现端缓存里的近期消息，久了就引用不到。\n");
+    out.push_str("# 框架因此自己记一份聊天数据（data/arona/chatlog.db，图片只存原链接），\n");
+    out.push_str("# 供插件做「引用回复」与按存储 id 的「撤回消息」。改动即时生效，不必重启。\n");
+    out.push_str("chatlog:\n");
+    out.push_str("  # 总开关：关掉后不再记账，引用还原与撤回时的 id 换算一起停\n");
+    out.push_str(&format!("  enable: {}\n", config.chatlog.enable));
+    out.push_str("  # 本地保留几天的聊天消息（超出的由下面的清理任务删掉）\n");
+    out.push_str(&format!("  keep_days: {}\n", config.chatlog.keep_days));
+    out.push_str("  # 每隔几天清一次过期记录\n");
+    out.push_str(&format!(
+        "  purge_interval_days: {}\n",
+        config.chatlog.purge_interval_days
+    ));
+    out.push_str("  # 多少分钟内的引用仍由实现端直接挂原生引用，超过才用本地记录还原成文字+图片\n");
+    out.push_str(&format!(
+        "  quote_ttl_minutes: {}\n",
+        config.chatlog.quote_ttl_minutes
+    ));
+    out.push('\n');
     out.push_str("# 提示: 本地图片的发送方式(send_image_as_file)属于 onebot.yml，在那里配置。\n");
     out
 }
@@ -555,6 +647,64 @@ mod tests {
             .expect("写入测试配置失败");
         let config = load(&file).expect("已迁移的旧键不应导致加载失败");
         assert_eq!(config.groups, vec![10001]);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    /// framework 段必须写得出、读得回；老文件没有这一段时按 FrameworkOptions 的默认值补，
+    /// 而不是 0 / false 那种"看起来像用户显式关掉了隔离"的假值。
+    #[test]
+    fn framework_section_round_trips_through_the_template() {
+        let file = std::env::temp_dir().join("arona-framework-section-test.yml");
+        let mut config = AronaConfig::default();
+        config.groups = vec![10001];
+        config.framework.panic_disable_threshold = 2;
+        config.framework.prefix_match_by_default = true;
+        save(&file, &config).expect("写入模板失败");
+
+        let reloaded = load(&file).expect("framework 段应能读回强类型");
+        assert_eq!(reloaded.framework.panic_disable_threshold, 2);
+        assert!(reloaded.framework.prefix_match_by_default);
+
+        // 段缺失 = 用框架默认，而不是 0（0 在语义上是"只记日志、永不停用"）
+        std::fs::write(&file, "groups: [10001]\n").expect("写入老格式配置失败");
+        let legacy = load(&file).expect("缺少 framework 段不应导致加载失败");
+        assert_eq!(
+            legacy.framework.panic_disable_threshold,
+            crate::framework::Framework::DEFAULT_PANIC_THRESHOLD
+        );
+        assert!(!legacy.framework.prefix_match_by_default);
+
+        // 只写一个键时另一个仍按默认补，serde(default) 是逐字段生效的
+        std::fs::write(&file, "framework:\n  prefix_match_by_default: true\n")
+            .expect("写入片段配置失败");
+        let partial = load(&file).expect("framework 段缺键不应导致加载失败");
+        assert!(partial.framework.prefix_match_by_default);
+        assert_eq!(
+            partial.framework.panic_disable_threshold,
+            crate::framework::Framework::DEFAULT_PANIC_THRESHOLD
+        );
+        let _ = std::fs::remove_file(&file);
+    }
+
+    /// 聊天记录段要写得出、读得回；老文件没有这一段时按默认值补，而不是
+    /// enable=false / keep_days=0 那种"看起来像用户显式关掉了记账"的假值。
+    #[test]
+    fn chatlog_section_round_trips_through_the_template() {
+        let file = std::env::temp_dir().join("arona-chatlog-section-test.yml");
+        let mut config = AronaConfig::default();
+        config.chatlog.keep_days = 7;
+        config.chatlog.quote_ttl_minutes = 10;
+        save(&file, &config).expect("写入模板失败");
+
+        let reloaded = load(&file).expect("chatlog 段应能读回强类型");
+        assert!(reloaded.chatlog.enable);
+        assert_eq!(reloaded.chatlog.keep_days, 7);
+        assert_eq!(reloaded.chatlog.purge_interval_days, 4);
+        assert_eq!(reloaded.chatlog.quote_ttl_minutes, 10);
+
+        std::fs::write(&file, "groups: [10001]\n").expect("写入老格式配置失败");
+        let legacy = load(&file).expect("缺少 chatlog 段不应导致加载失败");
+        assert_eq!(legacy.chatlog, ChatLogSettings::default());
         let _ = std::fs::remove_file(&file);
     }
 

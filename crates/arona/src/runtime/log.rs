@@ -3,9 +3,12 @@
 
 use once_cell::sync::OnceCell;
 use std::fs::OpenOptions;
+use std::future::Future;
 use std::io::Write;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Mutex;
+use std::task::{Context, Poll};
 
 struct FileLog {
     file: PathBuf,
@@ -97,8 +100,98 @@ pub fn error(message: impl Into<String>) {
     log("ERROR", &message);
 }
 
+// 日志来源：`[Arona]` 是框架自己打的，插件代码里打的要挂插件名。
+// 用线程局部而不是给每个日志函数加参数——插件里几十处调用点不该为此改动。
+thread_local! {
+    static SOURCE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// 在 `f` 执行期间把日志来源换成 `source`（`插件名` 或 `插件名:动作`），结束后还原。
+///
+/// 只在同步段可靠：`f` 里 await 之后被换到别的线程续跑时来源会退回 `[Arona]`，
+/// 所以包裹点放在框架进入插件代码的那一次同步调用上（生命周期回调、命令、钩子、定时任务），
+/// 要覆盖一段异步活儿就用 `with_action_async` / `PluginScope::spawn_as` 的外壳。
+#[must_use = "来源只在闭包执行期间有效，别把结果丢掉"]
+pub fn with_source<R>(source: &str, f: impl FnOnce() -> R) -> R {
+    let previous = SOURCE.with(|slot| slot.borrow_mut().replace(source.to_string()));
+    let outcome = f();
+    SOURCE.with(|slot| *slot.borrow_mut() = previous);
+    outcome
+}
+
+/// 给 future 套一层"每次轮询都设好日志来源"的外壳。
+///
+/// 来源是线程局部的，而任务会在 runtime 的各工作线程之间搬动，起头设一次会在第一次
+/// await 之后丢掉——所以必须在 poll 里重设。`source` 为 None 时原样轮询。
+pub(crate) struct Sourced<F> {
+    source: Option<String>,
+    inner: Pin<Box<F>>,
+}
+
+impl<F: Future> Sourced<F> {
+    pub(crate) fn new(source: Option<String>, future: F) -> Sourced<F> {
+        Sourced {
+            source,
+            inner: Box::pin(future),
+        }
+    }
+}
+
+impl<F: Future> Future for Sourced<F> {
+    type Output = F::Output;
+
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        match &this.source {
+            Some(source) => with_source(source, || this.inner.as_mut().poll(context)),
+            None => this.inner.as_mut().poll(context),
+        }
+    }
+}
+
+/// 当前来源是已登记的插件时，把它细化成 `[插件名:动作]`（已有的动作段被换掉，只留插件名）。
+/// 返回 None 表示别动来源：框架自己的日志一直是 `[Arona]`，不挂动作。
+fn refined_source(action: &str) -> Option<String> {
+    let current = SOURCE
+        .with(|slot| slot.borrow().clone())
+        .unwrap_or_default();
+    // 冒号前才是插件名：框架给的粗动作（`装配`、`命令 活动`）在这一层被换掉
+    let plugin = current.split(':').next().unwrap_or_default();
+    crate::plugin::is_plugin_name(plugin).then(|| format!("{plugin}:{action}"))
+}
+
+/// 把当前来源细化成 `[插件名:动作]`（如 `[BluearchivePlugin:定时推送]`），只在 `f` 期间有效。
+///
+/// 框架按入口给的是粗动作（`装配` / `命令 活动` / `事件 群消息` / `定时 ChatLogPurge`），
+/// 插件比框架清楚自己那一步在干什么，包一层就精确到「发送消息」「踢人」这个粒度；
+/// 已经带过动作的来源会被替换掉，只留插件名。
+///
+/// 当前来源不是已登记的插件时原样执行：框架自己的日志一直是 `[Arona]`，不挂动作。
+/// 被包住的活儿要跨 `await` 时用 [`with_action_async`]。
+#[must_use = "来源只在闭包执行期间有效，别把结果丢掉"]
+pub fn with_action<R>(action: &str, f: impl FnOnce() -> R) -> R {
+    match refined_source(action) {
+        Some(source) => with_source(&source, f),
+        None => f(),
+    }
+}
+
+/// [`with_action`] 的异步版：动作名覆盖整个 future 的每次轮询，中间的 await 不会丢掉它。
+///
+/// `plugin::action_async("发送消息", services::send_message(target, msg)).await`
+#[must_use = "来源只在返回的 future 运行期间有效，别把它丢掉"]
+pub fn with_action_async<F: Future>(action: &str, future: F) -> impl Future<Output = F::Output> {
+    Sourced::new(refined_source(action), future)
+}
+
+fn source() -> String {
+    SOURCE
+        .with(|slot| slot.borrow().clone())
+        .unwrap_or_else(|| "Arona".to_string())
+}
+
 fn log(level: &str, message: &str) {
-    let line = format!("[Arona] {message}");
+    let line = format!("[{}] {message}", source());
     // 控制台按原版 ColoredPrintStream 规则染色（[Arona]/[OneBot] 亮绿, WARNING/SLF4J 亮黄）
     if level == "ERROR" {
         crate::runtime::console::eprint_rule_line(&line);
@@ -329,6 +422,47 @@ mod tests {
             "wgpu_hal::dx12::device",
             "\tCompiled shader"
         ));
+    }
+
+    #[test]
+    fn source_switches_per_plugin_and_restores_on_exit() {
+        // 嵌套进出插件代码时来源不能串味：出来还得是 [Arona]
+        assert_eq!(source(), "Arona");
+        assert_eq!(
+            with_source("BluearchivePlugin", || source()),
+            "BluearchivePlugin"
+        );
+        assert_eq!(source(), "Arona");
+    }
+
+    #[test]
+    fn action_leaves_framework_source_alone() {
+        // 没有插件在名下（测试里没有任何已登记插件）时动作不生效：框架日志始终是 [Arona]
+        assert_eq!(with_action("发送消息", || source()), "Arona");
+        assert_eq!(refined_source("发送消息"), None);
+        // 插件给的粗动作也一样只看冒号前的插件名，未登记就不挂动作
+        assert_eq!(
+            with_source("BluearchivePlugin:装配", || with_action(
+                "发送消息",
+                || source()
+            )),
+            "BluearchivePlugin:装配"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sourced_future_keeps_action_across_awaits() {
+        // 线程局部的来源撑不过挂起，外壳必须每次轮询重设，否则 await 之后又退回 [Arona]
+        let seen = tokio::task::spawn(Sourced::new(
+            Some("BluearchivePlugin:发送消息".to_string()),
+            async {
+                tokio::task::yield_now().await;
+                source()
+            },
+        ))
+        .await
+        .unwrap();
+        assert_eq!(seen, "BluearchivePlugin:发送消息");
     }
 
     #[test]

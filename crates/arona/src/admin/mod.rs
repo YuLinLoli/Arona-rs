@@ -55,7 +55,7 @@ pub struct ConnectionInfo {
     pub enable: bool,
 }
 
-/// 功能清单（GUI 展示）
+/// 功能清单（GUI 展示）：整体停用的插件不在此列，恢复启用要到「插件管理」页
 pub fn features() -> Vec<runtime_config::Feature> {
     runtime_config::features()
 }
@@ -320,6 +320,11 @@ pub fn set_group_feature(group_id: i64, feature: &str, enabled: bool) -> Result<
     standalone::set_group_feature(group_id, feature, enabled)
 }
 
+/// 整组开启/关闭某个群的一批功能（GUI「功能开关」按插件折叠时的组头开关）
+pub fn set_group_features(group_id: i64, features: &[&str], enabled: bool) -> Result<(), String> {
+    standalone::set_group_features(group_id, features, enabled)
+}
+
 pub fn set_group_blacklist(group_id: i64, user_id: i64, blacklisted: bool) -> Result<(), String> {
     standalone::set_group_blacklist(group_id, user_id, blacklisted)
 }
@@ -534,6 +539,7 @@ mod tests {
         let dispatcher = Arc::new(crate::runtime::dispatcher::CommandDispatcher::new());
         let business = Arc::new(StandaloneBusinessHandler::new(
             OneBotConfig::default(),
+            crate::framework::Framework::global_arc(),
             dispatcher,
             registry.clone(),
         ));

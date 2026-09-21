@@ -18,6 +18,9 @@ futures-util = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
+# 框架侧聊天记录缓存（runtime::chatlog）自带一个 SQLite 库；bundled 随包静态编译，
+# 与插件用的那份是同一个 workspace 依赖，不引入任何外部运行库
+rusqlite = { workspace = true }
 reqwest = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }

@@ -50,12 +50,23 @@ pub enum MessageSegment {
     },
     /// 卡片消息（OneBot 的 json 段，如音乐/小程序分享）
     Json(Value),
-    /// 卡片消息（OneBot 的 xml 段，机器人消息里的链接卡片多为这种）
+    /// 卡片消息（xml 段，机器人消息里的链接卡片多为这种）
     Xml(Value),
     /// 合并转发
     Forward {
+        /// 转发标题（实现端多给 "群聊的聊天记录"）
         title: String,
+        /// 转发的 flag/id：NapCat、LLOWeb 等把这个段的 `id` 给出来，
+        /// 插件可以拿它调 `get_forward_msg` 取完整节点。空串表示实现端没给。
+        id: String,
+        /// 已经解析出来的节点（实现端把 `content` 一起塞进事件时才有，常为空）
         messages: Vec<ForwardMessage>,
+    },
+    /// 框架还不认识的消息段（新版实现端加的类型）。原样留着，别把它当没有：
+    /// 转发/重发时要按 `kind` + `data` 拼回去，插件也能看到"这里有个 X 段"而不是空气。
+    Raw {
+        kind: String,
+        data: Value,
     },
 }
 
@@ -189,6 +200,7 @@ impl OutgoingMessage {
         OutgoingMessage {
             segments: vec![MessageSegment::Forward {
                 title: title.into(),
+                id: String::new(),
                 messages,
             }],
             revoke_after_millis: None,
@@ -238,6 +250,19 @@ impl MessageTarget {
 #[derive(Clone, Debug, Default)]
 pub struct MessageReceipt {
     pub message_id: Option<i64>,
+    /// 实现端另外给的那个号（NapCat / LLOWeb 的 `real_id`）：撤回与回查只认它时靠它。
+    /// 多数实现端不给，留 None 即按 message_id 操作。
+    pub real_id: Option<i64>,
+}
+
+impl MessageReceipt {
+    /// 只有协议层 message_id 的回执（实现端没给 real_id 时用）
+    pub fn new(message_id: Option<i64>) -> MessageReceipt {
+        MessageReceipt {
+            message_id,
+            real_id: None,
+        }
+    }
 }
 
 /// 盒装 Future，用于让含 async 方法的 trait 可 dyn 化

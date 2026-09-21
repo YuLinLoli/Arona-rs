@@ -23,9 +23,7 @@ impl MessageSender for CaptureSender {
     ) -> BoxFuture<'a, MessageReceipt> {
         Box::pin(async move {
             self.sent.lock().unwrap().push((target, message));
-            MessageReceipt {
-                message_id: Some(1),
-            }
+            MessageReceipt::new(Some(1))
         })
     }
 }

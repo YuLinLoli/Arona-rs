@@ -52,21 +52,25 @@ pub async fn fetch_birthdays() -> Result<Vec<Birthday>, String> {
         }
     }
     let mut last_error = "没有可用的 SchaleDB 数据源".to_string();
-    for base in SOURCES {
-        match fetch_from(base).await {
-            Ok(list) if !list.is_empty() => {
-                arona::runtime::log::info(format!(
-                    "SchaleDB 学生生日已同步: {} 条 (来源 {base})",
-                    list.len()
-                ));
-                *cache().lock().unwrap() = Some((list.clone(), now_ms() + CACHE_TTL_MS));
-                return Ok(list);
+    // 联网同步是一个独立动作：日志要能看出是「同步生日」而不是调用它的查询/刷新
+    arona::plugin::action_async("同步生日", async move {
+        for base in SOURCES {
+            match fetch_from(base).await {
+                Ok(list) if !list.is_empty() => {
+                    arona::runtime::log::info(format!(
+                        "SchaleDB 学生生日已同步: {} 条 (来源 {base})",
+                        list.len()
+                    ));
+                    *cache().lock().unwrap() = Some((list.clone(), now_ms() + CACHE_TTL_MS));
+                    return Ok(list);
+                }
+                Ok(_) => last_error = format!("{base} 未解析到生日数据"),
+                Err(err) => last_error = err,
             }
-            Ok(_) => last_error = format!("{base} 未解析到生日数据"),
-            Err(err) => last_error = err,
         }
-    }
-    Err(last_error)
+        Err(last_error)
+    })
+    .await
 }
 
 async fn fetch_from(base: &str) -> Result<Vec<Birthday>, String> {

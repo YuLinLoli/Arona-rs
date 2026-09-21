@@ -323,6 +323,14 @@ fn parse(registry: &SectionRegistry, plugin: &str, path: &Path) -> Result<Plugin
                         let Some(name) = key.as_str() else { continue };
                         if registered.iter().any(|k| *k == name) {
                             sections.insert(name.to_string(), val.clone());
+                        } else if name == "chatlog" {
+                            // 聊天记录缓存已从插件上收到框架：老配置留在插件文件里会静默失效，
+                            // 必须指名道姓告诉用户去哪儿改
+                            crate::runtime::log::warning(format!(
+                                "{} 里的「chatlog」已上收给框架，聊天记录缓存现在写在 {} 的 chatlog 段，此处的设置已忽略",
+                                path.display(),
+                                crate::runtime::paths::arona_file().display()
+                            ));
                         } else if let Some(owner) = registry.owner(name) {
                             crate::runtime::log::warning(format!(
                                 "{} 里的「{name}」属于插件 {owner}，写在 {plugin} 的配置里不会生效，已忽略",

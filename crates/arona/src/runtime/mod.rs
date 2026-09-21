@@ -1,5 +1,7 @@
 //! 运行期模块（对应原版 runtime 包）
 pub mod args;
+/// 聊天记录缓存：进出记账、旧消息引用还原、按存储 id 撤回
+pub mod chatlog;
 pub mod config;
 pub mod console;
 pub mod crash;
@@ -11,6 +13,10 @@ pub mod message;
 pub mod paths;
 /// 执行次序（事件监听与命令匹配共用）
 pub mod priority;
+/// 过期数据清理：框架统一排期与播报，插件只交删除动作
+pub mod purge;
+/// 进程 tokio 运行时句柄：GUI 线程等没有上下文的地方靠它投递后台任务
+pub mod reactor;
 /// 用另一套参数重新拉起自身（软件 OpenGL 兜底 / 渲染后端卡死后换一个）
 #[cfg(feature = "gui")]
 pub mod relaunch;

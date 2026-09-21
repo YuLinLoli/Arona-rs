@@ -45,6 +45,6 @@ pub async fn send_message(target: MessageTarget, message: OutgoingMessage) -> Me
     let sender = instance().message_sender.read().unwrap().clone();
     match sender {
         Some(s) => s.send(target, message).await,
-        None => MessageReceipt { message_id: None },
+        None => MessageReceipt::default(),
     }
 }

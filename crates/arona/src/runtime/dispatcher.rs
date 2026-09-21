@@ -22,7 +22,7 @@ use crate::framework::Framework;
 use crate::plugin::health::HealthBoard;
 use crate::runtime::config::Gating;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
@@ -130,9 +130,28 @@ const ROLE_CACHE_TTL: Duration = Duration::from_secs(60);
 type RoleCacheKey = (i64, i64);
 type RoleCacheEntry = (GroupRole, Instant);
 
+/// 缓存条数上限：机器人待的群只会越来越多，过期条目不但不删还会一直占着
+const ROLE_CACHE_MAX: usize = 4096;
+
+/// 身份缓存是**进程级**的：它存的是"这个人在那个群是什么身份"这一远端事实，
+/// 与命令表归属哪家插件无关，隔离实例跑测试时也不会因此看到别家的数据（键里没有实例维度）。
 fn role_cache() -> &'static Mutex<HashMap<RoleCacheKey, RoleCacheEntry>> {
     static CACHE: OnceLock<Mutex<HashMap<RoleCacheKey, RoleCacheEntry>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 写入前顺手清掉过期项；仍超上限就整体重来（低频路径，不必上 LRU）
+fn role_cache_put(key: RoleCacheKey, entry: RoleCacheEntry) {
+    let Ok(mut cache) = role_cache().lock() else {
+        return;
+    };
+    if cache.len() >= ROLE_CACHE_MAX {
+        cache.retain(|_, (_, at)| at.elapsed() < ROLE_CACHE_TTL);
+        if cache.len() >= ROLE_CACHE_MAX {
+            cache.clear();
+        }
+    }
+    cache.insert(key, entry);
 }
 
 impl CommandContext {
@@ -151,6 +170,23 @@ impl CommandContext {
         self.reply_message(OutgoingMessage::text(text.into())).await
     }
 
+    /// 引用回复：把触发消息引用的那条一起带回去。
+    /// 协议层还引用得到就挂原生 reply 段（QQ 上就是真引用），来不及了（NTQQ 系实现端十几
+    /// 二十分钟前的 id 已经查不到）就用框架的聊天记录库把那条还原成文字加图。
+    /// 触发消息本身没有引用时等同于 [`reply_message`](Self::reply_message)。
+    pub async fn reply_with_quote(&self, mut message: OutgoingMessage) -> MessageReceipt {
+        if let Some(prefix) = crate::runtime::chatlog::quote_prefix(self.quoted, self.time).await {
+            message.segments.splice(0..0, prefix);
+        }
+        self.reply_message(message).await
+    }
+
+    /// 撤回一条消息：先按框架的聊天记录库把 id 换成实现端认的那个号，再发 `delete_msg`。
+    /// 传任意一个见过的号都行（事件里的 message_id、自己那条回复的回执都算）。
+    pub async fn recall(&self, message_id: i64) -> Result<(), crate::onebot::OneBotError> {
+        crate::runtime::chatlog::recall(message_id).await
+    }
+
     /// 群内身份：先读事件自带的 `sender.role`，没有再回查 `get_group_member_info`（缓存 60 秒）。
     /// 私聊、无连接或实现端不支持时返回 None——按"不满足"处理。
     pub async fn group_role(&self) -> Option<GroupRole> {
@@ -162,6 +198,10 @@ impl CommandContext {
         if let Some((role, at)) = role_cache().lock().ok()?.get(&key).copied() {
             if at.elapsed() < ROLE_CACHE_TTL {
                 return Some(role);
+            }
+            // 读到已过期的就地删掉，别等它永远躺在表里
+            if let Ok(mut cache) = role_cache().lock() {
+                cache.remove(&key);
             }
         }
         let api = crate::onebot::api::OneBotApi::global();
@@ -177,9 +217,7 @@ impl CommandContext {
         } else {
             GroupRole::Member
         };
-        if let Ok(mut cache) = role_cache().lock() {
-            cache.insert(key, (role, Instant::now()));
-        }
+        role_cache_put(key, (role, Instant::now()));
         Some(role)
     }
 }
@@ -421,7 +459,9 @@ struct CommandEntry {
     priority: CommandPriority,
     permission: Permission,
     args: Vec<ArgSpec>,
-    prefix_match: bool,
+    /// `with_prefix_match` 声明的原值：`None` 表示跟随实例的全局开关。
+    /// 留到匹配时才定，热重载改开关才对已经登记好的命令生效。
+    prefix_match: Option<bool>,
     body: CommandBody,
     /// 登记序号：同优先级下保持注册顺序稳定
     seq: u64,
@@ -444,6 +484,9 @@ pub struct CommandInfo {
     pub feature: &'static str,
     pub priority: CommandPriority,
     pub permission: Permission,
+    /// 登记序号（整张表单调递增）：一条命令的多个别名里**最先登记的那个才是主名**，
+    /// 自绘帮助页靠它复现插件自己的登记顺序、并识别出哪些名字只是别名
+    pub seq: u64,
 }
 
 /// 命令表：多个插件的命令并存，按名字索引到一组候选
@@ -461,8 +504,13 @@ pub struct CommandRegistry {
     seq: AtomicU64,
     gating: Arc<Gating>,
     health: Arc<HealthBoard>,
-    /// 未声明 `with_prefix_match` 的命令是否也允许最短前缀匹配
-    prefix_match_by_default: bool,
+    /// 未声明 `with_prefix_match` 的命令是否也允许最短前缀匹配。
+    /// 活状态放在这里（而不是只存进构造选项），arona.yml 热重载才改得动。
+    prefix_match_by_default: AtomicBool,
+    /// 命令名的合法前缀（`FrameworkOptions::command_prefixes`）。登记时给不带前缀的名字
+    /// 补上第一个，避免"arona 好可爱"这类日常句子命中 `/arona`。
+    /// 只影响**之后**的登记：名字是表的键，改设置不会给已登记的命令改名。
+    command_prefixes: RwLock<Vec<String>>,
 }
 
 impl CommandRegistry {
@@ -470,18 +518,67 @@ impl CommandRegistry {
         gating: Arc<Gating>,
         health: Arc<HealthBoard>,
         prefix_match_by_default: bool,
+        command_prefixes: Vec<String>,
     ) -> CommandRegistry {
         CommandRegistry {
             table: RwLock::new(CommandTable::default()),
             seq: AtomicU64::new(0),
             gating,
             health,
-            prefix_match_by_default,
+            prefix_match_by_default: AtomicBool::new(prefix_match_by_default),
+            command_prefixes: RwLock::new(clean_prefixes(&command_prefixes)),
         }
+    }
+
+    /// 当前生效的命令前缀列表（空表示不做前缀规范化）
+    pub fn command_prefixes(&self) -> Vec<String> {
+        self.command_prefixes.read().unwrap().clone()
+    }
+
+    /// 未声明 `with_prefix_match` 的命令是否也允许最短前缀匹配
+    pub fn prefix_match_by_default(&self) -> bool {
+        self.prefix_match_by_default.load(Ordering::SeqCst)
+    }
+
+    /// 设定全局最短前缀匹配开关（`framework.prefix_match_by_default` 热重载用）
+    pub fn set_prefix_match_by_default(&self, enabled: bool) {
+        self.prefix_match_by_default
+            .store(enabled, Ordering::SeqCst);
     }
 
     fn next_seq(&self) -> u64 {
         self.seq.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// 按框架的前缀设置规范化命令名：去掉空的/重复的，给不带前缀的名字补上第一个前缀，
+    /// 并把这些改写写进 `problems` 告知登记方（插件的别名往往是自己挑的，改了什么必须说）。
+    /// 前缀列表为空 = 关闭这条规则，原样收下（mirai 的纯聊天式命令就靠这个）。
+    fn normalize_names(
+        &self,
+        plugin: &str,
+        names: &[String],
+        problems: &mut Vec<String>,
+    ) -> Vec<String> {
+        let prefixes = self.command_prefixes();
+        let mut out: Vec<String> = Vec::with_capacity(names.len());
+        for name in names {
+            let key = normalize(name);
+            if key.is_empty() || out.iter().any(|kept| kept == &key) {
+                continue;
+            }
+            if prefixes.is_empty() || prefixes.iter().any(|p| key.starts_with(p)) {
+                out.push(key);
+                continue;
+            }
+            let fixed = format!("{}{}", prefixes[0], key);
+            problems.push(format!(
+                "命令名「{key}」不带前缀，插件 {plugin} 已按框架设置登记为「{fixed}」（要改规则看 FrameworkOptions::command_prefixes 或 builder().command_prefixes(..)）"
+            ));
+            if !out.iter().any(|kept| kept == &fixed) {
+                out.push(fixed);
+            }
+        }
+        out
     }
 
     /// 登记一条命令（归属插件由框架填好）。返回每个命令名的实际归属结果，
@@ -505,18 +602,16 @@ impl CommandRegistry {
                 names.first()
             ));
         }
+        // 名字先按框架的前缀设置规范化，用法串才和表里的键一致
+        let names = self.normalize_names(plugin, &names, &mut problems);
         let usage = if usage.is_empty() {
             args::usage(&names, &args)
         } else {
             usage
         };
-        let prefix_match = prefix_match.unwrap_or(self.prefix_match_by_default);
         let mut guard = self.table.write().unwrap();
         for name in names {
-            let key = normalize(&name);
-            if key.is_empty() {
-                continue;
-            }
+            let key = name;
             let candidates = guard.by_name.entry(key.clone()).or_default();
             let winner = Arc::new(CommandEntry {
                 plugin: plugin.to_string(),
@@ -538,21 +633,19 @@ impl CommandRegistry {
             {
                 candidates.remove(existing);
             }
-            match candidates
-                .iter()
-                .position(|entry| entry.priority.order() <= winner.priority.order())
-            {
-                None => candidates.push(winner),
-                Some(at) => {
-                    let holder = &candidates[at];
+            // 候选表恒按 (优先级, 登记序号) 升序，所以表首就是当前占有这个名字的赢家。
+            // 它优先级更高 -> 后来者被忽略；相同 -> 冲突并报原因；否则后来者入表后重排。
+            match candidates.first() {
+                Some(holder) if holder.priority.order() <= winner.priority.order() => {
                     if holder.priority.order() == winner.priority.order() {
                         problems.push(format!(
                             "命令「{key}」已由插件 {} 以相同优先级占用，本次登记被忽略",
                             holder.plugin
                         ));
-                    } else {
-                        candidates.push(winner);
                     }
+                }
+                _ => {
+                    candidates.push(winner);
                     candidates.sort_by_key(|entry| (entry.priority.order(), entry.seq));
                 }
             }
@@ -561,15 +654,36 @@ impl CommandRegistry {
         problems
     }
 
-    /// 登记一条兜底处理器（未命中任何命令时按优先级依次调用）
+    /// 登记一条兜底处理器（未命中任何命令时按优先级依次调用）。
+    ///
+    /// 同一家插件在**同一档**上重复登记 = 重新装配，换掉自己的旧实现；
+    /// 换档登记则是叠加——一条兜底只能占一个档位，但一个插件可以有若干条，
+    /// 各家之间也互不排斥：未命中命令时按优先级全部轮一遍。
+    /// 返回与别家同档并存的原因列表（不视为失败，仅提示）。
     pub fn register_fallback(
         &self,
         plugin: &str,
         handler: Arc<dyn FallbackHandler>,
         priority: CommandPriority,
-    ) {
+    ) -> Vec<String> {
+        let mut problems: Vec<String> = Vec::new();
         let mut guard = self.table.write().unwrap();
-        guard.fallbacks.retain(|entry| entry.plugin != plugin);
+        let peers: Vec<&str> = guard
+            .fallbacks
+            .iter()
+            .filter(|entry| entry.priority == priority && entry.plugin != plugin)
+            .map(|entry| entry.plugin.as_str())
+            .collect();
+        if !peers.is_empty() {
+            problems.push(format!(
+                "兜底档位「{}」上已有插件 {} 登记，两条兜底都会执行（按登记先后）",
+                priority.display_name(),
+                peers.join("、")
+            ));
+        }
+        guard
+            .fallbacks
+            .retain(|entry| !(entry.plugin == plugin && entry.priority == priority));
         guard.fallbacks.push(FallbackEntry {
             plugin: plugin.to_string(),
             priority,
@@ -579,6 +693,7 @@ impl CommandRegistry {
         guard
             .fallbacks
             .sort_by_key(|entry| (entry.priority.order(), entry.seq));
+        problems
     }
 
     /// 撤销某个插件登记的全部命令与兜底（插件停用时由框架调用）
@@ -618,6 +733,7 @@ impl CommandRegistry {
                 feature: entry.feature,
                 priority: entry.priority,
                 permission: entry.permission,
+                seq: entry.seq,
             })
             .collect();
         list.sort_by(|a, b| a.plugin.cmp(&b.plugin).then_with(|| a.name.cmp(&b.name)));
@@ -657,6 +773,8 @@ impl CommandRegistry {
     /// 返回按名字去重后的候选，调用方据个数决定"命中"还是"回显歧义"。
     fn by_prefix(&self, key: &str, group_id: Option<i64>) -> Vec<Arc<CommandEntry>> {
         let guard = self.table.read().unwrap();
+        // 没显式声明的命令跟随实例全局开关：读一次，别在循环里反复取
+        let follows_by_default = self.prefix_match_by_default();
         let mut names: Vec<String> = Vec::new();
         let mut hits: Vec<Arc<CommandEntry>> = Vec::new();
         let mut entries: Vec<&String> = guard.by_name.keys().collect();
@@ -668,10 +786,10 @@ impl CommandRegistry {
             let Some(candidates) = guard.by_name.get(name) else {
                 continue;
             };
-            let Some(entry) = candidates
-                .iter()
-                .find(|entry| entry.prefix_match && self.entry_allowed(entry, group_id))
-            else {
+            let Some(entry) = candidates.iter().find(|entry| {
+                entry.prefix_match.unwrap_or(follows_by_default)
+                    && self.entry_allowed(entry, group_id)
+            }) else {
                 continue;
             };
             if names.contains(&entry.name) {
@@ -726,13 +844,24 @@ impl CommandRegistry {
             return true;
         }
 
+        let action = format!("命令 {}", entry.name);
         let outcome: Option<Option<OutgoingMessage>> = match &entry.body {
             CommandBody::Raw(command) => {
-                crate::plugin::health::guarded(command.handle(context.clone(), raw)).await
+                crate::plugin::health::guarded(
+                    &entry.plugin,
+                    &action,
+                    command.handle(context.clone(), raw),
+                )
+                .await
             }
             CommandBody::Typed(command) => match args::parse(&entry.args, &raw) {
                 Ok(parsed) => {
-                    crate::plugin::health::guarded(command.handle(context.clone(), parsed)).await
+                    crate::plugin::health::guarded(
+                        &entry.plugin,
+                        &action,
+                        command.handle(context.clone(), parsed),
+                    )
+                    .await
                 }
                 Err(problem) => {
                     // 参数不对：回显用法 + 一句原因，不进插件代码（mirai 的 ArgException）
@@ -779,7 +908,12 @@ impl CommandRegistry {
             return false;
         }
         for (plugin, fallback) in fallbacks {
-            if crate::plugin::health::guarded(fallback.handle(context.clone()))
+            // 上一家的 panic 可能刚好触发隔离：名单是活的，每轮重新看过一遍，
+            // 别让被停用的插件继续往后跑（也别牵连别家）
+            if !self.gating.plugin_enabled(&plugin) {
+                continue;
+            }
+            if crate::plugin::health::guarded(&plugin, "命令兜底", fallback.handle(context.clone()))
                 .await
                 .is_none()
             {
@@ -806,8 +940,8 @@ pub fn register_fallback(
     plugin: &str,
     handler: Arc<dyn FallbackHandler>,
     priority: CommandPriority,
-) {
-    global().register_fallback(plugin, handler, priority);
+) -> Vec<String> {
+    global().register_fallback(plugin, handler, priority)
 }
 
 /// 撤销某个插件登记的全部命令与兜底（插件停用时由框架调用）
@@ -881,13 +1015,26 @@ fn normalize(command: &str) -> String {
     command.trim().to_lowercase()
 }
 
+/// 前缀列表去空、去重并统一小写（命令名整体转过小写，前缀不跟着转就没法比对）
+fn clean_prefixes(prefixes: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(prefixes.len());
+    for prefix in prefixes {
+        let trimmed = prefix.trim().to_lowercase();
+        if trimmed.is_empty() || out.iter().any(|kept| kept == &trimmed) {
+            continue;
+        }
+        out.push(trimmed);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::framework::FrameworkOptions;
     use crate::runtime::args::arg;
     use crate::runtime::message::MessageSegment;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
 
     struct NullSender;
 
@@ -897,7 +1044,7 @@ mod tests {
             _target: MessageTarget,
             _message: OutgoingMessage,
         ) -> BoxFuture<'a, MessageReceipt> {
-            Box::pin(async { MessageReceipt { message_id: None } })
+            Box::pin(async { MessageReceipt::default() })
         }
     }
 
@@ -923,11 +1070,17 @@ mod tests {
 
     /// 一张独立的表：门控与健康度共用同一个 Gating，停用才真的能生效
     fn registry() -> CommandRegistry {
+        registry_with_prefixes(&[Framework::DEFAULT_COMMAND_PREFIX])
+    }
+
+    /// 同上，但命令前缀按参数给（前缀规范化的用例要试"关规则"这一档）
+    fn registry_with_prefixes(prefixes: &[&str]) -> CommandRegistry {
         let gating = Arc::new(Gating::default());
         CommandRegistry::new(
             gating.clone(),
             health(Framework::DEFAULT_PANIC_THRESHOLD, &gating),
             false,
+            prefixes.iter().map(|prefix| prefix.to_string()).collect(),
         )
     }
 
@@ -985,6 +1138,81 @@ mod tests {
         registry.unregister_plugin(first);
         registry.unregister_plugin(second);
         assert!(!registry.has_commands_of(first) && !registry.has_commands_of(second));
+    }
+
+    /// 帮助页要按登记顺序复现插件自己的清单，所以 `CommandInfo::seq` 得能认出
+    /// 「一条命令的哪个名字是主名」：别名共用描述，主名的序号最小。
+    #[test]
+    fn command_info_seq_marks_the_primary_name_of_a_registration() {
+        let registry = registry();
+        let plugin = "CommandInfoSeqPlugin";
+        registry.register(
+            plugin,
+            CommandRegistration::new(
+                vec!["/单抽".to_string(), "/gacha_one".to_string()],
+                "单抽一次",
+                mark(Arc::new(AtomicBool::new(false))),
+            ),
+        );
+        let infos = registry.commands_of(plugin);
+        assert_eq!(infos.len(), 2, "两个名字各占一个表项：{infos:?}");
+        let primary = infos
+            .iter()
+            .min_by_key(|info| info.seq)
+            .expect("应有登记项");
+        assert_eq!(primary.name, "/单抽", "主名应是最先登记的那个");
+        assert!(
+            infos.iter().all(|info| info.description == "单抽一次"),
+            "同一条登记的描述应一致：{infos:?}"
+        );
+        registry.unregister_plugin(plugin);
+    }
+
+    /// 后登记的高优先级命令必须抢到同名命令（回归点：曾经把它追加到队尾且不重排，
+    /// 结果"优先"档反而最后执行，抢占关系整个反了）。
+    #[tokio::test]
+    async fn later_higher_priority_registration_wins() {
+        let registry = registry();
+        let low = Arc::new(AtomicBool::new(false));
+        let high = Arc::new(AtomicBool::new(false));
+        registry.register(
+            "PriorityPluginSlow",
+            CommandRegistration::new(vec!["/抢占".to_string()], "延后档", mark(low.clone()))
+                .with_priority(CommandPriority::Low),
+        );
+        let problems = registry.register(
+            "PriorityPluginFast",
+            CommandRegistration::new(vec!["/抢占".to_string()], "优先档", mark(high.clone()))
+                .with_priority(CommandPriority::High),
+        );
+        assert!(
+            problems.is_empty(),
+            "不同优先级抢同名不该报冲突: {problems:?}"
+        );
+        assert!(registry.dispatch(context("/抢占", Some(1))).await);
+        assert!(high.load(Ordering::SeqCst), "高优先级应胜出");
+        assert!(!low.load(Ordering::SeqCst), "一次分发只应调用一个处理器");
+    }
+
+    /// 更低优先级的后来者不该挤掉已经在表首的赢家
+    #[tokio::test]
+    async fn later_lower_priority_registration_is_skipped() {
+        let registry = registry();
+        let high = Arc::new(AtomicBool::new(false));
+        let low = Arc::new(AtomicBool::new(false));
+        registry.register(
+            "PriorityKeepHigh",
+            CommandRegistration::new(vec!["/保持".to_string()], "优先档", mark(high.clone()))
+                .with_priority(CommandPriority::High),
+        );
+        registry.register(
+            "PriorityKeepLow",
+            CommandRegistration::new(vec!["/保持".to_string()], "延后档", mark(low.clone()))
+                .with_priority(CommandPriority::Low),
+        );
+        assert!(registry.dispatch(context("/保持", Some(1))).await);
+        assert!(high.load(Ordering::SeqCst), "先登记的高优先级应继续占有");
+        assert!(!low.load(Ordering::SeqCst));
     }
 
     /// 停用插件只摘掉自己的命令，别家不受影响；一切都在实例内发生，不碰进程默认实例
@@ -1137,6 +1365,136 @@ mod tests {
         assert!(hit.load(Ordering::SeqCst));
     }
 
+    /// 开关是活的：热重载 framework.prefix_match_by_default 要能改变**已经登记好**的命令
+    /// 的行为（回归点：旧实现在登记那一刻就把 Option<bool> 压成 bool，之后再也改不动）；
+    /// 显式声明 with_prefix_match(false) 的命令不受全局开关摆布。
+    #[tokio::test]
+    async fn prefix_switch_applies_to_commands_registered_before_it_flips() {
+        let registry = registry();
+        let loose = Arc::new(AtomicBool::new(false));
+        let strict = Arc::new(AtomicBool::new(false));
+        registry.register(
+            "LivePrefixPlugin",
+            CommandRegistration::new(vec!["/签到提醒".to_string()], "签到", mark(loose.clone())),
+        );
+        registry.register(
+            "StrictPrefixPlugin",
+            CommandRegistration::new(vec!["/严格".to_string()], "严格", mark(strict.clone()))
+                .with_prefix_match(false),
+        );
+
+        assert!(
+            !registry.dispatch(context("/签到", Some(1))).await,
+            "默认关着时不该被前缀命中"
+        );
+        registry.set_prefix_match_by_default(true);
+        assert!(
+            registry.dispatch(context("/签到", Some(1))).await,
+            "打开开关后，登记时还没这项选择的命令应跟随新设置"
+        );
+        assert!(loose.load(Ordering::SeqCst));
+        assert!(!strict.load(Ordering::SeqCst), "前缀不该串到别的命令");
+
+        // 显式声明的取舍优先于全局开关
+        assert!(
+            !registry.dispatch(context("/严", Some(1))).await,
+            "with_prefix_match(false) 应压住全局开关"
+        );
+
+        registry.set_prefix_match_by_default(false);
+        strict.store(true, Ordering::SeqCst);
+        assert!(
+            registry.dispatch(context("/签到提醒", Some(1))).await,
+            "全名始终可用"
+        );
+        assert!(loose.load(Ordering::SeqCst));
+        // 关掉开关只影响前缀命中，全名照常
+        assert!(!registry.dispatch(context("/签到提", Some(1))).await);
+
+        registry.unregister_plugin("LivePrefixPlugin");
+        registry.unregister_plugin("StrictPrefixPlugin");
+    }
+
+    /// 不带前缀的命令名在登记时被补上框架前缀，并把这个改写告知登记方；
+    /// 补完之后"arona 好可爱"这类日常句子不再命中命令（回归点：旧实现照单全收，
+    /// 插件写的裸别名让机器人在群里随便一句话都可能被当成命令调用）。
+    #[tokio::test]
+    async fn bare_command_names_are_prefixed_at_registration() {
+        let registry = registry();
+        let hit = Arc::new(AtomicBool::new(false));
+        let problems = registry.register(
+            "PrefixRulePlugin",
+            CommandRegistration::new(vec!["抽卡".to_string()], "抽卡", mark(hit.clone())),
+        );
+        assert_eq!(problems.len(), 1, "改写命令名要回报给插件: {problems:?}");
+        assert!(
+            problems[0].contains("抽卡") && problems[0].contains("/抽卡"),
+            "{problems:?}"
+        );
+
+        assert!(registry.dispatch(context("/抽卡", Some(1))).await);
+        assert!(hit.load(Ordering::SeqCst), "补过前缀的名字按 /抽卡 可用");
+
+        // 已经带前缀的名字不该被再补一层，也不会产生改写提示
+        hit.store(false, Ordering::SeqCst);
+        let problems = registry.register(
+            "PrefixedPlugin",
+            CommandRegistration::new(vec!["/已带前缀".to_string()], "ok", mark(hit.clone())),
+        );
+        assert!(problems.is_empty(), "带前缀的名字不该被改写: {problems:?}");
+        assert!(registry.dispatch(context("/已带前缀", Some(1))).await);
+
+        // 裸名不再匹配 → 聊天里出现这个词不会触发机器人
+        hit.store(false, Ordering::SeqCst);
+        assert!(
+            !registry.dispatch(context("抽卡 我要抽卡", Some(1))).await,
+            "裸名不该再被当成命令"
+        );
+        assert!(!hit.load(Ordering::SeqCst));
+        registry.unregister_plugin("PrefixRulePlugin");
+        registry.unregister_plugin("PrefixedPlugin");
+    }
+
+    /// 前缀列表清空 = 关闭这条规则（纯聊天式命令的机器人靠这个）；
+    /// 列表里多个前缀时，裸名补第一个，带其中任一的都算合规。
+    #[tokio::test]
+    async fn prefix_rule_can_be_disabled_or_widened() {
+        let loose = registry_with_prefixes(&[]);
+        let hit = Arc::new(AtomicBool::new(false));
+        let problems = loose.register(
+            "NoPrefixPlugin",
+            CommandRegistration::new(vec!["抽卡".to_string()], "抽卡", mark(hit.clone())),
+        );
+        assert!(
+            problems.is_empty(),
+            "关掉规则就不该有改写提示: {problems:?}"
+        );
+        assert!(loose.dispatch(context("抽卡", Some(1))).await);
+        assert!(hit.load(Ordering::SeqCst));
+
+        let multi = registry_with_prefixes(&["#", "/"]);
+        hit.store(false, Ordering::SeqCst);
+        let problems = multi.register(
+            "MultiPrefixPlugin",
+            CommandRegistration::new(
+                vec!["抽卡".to_string(), "/十连".to_string()],
+                "抽卡",
+                mark(hit.clone()),
+            ),
+        );
+        assert_eq!(problems.len(), 1, "只有裸名那条被改写: {problems:?}");
+        assert!(multi.dispatch(context("#抽卡", Some(1))).await);
+        assert!(hit.load(Ordering::SeqCst), "裸名按第一个前缀补全为 #抽卡");
+        assert!(
+            !multi.dispatch(context("/抽卡", Some(1))).await,
+            "登记的是 #抽卡"
+        );
+        assert!(
+            multi.dispatch(context("/十连", Some(1))).await,
+            "已带任一前缀的原样收下"
+        );
+    }
+
     /// 群身份门控：普通成员被框架挡在处理器之外，群主/管理员放行
     #[tokio::test]
     async fn permission_blocks_before_the_handler_runs() {
@@ -1200,7 +1558,12 @@ mod tests {
     async fn panic_is_isolated_and_counted() {
         let gating = Arc::new(Gating::default());
         let health = health(2, &gating);
-        let registry = CommandRegistry::new(gating.clone(), health.clone(), false);
+        let registry = CommandRegistry::new(
+            gating.clone(),
+            health.clone(),
+            false,
+            vec![Framework::DEFAULT_COMMAND_PREFIX.to_string()],
+        );
         registry.register(
             "PanicPlugin",
             CommandRegistration::new(
@@ -1219,6 +1582,50 @@ mod tests {
         // 之后命令不再路由到它
         assert!(!registry.dispatch(context("/炸", Some(1))).await);
         registry.unregister_plugin("PanicPlugin");
+    }
+
+    /// 兜底可叠加：同一家在不同档各登记一条，未命中命令时两条都跑（回归点：
+    /// 旧实现按插件整体 retain，后登记的一条会把先登记那条悄悄顶掉）；
+    /// 同档重复登记才是替换，那是重新装配的语义。
+    #[tokio::test]
+    async fn fallbacks_stack_across_priorities() {
+        let registry = registry();
+        let tally = || Arc::new(AtomicUsize::new(0));
+        let (first_count, second_count, third_count) = (tally(), tally(), tally());
+        let mark = |slot: Arc<AtomicUsize>| {
+            fallback(move |_ctx: Arc<CommandContext>| {
+                let slot = slot.clone();
+                async move {
+                    slot.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+        };
+        let monitor = CommandPriority::Monitor;
+        registry.register_fallback("FallbackStack", mark(first_count.clone()), monitor);
+        let problems = registry.register_fallback(
+            "FallbackStack",
+            mark(second_count.clone()),
+            CommandPriority::Lowest,
+        );
+        assert!(
+            problems.is_empty(),
+            "同一家换档登记是叠加而非冲突: {problems:?}"
+        );
+
+        assert!(registry.dispatch(context("/谁都没登记", Some(1))).await);
+        assert_eq!(first_count.load(Ordering::SeqCst), 1, "两档兜底都要跑");
+        assert_eq!(second_count.load(Ordering::SeqCst), 1);
+
+        // 同档再来一条：换掉自己那条旧的，另一档不受影响
+        registry.register_fallback("FallbackStack", mark(third_count.clone()), monitor);
+        assert!(registry.dispatch(context("/谁都没登记", Some(1))).await);
+        assert_eq!(
+            first_count.load(Ordering::SeqCst),
+            1,
+            "同档重复登记应替换掉旧的"
+        );
+        assert_eq!(third_count.load(Ordering::SeqCst), 1);
+        assert_eq!(second_count.load(Ordering::SeqCst), 2);
     }
 
     /// 处理器直接返回消息时由框架代发（mirai 的 `SimpleCommand` 回 String）
@@ -1246,7 +1653,7 @@ mod tests {
                         .collect::<Vec<_>>()
                         .join(" ");
                     seen.lock().unwrap().push(text);
-                    MessageReceipt { message_id: None }
+                    MessageReceipt::default()
                 })
             }
         }

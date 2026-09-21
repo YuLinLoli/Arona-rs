@@ -4,10 +4,12 @@
 //! 每天固定小时、固定间隔循环（首次立即执行）、单次延时/定时。这里用 tokio 实现同等语义，
 //! 任务以名称注册，支持列出、手动触发、暂停/恢复与删除。
 
+use crate::plugin::health::HealthBoard;
 use chrono::{DateTime, Local, Timelike};
 use std::collections::HashMap;
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock, Weak};
 use std::time::Duration;
 
 pub type JobFn = Arc<dyn Fn() + Send + Sync + 'static>;
@@ -34,6 +36,8 @@ struct TaskEntry {
     group: String,
     kind: TaskKind,
     run: JobFn,
+    /// 归属插件的健康度记账（拿不到框架实例时为 None，只吞 panic 不停用）
+    health: Option<Arc<HealthBoard>>,
     paused: AtomicBool,
     canceled: AtomicBool,
     last_fire: RwLock<Option<i64>>,
@@ -41,9 +45,36 @@ struct TaskEntry {
 }
 
 impl TaskEntry {
+    /// 跑一次任务体，返回是否发生了 panic。
+    ///
+    /// 不吞的话异常会顺着循环把整个 tokio 任务打死，而表里还留着一条
+    /// 看起来正常、永远不会再触发的僵尸任务。
+    fn invoke(&self) -> bool {
+        // 任务体属于插件：它打的日志挂 `[插件名:定时 任务名]`，不混进 [Arona]
+        let source = crate::plugin::log_source(&self.group, &format!("定时 {}", self.name));
+        let outcome = crate::runtime::log::with_source(&source, || {
+            std::panic::catch_unwind(AssertUnwindSafe(|| (self.run)()))
+        });
+        if outcome.is_ok() {
+            return false;
+        }
+        crate::runtime::log::error(format!(
+            "定时任务「{}」的处理器 panic，本次已跳过并继续按表调度",
+            self.name
+        ));
+        if let Some(health) = &self.health {
+            // group 就是归属插件 id：连续 panic 到阈值同样隔离停用
+            health.record_panic(&self.group, "定时任务");
+        }
+        true
+    }
+
     fn schedule_cycle(self: &Arc<Self>) {
         let entry = self.clone();
-        tokio::spawn(async move {
+        let name = self.name.clone();
+        // 走进程登记的运行时：GUI 主线程上重新装配插件时（停用→启用）这里没有上下文，
+        // 裸 tokio::spawn 会当场 panic「there is no reactor running」
+        if crate::runtime::reactor::spawn(async move {
             loop {
                 let now_ms = chrono::Utc::now().timestamp_millis();
                 let Some(delay_ms) = entry.delay_until_next(now_ms) else {
@@ -65,7 +96,7 @@ impl TaskEntry {
                     let mut last = entry.last_fire.write().unwrap();
                     *last = Some(fired_at);
                 }
-                (entry.run)();
+                entry.invoke();
                 let after = chrono::Utc::now().timestamp_millis();
                 if let Some(next) = entry.compute_next_after(after) {
                     let mut guard = entry.next_fire.write().unwrap();
@@ -76,7 +107,13 @@ impl TaskEntry {
                     return;
                 }
             }
-        });
+        })
+        .is_none()
+        {
+            crate::runtime::log::warning(format!(
+                "定时任务「{name}」未能启动：tokio 运行时还没就绪"
+            ));
+        }
     }
 
     /// 返回距下一次触发需要等待的毫秒数
@@ -149,19 +186,32 @@ fn next_daily_ms(hour: u32, now_ms: i64) -> i64 {
 #[derive(Default)]
 pub struct Scheduler {
     tasks: RwLock<HashMap<String, Arc<TaskEntry>>>,
+    /// 回填后，任务 panic 才能记到归属插件的健康度上（见 [`Scheduler::attach`]）
+    framework: OnceLock<Weak<crate::framework::Framework>>,
 }
 
 impl Scheduler {
+    /// 由 `Framework::new` 在整套注册表构造完成后回填（与 PluginManager/HealthBoard 同一手法）
+    pub(crate) fn attach(&self, framework: &Arc<crate::framework::Framework>) {
+        let _ = self.framework.set(Arc::downgrade(framework));
+    }
+
     fn register(&self, name: &str, group: &str, kind: TaskKind, run: JobFn) -> Arc<TaskEntry> {
         let existing = self.tasks.read().unwrap().get(name).cloned();
         if let Some(entry) = existing {
             entry.canceled.store(true, Ordering::SeqCst);
         }
+        let health = self
+            .framework
+            .get()
+            .and_then(|weak| weak.upgrade())
+            .map(|framework| framework.health().clone());
         let entry = Arc::new(TaskEntry {
             name: name.to_string(),
             group: group.to_string(),
             kind,
             run,
+            health,
             paused: AtomicBool::new(false),
             canceled: AtomicBool::new(false),
             last_fire: RwLock::new(None),
@@ -180,9 +230,16 @@ impl Scheduler {
         self.register(name, group, TaskKind::Daily { hour }, run);
     }
 
-    /// 创建固定间隔循环任务（首次立即执行）
+    /// 创建固定间隔循环任务（首次立即执行）。间隔至少 1 秒：传 0 会退化成空转刷屏的死循环。
     pub fn create_repeat(&self, interval_secs: u64, name: &str, group: &str, run: JobFn) {
-        self.register(name, group, TaskKind::Repeat { interval_secs }, run);
+        self.register(
+            name,
+            group,
+            TaskKind::Repeat {
+                interval_secs: interval_secs.max(1),
+            },
+            run,
+        );
     }
 
     /// 创建单次定时任务
@@ -233,11 +290,12 @@ impl Scheduler {
             .get(name)
             .cloned()
             .ok_or_else(|| format!("任务不存在: {name}"))?;
-        tokio::spawn(async move {
-            let run = entry.run.clone();
-            run();
-        });
-        Ok(())
+        crate::runtime::reactor::spawn(async move {
+            // 手动触发同样要过隔离：这里以前是裸调 run()，插件 panic 会打死临时任务
+            entry.invoke();
+        })
+        .map(|_| ())
+        .ok_or_else(|| "tokio 运行时还没就绪，无法触发任务".to_string())
     }
 
     pub fn pause_all(&self) {
@@ -321,4 +379,69 @@ pub fn resume_all() {
 
 pub fn list() -> Vec<TaskInfo> {
     scheduler().list()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    /// 任务体 panic 只废掉那一次触发：循环必须继续按表走。
+    /// 回归点：以前 panic 会顺着 async 块打死整个 tokio 任务，
+    /// 表里却留一条状态正常、永远不会再触发的僵尸任务。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn panicking_job_keeps_being_scheduled() {
+        static FIRES: AtomicUsize = AtomicUsize::new(0);
+        let framework = crate::framework::Framework::new();
+        framework.jobs().create_repeat(
+            1,
+            "QuartzPanicJob",
+            "QuartzPanicPlugin",
+            Arc::new(|| {
+                if FIRES.fetch_add(1, Ordering::SeqCst) == 0 {
+                    panic!("任务炸弹");
+                }
+            }),
+        );
+        // 首次立即触发（这次炸），1 秒后还应再来一次
+        tokio::time::sleep(Duration::from_millis(1_600)).await;
+        framework.jobs().remove("QuartzPanicJob");
+        assert!(
+            FIRES.load(Ordering::SeqCst) >= 2,
+            "panic 之后调度循环不该消失，实际触发 {FIRES:?}"
+        );
+    }
+
+    /// GUI 的事件循环在主线程，那里没有 tokio 上下文：在面板上把插件停用再启用时，
+    /// 装配是在这条线程上同步做的，登记定时任务不能炸「there is no reactor running」
+    #[test]
+    fn registering_a_job_without_runtime_context() {
+        let runtime = crate::runtime::runtime_builder().build().expect("建运行时");
+        crate::runtime::reactor::set(runtime.handle().clone());
+        let framework = crate::framework::Framework::new();
+        framework
+            .jobs()
+            .create_repeat(1, "NoContextJob", "NoContextPlugin", Arc::new(|| {}));
+        assert!(framework.jobs().remove("NoContextJob"));
+        runtime.shutdown_background();
+    }
+
+    /// 间隔传 0 会退化成空转刷屏，登记时就得夹住
+    #[tokio::test]
+    async fn zero_interval_is_clamped() {
+        let scheduler = Scheduler::default();
+        scheduler.create_repeat(0, "QuartzClampJob", "QuartzClampPlugin", Arc::new(|| {}));
+        let entry = scheduler
+            .tasks
+            .read()
+            .unwrap()
+            .get("QuartzClampJob")
+            .unwrap()
+            .clone();
+        assert!(
+            matches!(entry.kind, TaskKind::Repeat { interval_secs } if interval_secs >= 1),
+            "0 秒间隔应被夹到至少 1 秒"
+        );
+        entry.canceled.store(true, Ordering::SeqCst);
+    }
 }

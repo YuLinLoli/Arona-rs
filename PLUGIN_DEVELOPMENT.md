@@ -21,7 +21,7 @@ plugins/bluearchive/       # 碧蓝档案功能插件：name=bluearchive-plugin,
 
 ```
 <运行目录>/
-  config/arona.yml          框架配置：groups / managers / global_blacklist / group_settings / disabled_plugins
+  config/arona.yml          框架配置：groups / managers / global_blacklist / group_settings / disabled_plugins / framework
   config/onebot.yml         OneBot 连接配置
   config/<插件>/arona.yml   该插件自己的配置（如 config/bluearchive/arona.yml）
   data/<插件>/…             该插件自己的数据（如 data/bluearchive/image、arona.db、backups）
@@ -94,12 +94,13 @@ arona-host  ──depends──▶  arona (框架)
 | `SimpleCommandDispatcher.shortestPrefixMatch` | `CommandRegistration::with_prefix_match(true)` + `FrameworkOptions::prefix_match_by_default`（最短前缀唯一即命中） | 同上 + `framework.rs` |
 | `PermissionService` / `MiraiPermission` | `Permission::{Anyone,GroupAdmin,GroupOwner}` + `GroupRole`（`ctx.with_permission(..)`，身份优先读 `sender.role`，回查带缓存） | `runtime/dispatcher.rs` |
 | `MiraiInstance.new { .. }`（构造选项） | `Framework::builder().panic_disable_threshold(..).build()` / `Framework::with_options(..)` | `framework.rs` |
-| `broadcastAndDumpInterceptedExceptions`（插件异常不冒泡到宿主） | 命令/钩子/兜底三侧统一过 `guarded()`：panic 被 `catch_unwind` 吃掉、记账、连续达阈值自动停用该插件 | `plugin/health.rs` |
-| `GroupMessageEvent` / `FriendMessageEvent` / `NudgedEvent` 事件族 | `EventBody`（强类型事件体）+ `BodyFilter` 子类型订阅：`ctx.on_group_message(..)`、`ctx.listen_where(&[BodyFilter::..], ..)` | `onebot/hooks.rs` |
-| `MessageChain` / `Element`（At、Image、Source、QuoteReply、Face、FlashMessage…） | `MessageSegment` 14 段（文本/@/@全体/引用/图片/表情/语音/视频/文件/戳一戳/位置/json/xml/合并转发），收发双向同一套类型 | §19 |
-| `AbstractMessage.source()` / `quoteReply`（引用的那条消息还能不能拿到） | 框架只负责**让引用对命令可见**：`CommandContext::{quoted, segments, message_id, time}`。至于协议层已经引用不到的旧消息，由插件自己记聊天记录还原（§21） | `runtime/dispatcher.rs` + `plugins/bluearchive/src/standalone/history.rs` |
-| `EventPriority`（Monitor→Normal→High→Low→Lowest） | `ListenerPriority` / `CommandPriority`（同一份 `runtime::priority::Priority`） | `runtime/priority.rs` |
+| `broadcastAndDumpInterceptedExceptions`（插件异常不冒泡到宿主） | 框架调用的插件入口全被兜住：命令/兜底、入站与出站钩子过 `guarded()`，生命周期回调与定时任务各自 `catch_unwind`，三处记账在同一张健康度面板上；连续 panic 达阈值自动停用该插件 | `plugin/health.rs` |
+| `GroupMessageEvent` / `FriendMessageEvent` / `NudgedEvent` 事件族 | `EventBody`（强类型事件体，notice/request 另带 `NoticeInfo`/`RequestInfo` 细节：动作、操作者、禁言时长、处理凭据）+ `BodyFilter` 子类型订阅：`ctx.on_group_message(..)`、`ctx.listen_where(&[BodyFilter::..], ..)` | `onebot/hooks.rs` |
+| `MessageChain` / `Element`（At、Image、Source、QuoteReply、Face、FlashMessage…） | `MessageSegment` 15 段（文本/@/@全体/引用/图片/表情/语音/视频/文件/戳一戳/位置/json/xml/合并转发/未知段原样保留），收发双向同一套类型 | §19 |
+| `AbstractMessage.source()` / `quoteReply`（引用的那条消息还能不能拿到） | 框架全包：`CommandContext::{quoted, segments, message_id, time}` 让引用对命令可见，协议层引用不到的旧消息由框架的聊天记录库还原（`context.reply_with_quote`），撤回按存下来的 id 换算（`context.recall`） | `runtime/dispatcher.rs` + `runtime/chatlog.rs`（§21） |
+| `EventPriority`（Monitor→High→Normal→Low→Lowest） | `ListenerPriority` / `CommandPriority`（同一份 `runtime::priority::Priority`） | `runtime/priority.rs` |
 | `event.intercept()` | `HookFlow::Handled` | `onebot/hooks.rs` |
+| `MessagePreSendEvent`（发出去之前改内容 / 整条拦下） | `OutboundContext`：`ctx.on_outgoing(..)` 订阅，`rewrite(..)` 改写、`cancel()` 拦停；挂在统一发送口上，合并转发拆分与控制台打印之前 | 同上 + `onebot/message_sender.rs` |
 | `plugin.instance.coroutineScope.launch` | `ctx.spawn(..)` / `PluginScope` | `plugin/scope.rs` |
 | `DiContainer.declare` / `instance<T>()` | `ctx.declare_service::<T>(..)` / `ctx.service::<T>()` | `container.rs` |
 | —（原版 Arona 的 `StandaloneServiceInfo` 表） | `arona::services::ServiceManager`：`ctx.register_service(..)`，条目带归属、插件停用时一并撤销 | `services/mod.rs` |
@@ -334,9 +335,22 @@ fn configure(&self, ctx: &PluginContext) -> Result<(), String> {
 - 命令名撞上别家插件时框架只记告警、按 `priority` 定胜出方（同优先级先到先得），**其余命令照常登记**，
   不会因为一家冲突就整批失败。分发时同名命令只调用排在最前的那一家，别家不会跟着响应一遍。
 - 前缀匹配默认关闭（一个字母能撞上一堆命令），单个命令用 `with_prefix_match(true)` 打开，
-  或整套实例用 `Framework::builder().prefix_match_by_default(true)`。歧义时框架回显候选列表，不猜。
-- `ctx.own_commands()` 拿本插件名下的命令概览（自绘帮助页用）；全表看 `arona::runtime::dispatcher::commands()`
+  或整套实例用 `Framework::builder().prefix_match_by_default(true)`；部署时也可以不改代码，
+  在框架 `config/arona.yml` 的 `framework:` 段里设（见 §20，热生效，且对**已经登记好**的命令也生效——
+  没显式声明过的命令在匹配那一刻才读这个开关）。歧义时框架回显候选列表，不猜。
+- **命令名要带前缀**：`FrameworkOptions::command_prefixes`（默认 `["/"]`）规定了合法写法，登记时
+  不带其中任何一个前缀的名字会被自动补上第一个（`"抽卡"` → `"/抽卡"`），并在 `problems` 里回报这次改写。
+  目的是让"arona 好可爱""这个 config 怎么改"这类日常句子不触发机器人——裸名别名（`"gacha"`、`"谁叫"`）
+  请写成 `"/gacha"`、`"/谁叫"`。想要纯聊天式命令（词就是命令、不写前缀）由宿主
+  `Framework::builder().command_prefixes(Vec::<String>::new())` 关掉这条规则；列表可以给多个前缀
+  （`["#", "/"]`），带任一者都算合规，裸名补第一个。规则只在**登记时**生效：名字是命令表的键，
+  中途改设置不会给已登记的命令改名。
+- `ctx.own_commands()` 拿本插件名下的命令概览（`CommandInfo`：名字、描述、用法、功能 key、优先级、
+  所需身份，以及**登记序号 `seq`**）；全表看 `arona::runtime::dispatcher::commands()`
   （默认实例那份，等价于 `Framework::global().commands()`）。
+  自绘 `/帮助` 就该从这里生成：一条命令的多个别名是**各自独立的表项**（描述相同），
+  `seq` 最小的那个是主名——按 `seq` 排序再按描述去重，别名就不会重复占行。
+  写死一份清单必然和 `registrations()` 漂移（本仓库的 `/帮助` 以前就列过不存在的命令）。
 - `configure()` 里可拿到 `ctx.onebot_config`（协议配置快照，需要 self_id / nickname 时用）与 `ctx.test_notify`
   （命令行是否带 `--test-notify`）。
 
@@ -393,25 +407,119 @@ fn configure(&self, ctx: &PluginContext) -> Result<(), String> {
 `segments`（§19 的全部消息段）、`api: OneBotApi`（§14），
 以及 `user_id()/group_id()/is_group()/is_private()/message_id()/field(key)/field_str(key)`、
 `target()`、`reply(text)`、`reply_message(OutgoingMessage)`、`recall(message_id)`。
+发送者侧另有 `sender_name()`（群名片优先，退回昵称）、`sender_role()`（`Option<GroupRole>`，§8 的权限枚举）、
+`sender_is_admin()`、`quoted()`（这条消息引用了哪条：`command_text` 里已剥掉引用段，值在这里）——
+全部读事件自带的 `sender`/`segments`，不发协议请求，实现端没给就是 `None`。
 
 `BodyFilter` 的档位：`All`、`Kind(EventKind)`（大类）、`GroupMessage` / `PrivateMessage`、
-`Notice(NoticeKind)`、`Request(RequestKind)`、`Meta(MetaKind)`。
-`NoticeKind` 覆盖 `group_upload/group_decrease/group_increase/group_admin/group_ban/group_recall/poke/nudge/群名片/群头衔/notify`，
-`RequestKind` 覆盖加好友、加群申请、被邀请加群，`MetaKind` 覆盖心跳与生命周期。
+`Notice(NoticeKind)`、`NoticeAction(NoticeKind, String)`、`Request(RequestKind)`、`Meta(MetaKind)`。
+
+同一个 `notice_type` 下的不同动作在 QQ 上是完全不同的事，所以子类之外还有一层细节：
+
+```rust
+use arona::onebot::hooks::{BodyFilter, EventBody, NoticeKind, RequestKind};
+
+// "被踢出群"与"自己退群"都是 group_decrease，靠动作分开订阅
+ctx.listen_where(
+    &[BodyFilter::notice(NoticeKind::GroupDecrease, "kick")],   // leave=自行退群, kick_me=被自家机器人踢
+    ListenerPriority::Normal,
+    event_handler(|e| Box::pin(async move { /* 清理该成员的数据 */ HookFlow::Pass })),
+);
+
+if let EventBody::Notice(NoticeKind::GroupBan, info) = &e.body {
+    // info.action: ban / unban；info.operator_id: 谁干的；info.duration: 秒（0 = 解禁）
+    if info.action.as_deref() == Some("ban") && info.duration == Some(0) {
+        // ...
+    }
+}
+
+// 请求侧：v11 把"申请加群"和"被邀请进群"都写成 request_type="group"，
+// 框架读 sub_type 归位成两个子类——自动通过申请的插件必须只认 AddGroup
+// info.flag 是处理凭据（§14 的 set_group_add_request 要原样带回），info.comment 是留言
+ctx.listen_where(
+    &[BodyFilter::Request(RequestKind::AddGroup)],
+    ListenerPriority::Normal,
+    event_handler(|e| Box::pin(async move { /* 审核并 set_group_add_request(e.body 里的 flag) */ HookFlow::Pass })),
+);
+```
+
+`NoticeKind` 覆盖 `group_upload/group_decrease/group_increase/group_admin/group_ban/group_recall/poke/nudge/群名片/群头衔/notify`。
+NapCat、LLOneBot、Lagrange 把戳一戳、名片与头衔变更都塞进 `notice_type="notify"`，真正的类型写在内层
+`sub_type`/`type` 里——框架 `EventBody::from_event` 会把它们归回 `Poke`/`Nudge`/`GroupCardUpdate`/`GroupTitleUpdate`，
+插件不必自己啃这层实现端差异；细分动作原样留在 `NoticeInfo::action`。
+`RequestKind` 覆盖加好友、加群申请、被邀请加群（`InviteGroup`，靠 `sub_type=invite` 认出），`MetaKind` 覆盖心跳与生命周期。
 实现端自定义的类型一律落到 `Other`，`field_str` 仍能拿到原始字符串——**优先用 `body`/`BodyFilter`，字符串比较是兜底**。
 
 优先级序（`arona::runtime::priority::Priority`，数值越小越先执行）：
-`Monitor → Normal（默认） → High → Low → Lowest`，同档按登记顺序。注意 `High` 排在 `Normal` 之前、
+`Monitor → High → Normal（默认） → Low → Lowest`，同档按登记顺序。注意 `High` 排在 `Normal` 之前、
 `Lowest` 是给兜底实现留的最后一档——这套序与 mirai 的 `EventPriority` 一致，别按英文字面意思猜。
 
 门控语义（框架负责，插件不用自己判断）：
 - `message`：先过「群授权 + 全局/群内黑名单」，再进钩子，最后才是命令分发；
 - `notice` / `request` / `meta`：无条件投递（机器人被踢、黑名单用户申请加群这类事也会触发，插件自己要清楚）；
 - 任何一条返回 `HookFlow::Handled` 即停止后续钩子并跳过命令分发；
-- **所属插件被禁用（全局或该群）时，它的钩子一律跳过**。
+- **所属插件被禁用（全局或该群）时，它的钩子一律跳过**；
+- 用 `ctx.listen_feature("gacha", ..)` 绑过分群功能开关的订阅，该群关掉这个功能时同样跳过——
+  和同名命令保持一致，不会出现"面板上功能已关闭、钩子还在收这个群的消息"。
 
-`arona::onebot::hooks::{on_message, on_notice, on_request, on_meta, on_all, subscribe, subscribe_at}`
+`arona::onebot::hooks::{on_message, on_notice, on_request, on_meta, on_all, subscribe, subscribe_at, subscribe_where, subscribe_feature}`
 这些自由函数仍在（第一个参数是插件 id），供框架自身与拿不到 `ctx` 的场景用；插件正常都走 `ctx`。
+
+### 9.1 出站前钩子：消息交给实现端之前的最后一道（mirai 的 `MessagePreSendEvent`）
+
+上面都是"收"。发出去那一侧同样有订阅点：`ctx.on_outgoing(..)` / `ctx.on_outgoing_at(.., priority)`。
+凡是走框架发送口的消息——命令回复、钩子里的 `e.reply(..)`、`services::send_message` 的主动推送——
+都会先过这道门：
+
+```rust
+use arona::onebot::MessageSegment;
+use arona::onebot::hooks::{ListenerPriority, OutboundContext, outbound_handler};
+
+// 本插件发出的每条消息末尾加一行落款
+ctx.on_outgoing(outbound_handler(|out: std::sync::Arc<OutboundContext>| {
+    Box::pin(async move {
+        out.rewrite(|message| {
+            message.segments.push(MessageSegment::Text("\n—— 阿罗娜".into()));
+        });
+    })
+}));
+
+// 风控：内容涉敏就整条拦下
+ctx.on_outgoing_at(
+    outbound_handler(|out| Box::pin(async move {
+        let risky = out.message().segments.iter().any(|segment| {
+            matches!(segment, MessageSegment::Text(text) if text.contains("密码"))
+        });
+        if risky {
+            out.cancel();   // 发送方拿到空回执，实现端收不到任何动作
+        }
+    })),
+    ListenerPriority::Monitor,   // 越早的档位越先改，后面的看到改完的结果
+);
+```
+
+`OutboundContext` 一共四件事：`target`（发往哪个群/谁，公有字段）、`message()`（当前快照）、
+`rewrite(closure)`（改写，闭包里拿到的是到目前为止各家改完的内容）、`cancel()`（拦停），
+外加 `is_cancelled()`。处理器返回 `()`——拦停靠 `cancel()`，不靠返回值，所以一次 `await` 里
+先改后拦、或者根据远端查询结果决定拦不拦都行。
+
+`OutgoingMessage::revoke_after_millis`（§19 的自动撤回）也在这一步可写，且改写发生在
+**合并转发拆分与控制台打印之前**——日志里看到的就是真正发出去的那份。
+
+优先级序、同档按登记顺序、同一处理器重复订阅去重、单插件条数上限、panic 隔离（某家改崩了不会吞掉消息，
+记账后带着当前内容继续走）、**所属插件被禁用（全局或该群）时一律跳过**——语义与入站钩子一致。
+自由函数版是 `arona::onebot::hooks::{subscribe_outbound, dispatch_outbound}`；`subscribe_outbound` 的
+`feature` 参数同 `ctx.listen_feature`（该群关掉这个功能时一并跳过），`ctx` 这两个入口不带功能 key。
+
+三个边界要清楚：
+- 钩子里 `e.reply(..)` / `e.reply_message(..)` 走的就是框架发送口，因此**会**再过一次出站门（含本插件自己的那条），
+  写落款/过滤逻辑时不必为"钩子回的消息"开特例；
+- 也正因为这条，**别在出站钩子里再发一条消息**——那是第二次过门，条件一触发就是自我递归。
+  要动手就改本条（`rewrite`），或者 `cancel()` 之后换个时机（`ctx.spawn`）再发；
+- 反过来，`OneBotApi` 的发送方法（`api.send(..)`、`send_group_msg(..)`、`send_private_msg(..)`）是
+  **协议层直连出口**：不过这道门，也不打印、不拆合并转发、`revoke_after_millis` 会丢
+  （`MessagePayload` 只带消息段）。它是留给 GUI 与"确实要绕开门控"的场景的后门，
+  插件平时发消息请用 `context.reply*`、`services::send_message`、§12 的延时推送。
 
 ## 10. 后台任务与定时任务：作用域自动回收
 
@@ -430,9 +538,15 @@ fn start(&self, ctx: &PluginContext) -> Result<(), String> {
     ctx.single_job(ts_ms, "OnceAt", job.clone());               // 单次
     ctx.delay_job(20, "TestNotify", job);                       // 延迟 N 秒
     ctx.remove_job("TestNotify");                               // 撤掉自己的一个任务
+    // 例行清库交给框架排期（回调返回删掉的条数，日志挂 [Arona] 而非插件名）
+    ctx.purge_job("ImageCachePurge", "图片缓存", every_days, keep_days, Arc::new(|| 0));
     Ok(())
 }
 ```
+
+`purge_job` 是同一件事的框架侧版本：例行清库（「每 N 天删掉 M 天前的东西」）由 `runtime::purge`
+统一排期与播报，插件只交出删除动作并回报条数，所以那两行日志挂 `[Arona]` 而不是某家的名字。
+同名任务重复登记时周期没变就不重建——`Repeat` 型任务登记时会先跑一次，重建等于每改一次配置就清一遍库。
 
 这些 helper 内部把 `quartz` 的**任务组**填成插件 id，所以 `revoke_resources` 一次就能整组取消。
 硬约束：**不要用裸 `tokio::spawn` 起长命任务、不要把 `PLUGIN_ID` 之外的字符串传给 `quartz` 的 group 参数**，
@@ -569,16 +683,25 @@ notify.update(|c| c.every_day_hour = 20)?;           // 读—改—写：落盘
 
 | 层级 | 开关来源 | 生效点 |
 | --- | --- | --- |
-| 功能（分群） | `arona.yml` → `group_settings.<群号>.disabled_features` | `runtime::config::feature_enabled(group_id, key)` |
-| 插件（分群） | `arona.yml` → `group_settings.<群号>.disabled_plugins` | `plugin_enabled_in_group`，命令与钩子一起停 |
-| 插件（全局） | `arona.yml` → `disabled_plugins` | 不 configure、不 start、不路由、不收事件 |
+| 功能（分群） | `arona.yml` → `group_settings.<群号>.disabled_features` | `runtime::config::feature_enabled(group_id, key)`：命令路由，以及 `ctx.listen_feature(..)` 绑了该 key 的钩子 |
+| 插件（分群） | `arona.yml` → `group_settings.<群号>.disabled_plugins` | `plugin_enabled_in_group`，命令与钩子（入站、出站）一起停 |
+| 插件（全局） | `arona.yml` → `disabled_plugins` | 不 configure、不 start、不路由、不收事件、也不改写别人发的消息 |
 
 `feature_enabled` 先看功能归属插件是否启用（`feature_owner` → `plugin_enabled`），再看该群的功能/插件名单，
 所以「整体停用插件」自动覆盖它名下所有功能。命令路由的最后一道兜底是
 `plugin::dispatcher_active_in_group(group_id)`：插件被停用时，**没绑定功能 key 的命令也进不去**。
 
-**`stop()` 只需关掉自己持有的句柄**（数据库连接、文件句柄）。后台任务、定时任务、事件订阅、命令、
-共享能力（容器）、服务开关条目
+展示层跟着收口，但不改任何判定：GUI「群管理」的功能清单走 `runtime::config::features()`，它会跳过
+被全局停用的插件的功能（摆一排永远勾不上的复选框没有意义，要恢复请到「插件管理」页）。
+`features_of(plugin)`（插件卡片上"本插件提供哪些功能"，卡片自带 `enabled`）与 `feature_keys_text()`
+（写进 `arona.yml` 的"可用功能 key"注释）**不过滤**——停用中也得看得见 key 叫什么名字。
+
+GUI 里这一栏按**提供它的插件分组**（用 `feature_owner` 归类），每组默认收起、点插件名展开/收起：组头的
+勾选框一次开关该插件在本群的全部功能（走 `admin::set_group_features`，一批 key 只落盘一次），展开后
+仍可单项开关；插件只在本群被停用时整组灰掉，因为那种情况下勾了也不生效。
+
+**`stop()` 只需关掉自己持有的句柄**（数据库连接、文件句柄）。后台任务、定时任务、事件订阅
+（入站钩子与出站钩子一起收）、命令、共享能力（容器）、服务开关条目
 由框架在 `stop()` 之后按归属统一回收（`manager::revoke_resources`），日志会写明各收了多少：
 
 ```rust
@@ -601,6 +724,7 @@ api.delete_msg(message_id).await?;
 ```
 
 不要缓存 `OneBotApi` 之外的连接对象：`onebot.yml` 热重载后旧连接已销毁，而 `global()` 每次现取。
+这里所有发送方法都是**协议层直连**：不出站钩子（§9.1）、不打印、不拆合并转发、不带自动撤回。
 错误统一是 `OneBotError::{NoConnection, Timeout, Failed{..}, BadResponse(_)}`，实现了 `Display`，
 直接 `?` 上抛或 `.map_err(|e| e.to_string())` 写日志都行。
 
@@ -731,10 +855,20 @@ GUI 相关的落地细节（改动前务必先读）：
 - 插件代码里不要 `std::process::exit`，也不要长阻塞主线程；耗时活计用 `ctx.spawn(..)`（§10）或 `arona::quartz`。
 - 日志走 `arona::runtime::log::{info, warning, error}`，不要用 `println!`（GUI 模式没有控制台）。
   调试用的 `runtime::log::debug(..)` 只在控制台开着时输出，不进日志文件。
+- 行首前缀由框架按「当前来源」填，插件不要自己拼：插件代码里打的挂 `[插件显示名:动作]`（控制台与 GUI 染淡紫），
+  框架自己打的挂 `[Arona]`（亮绿）。来源在框架进入插件代码的那一次调用上切换（生命周期回调、命令、钩子、
+  定时任务），跨 `await` 的后台任务由框架逐次 poll 时重设——所以任务体里 `ctx.spawn(..)` 起的活儿同样认得归属。
+- 框架给的动作为粗粒度（按入口）：`装配`、`启动`、`配置重载`、`命令 活动`、`事件 群消息`、`定时 每日任务名`…
+  插件比框架清楚自己那一步在干什么，关键动作再包一层就精确到「发送消息」「同步生日」「踢人」这个粒度：
+  - 同步段：`arona::plugin::action("踢人", || { .. })`
+  - 一段异步活儿：`arona::plugin::action_async("发送消息", services::send_message(target, msg)).await`
+    （整段每次轮询都带着动作名，中间的 `await` 不会把它丢掉）
+  - 后台任务：`ctx.spawn_as("定时推送", async { .. })`，动作名随任务下发，比 `ctx.spawn` 多一个标签
+  动作只在当前来源确实是已登记插件时生效，框架自己的日志始终是 `[Arona]`；嵌套时以最内层为准。
 
 ## 19. 消息段全谱：收与发用同一套类型
 
-对应 mirai 的 `MessageChain` / `Element`。`arona::runtime::message::MessageSegment` 共 14 段，
+对应 mirai 的 `MessageChain` / `Element`。`arona::runtime::message::MessageSegment` 共 15 段，
 入站（`EventContext::segments`）与出站（`OutgoingMessage`）都是它，插件不需要碰 JSON：
 
 | 段 | 入站来自 | 出站映射（`onebot::protocol::segment_to_json`） |
@@ -750,7 +884,8 @@ GUI 相关的落地细节（改动前务必先读）：
 | `Poke{name,target}` | `poke`（`type`/`target_id`，也吃 `target`） | `poke` + `type`/`target_id` |
 | `Location{…}` | `location`（`lat`/`lon` 数字或字符串都行） | `location` + `name`/`address`/`lat`/`lon` |
 | `Json(card)` / `Xml(card)` | `json`/`xml`：`data.data` 给对象直接用，给 JSON 字符串会先解析 | `json`/`xml` + `data` |
-| `Forward{title,messages}` | `forward`/`node`（递归解析 `content`，空内容整段丢弃） | 普通发送接口不支持合并转发 → 占位文本；真发送见下 |
+| `Forward{title,id,messages}` | `forward`/`node`（递归解析 `content`，空内容整段丢弃；`id` 是实现端给的 flag，可拿它调 `get_forward_msg` 取全量节点，`messages` 常为空） | 普通发送接口不支持合并转发 → 占位文本；真发送见下 |
+| `Raw{kind,data}` | 框架还不认识的段（新版实现端自己加的类型）：不再丢弃，原样留在这里，显示成 `[kind]` | `{"type":kind,"data":data}` 原样拼回，转发/重发不丢信息 |
 
 图片/语音/视频的统一取值（`media_value`）：**URL > 内存字节 > 本地文件**。
 内存字节和本地文件都编成 `base64://…`；只有 `config/onebot.yml` 顶层的 `send_image_as_file: true`
@@ -760,13 +895,17 @@ GUI 相关的落地细节（改动前务必先读）：
 出站构造：`OutgoingMessage::{new, text, at, at_all, quoted, image_file, image_data, record_file,
 video_file, json_card, xml_card, forward}`，再加 `.with_revoke(毫秒)` 让框架发完自动撤回。
 `ctx.reply(..)` / `context.reply_message(..)` / `api.send(target, msg)` 都吃它。
+区别在于走哪条路：前两者（以及 §12 的延时推送）走框架统一发送口，会先过 §9.1 的出站钩子、`.with_revoke(..)` 生效；
+`api.send(..)` 是协议层直连出口，不过门、`.with_revoke(..)` 在它身上无效。
 
 合并转发（`Forward` 段）由发送器自动分流：`onebot::message_sender` 把一条消息里的 `Forward` 摘出来走
 `send_forward_msg`，其余段照常发送，所以插件把合并转发当普通段拼进消息链就行，不用自己分两次调接口。
 
-入站解析两条路都通：实现端给 `message` 数组（推荐，`parse_segment` 逐段还原，认不出的类型直接丢弃）
-或只给 `raw_message` CQ 码（`decode_cq_message`：按 `[CQ:类型,键=值]` 还原，`&#44;/&#58;/&#93;/&amp;`
-实体自动解转义，未知 CQ 码整段留成原文文本，绝不吞字）。
+入站解析两条路都通：实现端给 `message` 数组（推荐，`parse_segment` 逐段还原，认不出的类型留成
+`Raw{kind,data}` 而不是丢掉）或只给 `raw_message` CQ 码（`decode_cq_message`：按 `[CQ:类型,键=值]`
+还原，`&#44;/&#58;/&#93;/&amp;` 实体自动解转义，未知 CQ 码整段留成原文文本，绝不吞字）。
+两条路都只是"不丢信息"，**不保证你认得**：要按类型分支处理，`match` 的兜底分支请写
+`MessageSegment::Raw { kind, .. }`，别写 `_ => {}`。
 
 `MessageSegment::is_mention_of(self_id)` 判断"这是在召唤机器人吗"（@机器人 与 @全体都算），
 `command_text(event, self_id)` 就是靠它剥命令前缀的（§8）。
@@ -774,9 +913,15 @@ video_file, json_card, xml_card, forward}`，再加 `.with_revoke(毫秒)` 让�
 ## 20. panic 隔离、自动停用与框架构造选项
 
 mirai 用 `broadcastAndDumpInterceptedExceptions` 保证"一个订阅者炸了不影响别人"。
-Arona 的等价物在框架侧：命令、事件钩子、兜底处理器三处调用统一过 `guarded`，用
-`poll_fn + catch_unwind(AssertUnwindSafe(..))` 把 `async` 处理器的 panic 就地吃掉——
-**不会拖垮 tokio task，也不会中断这一批事件的其余订阅者**。
+Arona 的等价物在框架侧：**框架会调用的插件入口**全被兜住——命令处理器与命令兜底、入站事件钩子
+与出站钩子过 `guarded`（`poll_fn + catch_unwind(AssertUnwindSafe(..))`，把 async 处理器的 panic
+就地吃掉，**既不拖垮 tokio task，也不中断这一批事件的其余订阅者**）；`install / configure / start`
+的 panic 折算成该阶段失败并走回收，`stop / on_config_reload` 只记日志、绝不打断框架后续的回收流程；
+定时任务 panic 只跳过本次，仍按表调度。三处都往同一张健康度面板记账。
+
+一个有意的例外：`ctx.spawn(..)` 起的后台任务是插件自己的独立 task，框架**不**兜它的 panic——
+那等于把插件里随便一段循环变成"看起来还在跑、其实早就停了"的僵尸，所以 panic 只结束那个任务，
+也不计入健康度。要在任务里连续存活就自己 `while` 循环 + 捕获，或者干脆用定时任务（§10）。
 
 记账的是 `arona::plugin::health::HealthBoard`（挂在框架实例上，`framework.health()`）：
 
@@ -797,43 +942,70 @@ framework.health().forget("bluearchive");       // 插件重新装配时清空
 let framework = arona::framework::Framework::builder()
     .panic_disable_threshold(3)      // 连续 3 次 panic 即停用；0 = 只记日志不停用
     .prefix_match_by_default(true)   // 全部命令开放最短前缀匹配（默认关）
+    .command_prefixes(["/"])         // 命令名写法前缀；空列表 = 允许裸名（见 §8）
     .build();                        // 返回 Arc<Framework>，与 global() 那套完全隔离
 ```
 
 读回来用 `framework.options()`，隔离名单看 `framework.health()`。
-默认实例（`Framework::global()`）用的是默认选项，GUI 与 `arona.yml` 的行为不受影响。
 
-## 21. 旧消息引用还原（插件侧聊天记录）
+**进程默认实例的这两项由配置文件给**（部署时不必重新编译）——框架 `config/arona.yml` 末尾的
+`framework:` 段，加载和热重载时写进默认实例：
+
+```yaml
+framework:
+  panic_disable_threshold: 5      # 同一插件连续 panic 多少次就自动隔离停用（0 = 只记日志、不停用）
+  prefix_match_by_default: false  # 未声明 with_prefix_match 的命令是否也参与最短前缀匹配
+```
+
+两项都是活的：阈值改完下一次 panic 就按新数计；前缀开关是在**匹配那一刻**读的，
+所以改配置对启动时就登记好的命令同样生效（显式 `with_prefix_match(..)` 的命令不受全局开关摆布）。
+`Framework::new()` / `builder()` 造出来的隔离实例不读这个段，也不受它影响。
+
+## 21. 旧消息引用还原与撤回（框架侧聊天记录缓存）
 
 **问题**：用户引用一条消息再触发指令时，那条被引用的消息**未必还拿得到**。QQ 的引用段（`reply`）只被
 OneBot 实现端的本地缓存认账，NTQQ 系实现（NapCat / LLOWeb / Lagrange）对十几二十分钟前的 `message_id`
 就查不到原消息了——要么丢掉引用段静默发送，要么整个 `send_group_msg` 报错。所以"引用一条半小时前的
 消息再 `/攻略`"这件事，光靠协议层做不到。
+另一半是**撤回**：同一家实现端给的 `real_id` 才是 `delete_msg` 认的号，插件手上往往只有事件里那个
+`message_id`，直接拿去撤会报「消息不存在」。
 
-**框架只做一半**：把引用暴露给命令（`CommandContext::quoted` / `segments` / `message_id` / `time`，见 §8），
-不碰存储——框架 crate 不依赖 rusqlite，把聊天记录表塞进框架会让 GUI 那侧的静态链接构建白白变大。
-**剩下的一半归插件**：bluearchive 的 `standalone/history.rs` 是参考实现。
+**这两半现在都在框架**（`runtime::chatlog`，实现见 `crates/arona/src/runtime/chatlog.rs`）。留档这件事
+和玩法无关，谁都得依赖它，交给插件各记一份只会互相看不见：A 插件记的库，B 插件读不到。
 
-插件侧要做的三件事：
+插件要用的话只有两个方法，都在命令上下文与事件上下文上：
 
-1. **记账**。`configure` 阶段订阅消息事件（`ctx.listen_where(&[BodyFilter::GroupMessage, BodyFilter::PrivateMessage], ListenerPriority::Monitor, ..)`），
-   把听到的每条消息写进自己的表；机器人**自己发出去**的那条也要记（引用还原最常遇到的就是"用户引用了机器人的回复"），
-   所以在统一回复出口里拿 `MessageReceipt::message_id` 补一条出站记录。
-   `Monitor` 优先级保证排在别家钩子之前——别人 `HookFlow::Handled` 短路也短掉不了记账。
-   隐私边界由框架兜着：消息事件在进钩子之前已经过群授权与黑名单过滤，未授权的群和黑名单用户根本不会产生记录。
-2. **裁决 + 还原**。回复时看被引用那条的时间：还在窗口内（默认 30 分钟）就挂原生 `MessageSegment::Reply(id)`，
-   QQ 上是真引用；过窗就用本地记录拼一段文字头（`[引用 谁 时间]` + 原文）+ 图片，随本条回复一起发出。
-   库里查不到的 id 退回去问一次 `get_msg`，问到就顺手回填——机器人上线前的历史消息能被逐步补进库。
-   **图片只存原链接**（QQ 图床直链带签名、会过期），发出前先探一次（`Range: bytes=0-0` 的 GET，5 秒超时）；
-   探不到就回一句「图片已过期」，而不是默默少发一张图。机器人自己渲染的图存的是本地路径，探测方式是文件还在不在。
-3. **清理**。默认只留 2 天，每 4 天删一次 2 天前的记录（`ctx.repeat_job(间隔秒, "ChatLogPurge", ..)`，
-   首次立即执行）。注意这两项组合起来的**实际**保留时长是 2~6 天，磁盘峰值按 6 天算。
+```rust
+// 引用回复：被引用那条还在窗口内就挂原生 reply 段（QQ 上是真引用），
+// 过窗则用框架的聊天记录把那条还原成文字头 + 图片，拼在回复最前面
+context.reply_with_quote(message).await;
+// 撤回：传你见过的任意一个号（触发消息的 message_id、自己那条回复的回执都行），
+// 框架按库里的记录换成实现端认的那个
+context.recall(message_id).await;
+```
 
-配置住在插件自己的 `config/bluearchive/arona.yml`（`PluginConfig` + `typed_section::<ChatLogConfig>("chatlog")`，见 §12）：
+`reply_with_quote` 在触发消息本身没有引用时等同于 `reply_message`，所以命令实现里可以无条件用它。
+`EventContext` 上另有同名的 `reply_with_quote` / `recall`（钩子里回消息、钩子里撤回）。
+
+框架侧还做了什么：
+
+1. **进出两条路各记一笔**。听到的消息由 `onebot/business.rs` 记账（排在群授权与黑名单过滤之后，
+   未授权的群和黑名单用户根本不产生记录），说出的消息由 `onebot/message_sender.rs` 记账——
+   只有连出站一起记，才还原得了"用户引用了机器人的回复"。库在 `data/arona/chatlog.db`，
+   图片**只存原链接**不另存副本。
+2. **裁决 + 还原**。回复时看被引用那条的时间：还在窗口内（默认 30 分钟）挂原生引用，过窗就还原成
+   `[引用 谁 时间]` + 原文 + 图片。库里查不到的 id 退回去问一次 `get_msg` 并顺手回填，
+   机器人上线前的历史消息能被逐步补进库。图床直链会过期，发出前先探一次（`Range: bytes=0-0` 的 GET，
+   带浏览器 UA，5 秒超时）；探不到就明确回一句「图片已过期」，而不是默默少发一张图。
+   机器人自己渲染的图存的是本地路径，探测方式是文件还在不在。
+3. **清理**。默认只留 2 天，每 4 天删一次 2 天前的记录（`runtime::purge`，见 §10；首次立即执行）。
+   这两项组合起来的**实际**保留时长是 2~6 天，磁盘峰值按 6 天算。
+
+配置住在框架的 `config/arona.yml`（不属于任何插件），改动即时生效、不必重启：
 
 ```yaml
 chatlog:
-  # 是否记录聊天记录（关闭后不再还原引用）
+  # 总开关：关掉后不再记账，引用还原与撤回时的 id 换算一起停
   enable: true
   # 本地保留几天的聊天消息
   keep_days: 2
@@ -843,5 +1015,9 @@ chatlog:
   quote_ttl_minutes: 30
 ```
 
-改这几项不必重启：框架热重载后回调 `on_config_reload`，插件在里面比对间隔天数，变了才重建清理任务
-（开关关掉时直接把任务移除）。清理与还原两处都按 `chatlog.enable` 现读现判，所以关掉开关后立刻停止记账。
+开关与保留期都是**现读现判**：记账点每条消息读一次，清理任务在配置热重载时按新值校准
+（周期没变就不重建，避免每改一次配置就多清一遍库）。
+
+> 老版本的 `plugins/bluearchive/src/standalone/history.rs` 是这件事的插件侧实现，已删除；
+> 它的用例整套搬进了框架的 `runtime::chatlog` 测试。配置里如果还留着插件那份 `chatlog` 段，
+> 框架会在启动日志里点名城到 `config/arona.yml`。

@@ -50,7 +50,23 @@ impl PluginScope {
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
-        let handle = tokio::spawn(task);
+        self.spawn_as("后台任务", task)
+    }
+
+    /// 同上，但日志前缀细化成 `[插件名:动作]`（如 `[BluearchivePlugin:定时推送]`）。
+    ///
+    /// 后台任务会跨 `await` 在 runtime 的工作线程之间搬动，线程局部的来源撑不过一次挂起，
+    /// 所以动作名必须随任务一起交给日志外壳、每次轮询重设，而不是在 spawn 前 `with_action`。
+    pub fn spawn_as<F>(&self, action: &str, task: F) -> JoinHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let handle = crate::runtime::reactor::spawn(crate::runtime::log::Sourced::new(
+            Some(crate::plugin::log_source(&self.plugin, action)),
+            task,
+        ))
+        .expect("插件后台任务需要 tokio 运行时（进程启动时登记，见 runtime::reactor）");
         let abort = handle.abort_handle();
         let mut tasks = self.tasks.lock().unwrap();
         // 先丢掉已经结束的，免得长期运行的进程里记账表只增不减

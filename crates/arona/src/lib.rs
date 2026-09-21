@@ -126,6 +126,7 @@ pub fn run(args: Vec<String>) {
             return;
         }
     };
+    runtime::reactor::set(runtime.handle().clone());
     if let Err(err) = runtime.block_on(run_bot(args, None)) {
         runtime::console::eprint_safe(&format!("[Arona] 运行失败: {err}"));
     }
@@ -215,6 +216,9 @@ pub(crate) async fn run_bot(
     runtime::paths::set_arona_file(arona_config_file.clone());
     runtime::config::set_bot_id(onebot_config.self_id);
     runtime::config::set_end_with_sensei("老师".to_string());
+    // 聊天记录库随启动建好：留档从第一条消息就有，路径不可写这类问题也当场报在启动日志里，
+    // 而不是等第一条消息记账时才暴露
+    runtime::chatlog::open(&runtime::paths::chatlog_file());
 
     // 插件配置：每个插件一份 config/<插件>/arona.yml（旧写法已在上面被接管，这里落盘并加载）
     config::plugin_config::init();
@@ -228,6 +232,7 @@ pub(crate) async fn run_bot(
     let registry = Arc::new(ConnectionRegistry::new());
     let business = Arc::new(StandaloneBusinessHandler::new(
         onebot_config.clone(),
+        framework::Framework::global_arc(),
         Arc::new(runtime::dispatcher::CommandDispatcher::new()),
         registry.clone(),
     ));

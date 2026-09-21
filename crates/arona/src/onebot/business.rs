@@ -1,13 +1,13 @@
 //! 业务事件处理器（对应原版 StandaloneBusinessHandler）
 use crate::config::onebot::OneBotConfig;
 use crate::config::standalone;
+use crate::framework::Framework;
 use crate::onebot::connection::{ConnectionRegistry, OneBotConnection};
 use crate::onebot::console;
 use crate::onebot::message_sender::OneBotMessageSender;
 use crate::onebot::model::{OneBotAction, OneBotEvent};
 use crate::onebot::protocol;
 use crate::runtime::dispatcher::{CommandContext, CommandDispatcher};
-use crate::runtime::message::MessageSegment;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
@@ -30,7 +30,9 @@ impl HandlerState {
 
 pub struct StandaloneBusinessHandler {
     config: RwLock<OneBotConfig>,
-    /// 无状态分发句柄：真正的命令表是进程级的，由各插件在 configure 阶段按归属登记
+    /// 本处理器所属的框架实例：事件钩子与门控都读它，不绕回进程默认实例
+    framework: Arc<Framework>,
+    /// 无状态分发句柄：真正的命令表按归属登记在所属实例的 `CommandRegistry` 上
     pub dispatcher: Arc<CommandDispatcher>,
     pub registry: Arc<ConnectionRegistry>,
     pub state: Arc<HandlerState>,
@@ -39,11 +41,13 @@ pub struct StandaloneBusinessHandler {
 impl StandaloneBusinessHandler {
     pub fn new(
         config: OneBotConfig,
+        framework: Arc<Framework>,
         dispatcher: Arc<CommandDispatcher>,
         registry: Arc<ConnectionRegistry>,
     ) -> StandaloneBusinessHandler {
         StandaloneBusinessHandler {
             config: RwLock::new(config),
+            framework,
             dispatcher,
             registry,
             state: Arc::new(HandlerState::new()),
@@ -55,8 +59,15 @@ impl StandaloneBusinessHandler {
         self.config.read().unwrap().clone()
     }
 
-    /// 热重载时更新配置（self_id / nickname 等）
+    /// 只取机器人号：每条事件都要用它，不该为此克隆整份配置
+    fn self_id(&self) -> i64 {
+        self.config.read().unwrap().self_id
+    }
+
+    /// 热重载时更新配置（self_id / nickname 等），并同步门控里的机器人号
     pub fn update_config(&self, config: OneBotConfig) {
+        // 机器人号不同步的话，热重载换了号，"@机器人 才剥前缀"和身份判断都还在用旧号
+        self.framework.gating().set_bot_id(config.self_id);
         *self.config.write().unwrap() = config;
     }
 
@@ -64,39 +75,42 @@ impl StandaloneBusinessHandler {
     pub fn on_event(&self, event: OneBotEvent, connection: Arc<dyn OneBotConnection>) {
         self.registry.broadcast_except(&event.raw, connection.id());
         if event.post_type != "message" {
-            // 框架自己的通知处理（机器人被踢时清理 groups 配置）
-            if event.post_type == "notice" {
-                self.handle_notice(&event);
-            }
-            // 通知/请求/元事件无条件投给插件钩子：黑名单用户退群、加群申请这类事同样要能响应
+            // 通知/请求/元事件无条件投给插件钩子：黑名单用户退群、加群申请这类事同样要能响应。
+            // 框架自己的通知处理（机器人被踢时清理 groups 配置）排在钩子**之后**：
+            // 插件的 Monitor 档钩子应先看到原样的事件，日志顺序也才和实际处理顺序一致。
+            let hooks = self.framework.hooks().clone();
+            let self_id = self.self_id();
             tokio::spawn(async move {
-                crate::onebot::hooks::dispatch(&event).await;
+                hooks.dispatch(&event).await;
+                if event.post_type == "notice" {
+                    Self::handle_notice(self_id, &event);
+                }
             });
             return;
         }
-        let self_id = self.config().self_id;
+        let self_id = self.self_id();
+        // 消息段只解一次：打印用文本、命令匹配用命令文本、钩子与命令上下文用同一份段，
+        // 引用编号也是从这份段里取的（段解析要拷出每段的 data 映射，重复解是白付的钱）
+        let parsed = protocol::ParsedMessage::parse(&event, self_id);
         if event.message_type.as_deref() == Some("group") && event.group_id.is_some() {
-            self.print_group_message(&event, connection.clone());
+            self.print_group_message(&event, &parsed.text, connection.clone());
         } else {
-            console::print_message(self_id, &event, None);
+            console::print_message_text(self_id, &event, None, &parsed.text);
         }
         // 命令匹配读的是剥掉"@机器人 前缀"的文本：群消息里 @Arona /单抽 的首词才是命令名
-        let text = protocol::command_text(&event, self_id);
-        let segments = protocol::extract_segments(&event);
+        let text = parsed.command_text.clone();
         // 引用段被 command_text 剥掉了，插件要靠这个值才知道"用户引用了哪条消息"
-        let quoted = segments.iter().find_map(|segment| match segment {
-            MessageSegment::Reply(message_id) => Some(*message_id),
-            _ => None,
-        });
+        let quoted = parsed.quoted();
         // 纯图片/表情这类没有文本的消息，没有可分发的命令，但事件钩子照样要收到
         let has_command = !text.is_empty();
         let Some(user_id) = event.user_id else { return };
-        let is_admin = crate::runtime::config::is_manager(user_id);
-        if !is_admin && !self.is_allowed_group(event.group_id) {
-            return;
-        }
+        let gating = self.framework.gating();
+        let is_admin = gating.is_manager(user_id);
         // 黑名单（全局 + 群内）：管理员不受限制
-        if !is_admin && crate::runtime::config::is_blacklisted(user_id, event.group_id) {
+        if !is_admin
+            && (!gating.group_authorized(event.group_id)
+                || gating.is_blacklisted(user_id, event.group_id))
+        {
             return;
         }
         let sender_name = event
@@ -118,32 +132,36 @@ impl StandaloneBusinessHandler {
             });
         let sender = Arc::new(OneBotMessageSender {
             connection: Some(connection),
-            self_id: self.config().self_id,
+            self_id,
         });
         // 群身份直接取事件自带的 sender.role：命令的权限门控靠它，不必再回查一次实现端
         let sender_role = event
             .sender
             .as_ref()
             .and_then(crate::runtime::dispatcher::GroupRole::from_sender);
+        // 进出都要留档（出站那半在 onebot::message_sender）：NTQQ 系实现端十几二十分钟前的
+        // message_id 协议层就引用不到了，引用回复与撤回只能靠本地这份库
+        crate::runtime::chatlog::record_inbound(&event, &parsed.segments);
         let context = Arc::new(CommandContext {
             user_id,
             group_id: event.group_id,
-            text: text.clone(),
+            text,
             sender_name,
             is_admin,
             sender_role,
             message_id: event.message_id,
             time: event.time,
             quoted,
-            segments,
+            segments: parsed.segments.clone(),
             sender,
         });
         let dispatcher = self.dispatcher.clone();
+        let hooks = self.framework.hooks().clone();
         tokio::spawn(async move {
             // 消息钩子先于命令分发：插件有机会整条接管（返回 Handled 时不再走命令）。
             // 未命中任何命令时的兜底（如 /攻略 模糊建议的数字回复）由各插件自己登记的
             // FallbackHandler 按优先级依次尝试，框架这里不感知具体功能。
-            if crate::onebot::hooks::dispatch(&event).await {
+            if hooks.dispatch_parsed(&event, &parsed).await {
                 return;
             }
             if !has_command {
@@ -153,8 +171,9 @@ impl StandaloneBusinessHandler {
         });
     }
 
-    fn handle_notice(&self, event: &OneBotEvent) {
-        let self_id = self.config().self_id;
+    /// 框架自己对通知事件的善后：打日志 + 机器人被移出群时把该群从 groups 配置里摘掉。
+    /// 只在插件钩子跑完之后调用（见 `on_event`）。
+    fn handle_notice(self_id: i64, event: &OneBotEvent) {
         let group_id = event.group_id;
         match event.notice_type.as_deref() {
             Some("group_increase") => {
@@ -208,8 +227,13 @@ impl StandaloneBusinessHandler {
         }
     }
 
-    fn print_group_message(&self, event: &OneBotEvent, connection: Arc<dyn OneBotConnection>) {
-        let self_id = self.config().self_id;
+    fn print_group_message(
+        &self,
+        event: &OneBotEvent,
+        text: &str,
+        connection: Arc<dyn OneBotConnection>,
+    ) {
+        let self_id = self.self_id();
         let Some(group_id) = event.group_id else {
             return;
         };
@@ -221,7 +245,7 @@ impl StandaloneBusinessHandler {
             .get(&group_id)
             .cloned()
         {
-            console::print_message(self_id, event, Some(&name));
+            console::print_message_text(self_id, event, Some(&name), text);
             return;
         }
         if let Some(name) = event
@@ -235,13 +259,13 @@ impl StandaloneBusinessHandler {
                 .lock()
                 .unwrap()
                 .insert(group_id, name.to_string());
-            console::print_message(self_id, event, Some(name));
+            console::print_message_text(self_id, event, Some(name), text);
             return;
         }
         // 群名还没拿到：立刻按群号打印，绝不把「收到消息」这件事拖到一次网络请求之后。
         // （原版在这里把消息排队等 get_group_info 返回：OneBot 端慢、没实现 get_group_info
         //   或网络抖动时，控制台会先卡住最多 5 秒，收到的指令要等命令都执行完才显示出来）
-        console::print_message(self_id, event, None);
+        console::print_message_text(self_id, event, None, text);
         // 后台补一次群名，只影响后续消息的显示，不阻塞任何打印
         let mut loading = self.state.group_name_loading.lock().unwrap();
         if !loading.contains(&group_id) {
@@ -276,14 +300,6 @@ impl StandaloneBusinessHandler {
             }
             state.group_name_loading.lock().unwrap().remove(&group_id);
         });
-    }
-
-    fn is_allowed_group(&self, group_id: Option<i64>) -> bool {
-        let groups = crate::runtime::config::groups();
-        match group_id {
-            None => true,
-            Some(group_id) => groups.is_empty() || groups.contains(&group_id),
-        }
     }
 
     /// 处理 OneBot 实现发来的动作请求
@@ -366,8 +382,9 @@ mod tests {
         let registry = Arc::new(ConnectionRegistry::new());
         let handler = StandaloneBusinessHandler::new(
             OneBotConfig::default(),
-            // 分发句柄是无状态的，命令由插件按归属登记在全局表里；
+            // 分发句柄是无状态的，命令由插件按归属登记在命令表里；
             // 框架测试只验证「收到消息先打印」的时序，不需要任何命令。
+            crate::framework::Framework::global_arc(),
             Arc::new(crate::runtime::dispatcher::CommandDispatcher::new()),
             registry,
         );

@@ -78,10 +78,21 @@ pub fn segment_to_json(segment: &MessageSegment) -> Value {
         }),
         MessageSegment::Json(card) => json!({ "type": "json", "data": { "data": card } }),
         MessageSegment::Xml(card) => json!({ "type": "xml", "data": { "data": card } }),
+        // 只有凭据、没有节点的转发段：原样回一个 forward 段，实现端按 id 转发那份记录
+        // （发送器要发节点内容时会另走 send_forward_msg，见 onebot::message_sender）
+        MessageSegment::Forward {
+            id,
+            messages,
+            title: _,
+        } if messages.is_empty() && !id.is_empty() => {
+            json!({ "type": "forward", "data": { "id": id } })
+        }
         MessageSegment::Forward { title, .. } => json!({
             "type": "text",
             "data": { "text": format!("[合并转发:{title}]") }
         }),
+        // 不认识的段原样拼回去：实现端加的新类型不该因为框架落后一版就消失
+        MessageSegment::Raw { kind, data } => json!({ "type": kind, "data": data }),
         MessageSegment::Image { url, file, data } => json!({
             "type": "image",
             "data": { "file": media_value(url, file, data.as_deref()) },
@@ -177,15 +188,40 @@ pub fn segment_display(segment: &MessageSegment) -> String {
         MessageSegment::Xml(_) => "[xml 卡片]".to_string(),
         MessageSegment::Forward { title, .. } => format!("[合并转发:{title}]"),
         MessageSegment::Image { .. } => format_image(segment),
+        MessageSegment::Raw { kind, .. } => format!("[{kind}]"),
+    }
+}
+
+/// 命令文本里非文本段的**紧凑占位**：`segment_display` 的观感串（图片带整条 URL、
+/// 文件带中文名）不该混进首词，命令表查的是 `/单抽`，不是 `/[arona:image,url=https://…]`。
+fn command_token(segment: &MessageSegment) -> String {
+    match segment {
+        MessageSegment::Text(text) => text.clone(),
+        MessageSegment::At(user_id) => format!("@{user_id}"),
+        MessageSegment::AtAll => "@all".to_string(),
+        MessageSegment::Reply(_) => "[reply]".to_string(),
+        MessageSegment::Image { .. } => "[image]".to_string(),
+        MessageSegment::Face(id) => format!("[face:{id}]"),
+        MessageSegment::Record { .. } => "[record]".to_string(),
+        MessageSegment::Video { .. } => "[video]".to_string(),
+        MessageSegment::File { .. } => "[file]".to_string(),
+        MessageSegment::Poke { .. } => "[poke]".to_string(),
+        MessageSegment::Location { .. } => "[location]".to_string(),
+        MessageSegment::Json(_) => "[json]".to_string(),
+        MessageSegment::Xml(_) => "[xml]".to_string(),
+        MessageSegment::Forward { .. } => "[forward]".to_string(),
+        MessageSegment::Raw { kind, .. } => format!("[{kind}]"),
     }
 }
 
 /// 提取事件的纯文本内容（各段直接相连，与实现端的 raw_message 观感一致）
 pub fn extract_text(event: &OneBotEvent) -> String {
-    extract_segments(event)
-        .iter()
-        .map(segment_display)
-        .collect()
+    text_of(&extract_segments(event))
+}
+
+/// 从**已解析**的消息段拼文本：同一条消息被反复问到时不必再解一遍段
+pub fn text_of(segments: &[MessageSegment]) -> String {
+    segments.iter().map(segment_display).collect()
 }
 
 /// 提取**用来匹配命令**的文本。
@@ -195,11 +231,23 @@ pub fn extract_text(event: &OneBotEvent) -> String {
 /// `At(bot)` 从消息链里剥掉了，这里对齐它）。规则：从头剥掉召唤机器人的段
 /// （@机器人、@全体成员、引用、图片），段与段之间补空格，最后 trim。
 pub fn command_text(event: &OneBotEvent, self_id: i64) -> String {
+    command_text_of(&extract_segments(event), self_id)
+}
+
+/// 从已解析的消息段取命令文本（规则同 [`command_text`]）
+pub fn command_text_of(segments: &[MessageSegment], self_id: i64) -> String {
     let mut out = String::new();
     let mut leading = true;
-    for segment in extract_segments(event) {
+    for segment in segments {
+        // 纯空白的前导文本段（部分实现端在 @机器人 前面塞一个 `" "`）也算"还没开始说话"，
+        // 否则它把 leading 关掉，紧跟其后的 @机器人 就被当成正文混进首词，命令表再也查不中
+        let blank_text = match segment {
+            MessageSegment::Text(text) => text.trim().is_empty(),
+            _ => false,
+        };
         if leading
-            && (segment.is_mention_of(self_id)
+            && (blank_text
+                || segment.is_mention_of(self_id)
                 || matches!(
                     segment,
                     MessageSegment::Reply(_) | MessageSegment::Image { .. }
@@ -208,16 +256,49 @@ pub fn command_text(event: &OneBotEvent, self_id: i64) -> String {
             continue;
         }
         leading = false;
-        let part = match &segment {
-            MessageSegment::Text(text) => text.clone(),
-            other => segment_display(other),
-        };
+        let part = command_token(segment);
         if !out.is_empty() && !out.ends_with(' ') && !part.starts_with(' ') {
             out.push(' ');
         }
         out.push_str(&part);
     }
     out.trim().to_string()
+}
+
+/// 一条消息解析一次的结果。
+///
+/// 段解析是事件热路径上最贵的一步（每段都要拷一份 `data` 映射出来），而展示文本、命令文本、
+/// 引用编号全都只是它的派生值，所以事件入口解一次、三份结果一路带到命令分发与钩子。
+#[derive(Clone, Debug, Default)]
+pub struct ParsedMessage {
+    /// 原样消息段
+    pub segments: Vec<MessageSegment>,
+    /// 展示文本（各段直接相连）
+    pub text: String,
+    /// 剥掉召唤前缀、用来匹配命令的文本
+    pub command_text: String,
+}
+
+impl ParsedMessage {
+    /// 解析事件携带的消息（`message` 数组段优先，退回 `raw_message` 里的 CQ 码）
+    pub fn parse(event: &OneBotEvent, self_id: i64) -> ParsedMessage {
+        let segments = extract_segments(event);
+        let text = text_of(&segments);
+        let command_text = command_text_of(&segments, self_id);
+        ParsedMessage {
+            segments,
+            text,
+            command_text,
+        }
+    }
+
+    /// 这条消息引用了哪条（reply/quote 段）；`text` 与 `command_text` 里都已剥掉它
+    pub fn quoted(&self) -> Option<i64> {
+        self.segments.iter().find_map(|segment| match segment {
+            MessageSegment::Reply(message_id) => Some(*message_id),
+            _ => None,
+        })
+    }
 }
 
 /// 从 event.message（数组段）或 raw_message（CQ 码）提取消息段
@@ -260,14 +341,14 @@ fn parse_segment(element: &Value) -> Option<MessageSegment> {
                 .to_string(),
         )),
         "at" => parse_at_value(data.get("qq")),
-        "reply" => get_i64(&data, "id")
+        // 引用段：v11 规范叫 reply，NapCat / Lagrange 等新实现会写成 quote，都是同一段
+        "reply" | "quote" => get_i64(&data, "id")
             .or_else(|| str_field("id").and_then(|v| v.parse().ok()))
             .map(MessageSegment::Reply),
-        "image" => Some(MessageSegment::Image {
-            url: str_field("url"),
-            file: str_field("file"),
-            data: None,
-        }),
+        "image" => {
+            let (url, file, data) = media_parts(str_field("url"), str_field("file"));
+            Some(MessageSegment::Image { url, file, data })
+        }
         "face" => Some(MessageSegment::Face(str_field("id").unwrap_or_default())),
         "record" | "voice" => Some(MessageSegment::Record {
             url: str_field("url"),
@@ -303,6 +384,8 @@ fn parse_segment(element: &Value) -> Option<MessageSegment> {
         "forward" | "node" => {
             let content = data
                 .get("content")
+                .or_else(|| data.get("nodes"))
+                .or_else(|| data.get("messages"))
                 .and_then(|v| v.as_array())
                 .map(|nodes| {
                     nodes
@@ -311,22 +394,62 @@ fn parse_segment(element: &Value) -> Option<MessageSegment> {
                         .collect::<Vec<MessageSegment>>()
                 })
                 .unwrap_or_default();
-            if content.is_empty() {
+            // id/flag 是实现端给的转发凭据：NTQQ 系（NapCat / LLOWeb / Lagrange）常只给
+            // id 不给 content，此时段里一个节点都没有。旧实现"没 content 就整段丢弃"，
+            // 于是插件连"这条消息是转发、可以用 get_forward_msg 去取"都看不出来。
+            let id = str_field("id")
+                .or_else(|| str_field("flag"))
+                .unwrap_or_default();
+            if content.is_empty() && id.is_empty() {
                 return None;
             }
+            let messages = if content.is_empty() {
+                Vec::new()
+            } else {
+                vec![ForwardMessage {
+                    name: str_field("name").unwrap_or_default(),
+                    uin: get_i64(&data, "uin").unwrap_or_default(),
+                    content,
+                }]
+            };
             Some(MessageSegment::Forward {
                 title: str_field("title")
                     .or_else(|| str_field("uni"))
                     .unwrap_or_else(|| "转发消息".to_string()),
-                messages: vec![ForwardMessage {
-                    name: str_field("name").unwrap_or_default(),
-                    uin: get_i64(&data, "uin").unwrap_or_default(),
-                    content,
-                }],
+                id,
+                messages,
             })
         }
-        _ => None,
+        // 框架还不认识的段（实现端新版本加的类型）原样留着：整段丢掉的话，
+        // 转发/重发时它就从消息里消失了，插件也看不到"这里还有个东西"
+        _ => Some(MessageSegment::Raw {
+            kind: segment_type.to_string(),
+            data: Value::Object(data.clone()),
+        }),
     }
+}
+
+/// 媒体段的取值槽：实现端把字节直接塞进 `file`（少数塞进 `url`）时写成 `base64://…`，
+/// 既不给本地路径也不给 URL。就地解成字节，免得插件拿到一长串 base64 文本还得自己拆；
+/// 前缀对不上或 Base64 解不动就原样留在槽里，不猜。
+fn media_parts(
+    url: Option<String>,
+    file: Option<String>,
+) -> (Option<String>, Option<String>, Option<Vec<u8>>) {
+    let mut url = url;
+    let mut file = file;
+    let data = take_base64(&mut file).or_else(|| take_base64(&mut url));
+    (url, file, data)
+}
+
+fn take_base64(slot: &mut Option<String>) -> Option<Vec<u8>> {
+    use base64::Engine;
+    let payload = slot.as_deref()?.strip_prefix("base64://")?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(payload)
+        .ok()?;
+    *slot = None;
+    Some(bytes)
 }
 
 /// json/xml 卡片：实现端可能给对象，也可能给一段 JSON 字符串
@@ -424,13 +547,12 @@ pub fn decode_cq_message(raw: &str) -> Vec<MessageSegment> {
                 Some(qq) => qq.parse::<i64>().ok().map(MessageSegment::At),
                 None => None,
             },
-            "image" => Some(MessageSegment::Image {
-                url: text_field("url"),
-                file: text_field("file"),
-                data: None,
-            }),
+            "image" => {
+                let (url, file, data) = media_parts(text_field("url"), text_field("file"));
+                Some(MessageSegment::Image { url, file, data })
+            }
             "face" => Some(MessageSegment::Face(text_field("id").unwrap_or_default())),
-            "reply" => text_field("id")
+            "reply" | "quote" => text_field("id")
                 .and_then(|v| v.parse::<i64>().ok())
                 .map(MessageSegment::Reply),
             "record" => Some(MessageSegment::Record {
@@ -458,12 +580,33 @@ pub fn decode_cq_message(raw: &str) -> Vec<MessageSegment> {
                     .and_then(|v| v.parse::<f64>().ok())
                     .unwrap_or_default(),
             }),
-            "json" | "xml" => card_value(&map).map(|card| {
-                if cq_type == "json" {
-                    MessageSegment::Json(card)
-                } else {
-                    MessageSegment::Xml(card)
-                }
+            "json" | "xml" => {
+                // 卡片正文在 CQ 码里是转义过的（逗号/冒号/右括号写成实体），不还原就先
+                // 让 serde_json 解析失败，插件拿到的是带 &#44; 的坏 JSON 字符串而不是卡片
+                let card = match map.get("data").and_then(|v| v.as_str()) {
+                    Some(raw) => {
+                        let fixed = unescape_cq(raw);
+                        map.insert("data".to_string(), Value::String(fixed));
+                        card_value(&map)
+                    }
+                    None => card_value(&map),
+                };
+                card.map(|card| {
+                    if cq_type == "json" {
+                        MessageSegment::Json(card)
+                    } else {
+                        MessageSegment::Xml(card)
+                    }
+                })
+            }
+            // `[CQ:forward,id=…]`：实现端只给凭据不给节点，解成带 id 的转发段，
+            // 插件才看得出"这是条转发、可以用 get_forward_msg 去取"
+            "forward" => Some(MessageSegment::Forward {
+                title: text_field("brief")
+                    .or_else(|| text_field("title"))
+                    .unwrap_or_else(|| "转发消息".to_string()),
+                id: text_field("id").unwrap_or_default(),
+                messages: Vec::new(),
             }),
             _ => Some(MessageSegment::Text(format!("[CQ:{inner}]"))),
         };
@@ -604,6 +747,7 @@ mod tests {
             MessageSegment::Json(_) => "json",
             MessageSegment::Xml(_) => "xml",
             MessageSegment::Forward { .. } => "forward",
+            MessageSegment::Raw { .. } => "raw",
         }
     }
 
@@ -717,13 +861,31 @@ mod tests {
             segment_to_json(&MessageSegment::Xml(json!({ "msg": 2 }))),
             json!({ "type": "xml", "data": { "data": { "msg": 2 } } })
         );
-        // 合并转发在普通发送接口里不被支持，这里只留占位文本，真发送走 send_forward_msg
+        // 合并转发在普通发送接口里不被支持，有节点内容时只留占位文本，真发送走 send_forward_msg
         assert_eq!(
             segment_to_json(&MessageSegment::Forward {
                 title: "十连".into(),
+                id: String::new(),
                 messages: vec![],
             }),
             json!({ "type": "text", "data": { "text": "[合并转发:十连]" } })
+        );
+        // 只有凭据没有节点的转发段按原样回 forward/id：实现端认这个写法，可以整份转发出去
+        assert_eq!(
+            segment_to_json(&MessageSegment::Forward {
+                title: "十连".into(),
+                id: "F1234".into(),
+                messages: vec![],
+            }),
+            json!({ "type": "forward", "data": { "id": "F1234" } })
+        );
+        // 不认识的段按 kind + data 原样拼回去，不会因为框架不认识就从天上消失
+        assert_eq!(
+            segment_to_json(&MessageSegment::Raw {
+                kind: "markdown".into(),
+                data: json!({ "content": "# 标题" }),
+            }),
+            json!({ "type": "markdown", "data": { "content": "# 标题" } })
         );
     }
 
@@ -770,10 +932,14 @@ mod tests {
             names,
             vec![
                 "text", "at_all", "at", "reply", "face", "record", "video", "file", "poke",
-                "location", "json"
+                "location", "json", "raw"
             ],
-            "未知段应被丢弃、其余段全部还原：{segments:?}"
+            "未知段应原样留成 raw、其余段全部还原：{segments:?}"
         );
+        assert!(matches!(
+            &segments[11],
+            MessageSegment::Raw { kind, .. } if kind == "unknown-type"
+        ));
         assert!(matches!(&segments[3], MessageSegment::Reply(123)));
         assert!(matches!(
             &segments[5],
@@ -818,14 +984,124 @@ mod tests {
             },
         ]));
         let segments = extract_segments(&event);
-        let MessageSegment::Forward { title, messages } = &segments[1] else {
+        let MessageSegment::Forward {
+            title,
+            id,
+            messages,
+        } = &segments[1]
+        else {
             panic!("应为合并转发段：{segments:?}");
         };
         assert_eq!(title, "聊天记录");
+        assert_eq!(id, "");
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].name, "老师");
         assert_eq!(messages[0].uin, 20002);
         assert!(matches!(&messages[0].content[1], MessageSegment::At(30003)));
+    }
+
+    /// 实现端只给凭据（NTQQ 系的常态）：段必须留下，否则插件连"这是条转发"都不知道
+    #[test]
+    fn forward_id_without_content_is_kept() {
+        let event = message_event(json!([
+            { "type": "forward", "data": { "id": "F-42", "title": "群聊的聊天记录" } },
+        ]));
+        let segments = extract_segments(&event);
+        let MessageSegment::Forward {
+            title,
+            id,
+            messages,
+        } = &segments[0]
+        else {
+            panic!("应为合并转发段：{segments:?}");
+        };
+        assert_eq!(id, "F-42");
+        assert_eq!(title, "群聊的聊天记录");
+        assert!(messages.is_empty());
+
+        // CQ 码写法同样还原成带 id 的转发段
+        let decoded = decode_cq_message("[CQ:forward,id=F-42]");
+        let MessageSegment::Forward { id, .. } = &decoded[0] else {
+            panic!("应解出转发段：{decoded:?}");
+        };
+        assert_eq!(id, "F-42");
+    }
+
+    /// 未知类型不再被丢掉：原样留成 Raw，转发/重发时按 kind + data 拼回去
+    #[test]
+    fn unknown_segment_kinds_survive_as_raw() {
+        let event = message_event(json!([
+            { "type": "markdown", "data": { "content": "# 标题" } },
+            { "type": "text", "data": { "text": "正文" } },
+        ]));
+        let segments = extract_segments(&event);
+        assert_eq!(segments.len(), 2);
+        let MessageSegment::Raw { kind, data } = &segments[0] else {
+            panic!("应为原样保留段：{segments:?}");
+        };
+        assert_eq!(kind, "markdown");
+        assert_eq!(data["content"], "# 标题");
+        assert_eq!(
+            segment_to_json(&segments[0]),
+            json!({ "type": "markdown", "data": { "content": "# 标题" } })
+        );
+    }
+
+    /// `file=base64://…` 就地解成字节：这类实现端既不给路径也不给 URL
+    #[test]
+    fn base64_media_decodes_into_image_bytes() {
+        let event = message_event(json!([
+            { "type": "image", "data": { "file": "base64:///9g=" } },
+        ]));
+        let segments = extract_segments(&event);
+        let MessageSegment::Image { url, file, data } = &segments[0] else {
+            panic!("应为图片段：{segments:?}");
+        };
+        assert!(url.is_none() && file.is_none(), "url={url:?} file={file:?}");
+        assert_eq!(data.as_deref(), Some(&[0xFF, 0xD8][..]));
+
+        // 解不动的字符串原样留在 file 槽，不猜成字节
+        let event = message_event(json!([
+            { "type": "image", "data": { "file": "base64://@@@" } },
+        ]));
+        let segments = extract_segments(&event);
+        let MessageSegment::Image { file, data, .. } = &segments[0] else {
+            panic!("应为图片段：{segments:?}");
+        };
+        assert!(data.is_none());
+        assert_eq!(file.as_deref(), Some("base64://@@@"));
+    }
+
+    /// 实现端把引用段写成 `quote` 的也有（NapCat / Lagrange），要和 `reply` 认成同一段
+    #[test]
+    fn quote_segment_alias_decodes_as_reply() {
+        let event = message_event(json!([
+            { "type": "quote", "data": { "id": 12 } },
+            { "type": "text", "data": { "text": "/查日志" } },
+        ]));
+        let segments = extract_segments(&event);
+        assert!(
+            matches!(&segments[0], MessageSegment::Reply(12)),
+            "应解成引用段：{segments:?}"
+        );
+        assert_eq!(command_text(&event, 10001), "/查日志");
+        let decoded = decode_cq_message("[CQ:quote,id=12]你好");
+        assert!(
+            matches!(&decoded[0], MessageSegment::Reply(12)),
+            "CQ 写法也应解成引用段：{decoded:?}"
+        );
+    }
+
+    /// CQ 卡片里的转义必须还原，否则插件拿到的 JSON 带着一串实体码解析不了
+    #[test]
+    fn cq_card_unescapes_its_payload() {
+        let decoded =
+            decode_cq_message("[CQ:json,data={\"app\":\"node\"&#44;\"text\":\"a&#44;b&#58;c\"}]");
+        let MessageSegment::Json(card) = &decoded[0] else {
+            panic!("应为 json 卡片：{decoded:?}");
+        };
+        assert_eq!(card["app"], "node");
+        assert_eq!(card["text"], "a,b:c");
     }
 
     #[test]
@@ -837,6 +1113,27 @@ mod tests {
         let segments = extract_segments(&event);
         assert_eq!(segments.len(), 1);
         assert!(matches!(&segments[0], MessageSegment::Text(text) if text == "还在"));
+    }
+
+    /// 事件入口改成一次性解析后，日志、命令匹配与钩子必须看到同一份东西：
+    /// `ParsedMessage` 的三个字段与三个单用入口逐字相等
+    #[test]
+    fn parse_message_agrees_with_the_single_shot_helpers() {
+        let event = message_event(json!([
+            { "type": "reply", "data": { "id": 501 } },
+            { "type": "at", "data": { "qq": 10001 } },
+            { "type": "text", "data": { "text": "/单抽" } },
+            { "type": "image", "data": { "url": "https://x/a.png" } },
+        ]));
+        let parsed = ParsedMessage::parse(&event, 10001);
+        assert_eq!(parsed.text, extract_text(&event));
+        assert_eq!(parsed.command_text, command_text(&event, 10001));
+        assert_eq!(parsed.command_text, "/单抽 [image]");
+        let again = extract_segments(&event);
+        assert_eq!(parsed.segments.len(), again.len());
+        assert_eq!(format!("{:?}", parsed.segments), format!("{:?}", again));
+        // 引用段被 command_text 剥掉了，编号只能从段里取
+        assert_eq!(parsed.quoted(), Some(501));
     }
 
     #[test]
@@ -863,7 +1160,9 @@ mod tests {
             { "type": "text", "data": { "text": "抽到了" } },
             { "type": "face", "data": { "id": 1 } },
         ]));
-        assert_eq!(command_text(&event, 10001), "@20002 抽到了 [表情 [1]]");
+        // 非文本段用紧凑占位（不是日志里那种带整条 URL/中文名的观感串），
+        // 免得展示串里的空格把首词切坏、命令表查不中
+        assert_eq!(command_text(&event, 10001), "@20002 抽到了 [face:1]");
     }
 
     #[test]
@@ -877,12 +1176,21 @@ mod tests {
         ]));
         assert_eq!(command_text(&event, 10001), "/查日志");
 
-        // 夹在中间的引用不是前缀，保留为展示文本
+        // 夹在中间的引用不是前缀，保留为紧凑占位
         let event = message_event(json!([
             { "type": "text", "data": { "text": "a" } },
             { "type": "reply", "data": { "id": 5 } },
         ]));
-        assert_eq!(command_text(&event, 10001), "a [回复 5]");
+        assert_eq!(command_text(&event, 10001), "a [reply]");
+
+        // 部分实现端在 @机器人 前面先塞一个纯空白文本段：它不算"正文开始"，
+        // 否则 leading 被它关掉，紧跟其后的 @机器人 就当成正文混进首词了
+        let event = message_event(json!([
+            { "type": "text", "data": { "text": " " } },
+            { "type": "at", "data": { "qq": 10001 } },
+            { "type": "text", "data": { "text": "/查日志" } },
+        ]));
+        assert_eq!(command_text(&event, 10001), "/查日志");
     }
 
     #[test]

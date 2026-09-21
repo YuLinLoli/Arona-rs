@@ -30,6 +30,21 @@ use std::sync::atomic::{AtomicI32, Ordering};
 /// `data/bluearchive/`），`disabled_plugins` 里也写它。改名等于换一份用户数据，别动。
 pub(crate) const PLUGIN_ID: &str = "bluearchive";
 
+/// 定时任务体里起异步活儿：走本插件的作用域，而不是裸 `tokio::spawn`。
+/// 那样框架才能在插件被停用时取消它，它的日志也才认得出是谁打的。
+/// `action` 是这一步在干什么（`定时推送`、`活动预警`…），日志前缀会细化成 `[插件名:动作]`。
+pub(crate) fn in_scope<F>(action: &str, task: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    match arona::plugin::scope_of(PLUGIN_ID) {
+        Some(scope) => {
+            scope.spawn_as(action, task);
+        }
+        None => arona::runtime::log::warning("本插件尚未装配，后台任务本次跳过"),
+    }
+}
+
 /// 本插件的数据目录（data/bluearchive：数据库与备份都在这）
 pub(crate) fn data_dir() -> PathBuf {
     arona::runtime::paths::plugin_data_dir(PLUGIN_ID)
@@ -178,8 +193,7 @@ impl AronaPlugin for BluearchivePlugin {
     fn configure(&self, ctx: &PluginContext) -> Result<(), String> {
         // 把本插件的全部命令与兜底登记进框架的命令表（内部会注册全部服务）
         standalone::dispatcher::register(ctx, ctx.onebot_config.clone());
-        // 聊天记录钩子 + 清理任务：引用还原要靠它，旧消息在协议层已经引用不到了
-        standalone::history::install(ctx);
+        // 聊天记录的记账/保留期/清理已在框架侧（arona::runtime::chatlog），插件不再自己挂钩子
 
         // --test-notify：20 秒后完整跑一次每日推送，便于联调验证
         if ctx.test_notify {
@@ -188,7 +202,7 @@ impl AronaPlugin for BluearchivePlugin {
                 20,
                 "TestNotify",
                 Arc::new(move || {
-                    context.spawn(async {
+                    context.spawn_as("测试推送", async {
                         activity::notify::push(false).await;
                     });
                 }),
@@ -209,10 +223,10 @@ impl AronaPlugin for BluearchivePlugin {
 
         // 后台预热：kivo 学生数据 + 启动刷新本地资源图片（活动日历图 / 塔罗图）。
         // 走 ctx.spawn 而不是裸 tokio::spawn：插件被停用时框架要能取消它们。
-        ctx.spawn(async move {
+        ctx.spawn_as("预热学生数据", async move {
             data::kivo::init().await;
         });
-        ctx.spawn(async move {
+        ctx.spawn_as("刷新图片", async move {
             standalone::commands::activity::refresh_all_images().await;
             standalone::commands::tarot::download_all_images().await;
         });
@@ -227,7 +241,7 @@ impl AronaPlugin for BluearchivePlugin {
         Ok(())
     }
 
-    fn on_config_reload(&self, ctx: &PluginContext) {
+    fn on_config_reload(&self, _ctx: &PluginContext) {
         // 框架在每次热重载/写入后都会回调这里；只有推送小时真的变了才重建每日任务。
         let hour = config::notify().every_day_hour.clamp(0, 23);
         let previous = LAST_NOTIFY_HOUR.swap(hour, Ordering::SeqCst);
@@ -236,8 +250,7 @@ impl AronaPlugin for BluearchivePlugin {
             activity::notify::enable_daily_job(hour as u32);
             arona::runtime::log::info(format!("推送小时变更，重建每日任务: 每天 {hour} 点"));
         }
-        // 聊天记录的保留期/清理间隔与开关也在这里校准（内部只在真的变了才重建任务）
-        standalone::history::on_config_reload(ctx);
+        // 聊天记录的保留期与清理间隔由框架按 arona.yml 的 chatlog 段自己校准
     }
 
     fn stop(&self, _ctx: &PluginContext) {

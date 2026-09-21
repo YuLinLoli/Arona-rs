@@ -2,9 +2,10 @@
 //!
 //! 原版独立模式对标准输出/错误流做统一染色，判定顺序与优先级完全一致：
 //! 1. 以 `[Arona` / `[OneBot` 开头的行                     -> 亮绿（优先，即使含 WARNING）
-//! 2. 含 `WARNING:` / `WARNING：` / `SLF4J`，
+//! 2. 前缀是某个插件的显示名（`[BluearchivePlugin] …`）    -> 淡紫
+//! 3. 含 `WARNING:` / `WARNING：` / `SLF4J`，
 //!    或含被空白包裹的 `INFO|DEBUG|WARN|ERROR|TRACE`       -> 亮黄
-//! 3. 其它行                                              -> 原样
+//! 4. 其它行                                              -> 原样
 //!
 //! 与原版「无条件输出 ANSI 转义码」不同：Windows 控制台默认改用原生 API
 //! `SetConsoleTextAttribute`，因此 cmd.exe(经典 conhost)、PowerShell、Windows Terminal
@@ -17,12 +18,14 @@
 
 use once_cell::sync::OnceCell;
 
-/// 控制台颜色（与原版 ANSI 色一致：亮绿 92 / 亮黄 93 / 普通黄 33）
+/// 控制台颜色（与原版 ANSI 色一致：亮绿 92 / 亮黄 93 / 普通黄 33；插件日志另用淡紫 95）
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Color {
     BrightGreen,
     BrightYellow,
     Yellow,
+    /// 插件打的日志（`[插件名] …`）：和框架的亮绿一眼分得开
+    BrightMagenta,
 }
 
 impl Color {
@@ -32,12 +35,14 @@ impl Color {
             Color::BrightGreen => "\u{1b}[92m",
             Color::BrightYellow => "\u{1b}[93m",
             Color::Yellow => "\u{1b}[33m",
+            Color::BrightMagenta => "\u{1b}[95m",
         }
     }
 
     /// Windows 控制台属性（SetConsoleTextAttribute）
     #[cfg(windows)]
     fn win_attribute(self) -> u16 {
+        const BLUE: u16 = 0x0001;
         const GREEN: u16 = 0x0002;
         const RED: u16 = 0x0004;
         const INTENSITY: u16 = 0x0008;
@@ -45,6 +50,7 @@ impl Color {
             Color::BrightGreen => GREEN | INTENSITY,
             Color::BrightYellow => RED | GREEN | INTENSITY,
             Color::Yellow => RED | GREEN,
+            Color::BrightMagenta => RED | BLUE | INTENSITY,
         }
     }
 }
@@ -175,7 +181,7 @@ fn force_color_env() -> bool {
     )
 }
 
-/// 判定一行文本对应的颜色（复刻原版 `ColoredPrintStream.colorize` 的判定顺序）
+/// 判定一行文本对应的颜色（复刻原版 `ColoredPrintStream.colorize` 的判定顺序，另加插件淡紫一档）
 pub fn color_for_line(line: &str) -> Option<Color> {
     if line.is_empty() {
         return None;
@@ -184,10 +190,22 @@ pub fn color_for_line(line: &str) -> Option<Color> {
     if line.starts_with("[Arona") || line.starts_with("[OneBot") {
         return Some(Color::BrightGreen);
     }
+    // [BluearchivePlugin] 一类：插件自己的日志淡紫，跟框架的亮绿区分开
+    if source_of(line).is_some_and(crate::plugin::is_plugin_name) {
+        return Some(Color::BrightMagenta);
+    }
     if is_warning_line(line) {
         return Some(Color::BrightYellow);
     }
     None
+}
+
+/// 取出行首 `[…]` 里的来源名（`[Arona] xxx` -> `Some("Arona")`），没有前缀时 None。
+/// 只取第一个冒号之前：插件日志细化成 `[插件名:动作]` 后仍要认得插件名。
+fn source_of(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix('[')?;
+    let source = rest.split_once(']')?.0;
+    Some(source.split(':').next().unwrap_or(source))
 }
 
 /// WARNING:xxx（中英文冒号）/ SLF4J / SLF4J 级别标记（原版正则 `\s(INFO|DEBUG|WARN|ERROR|TRACE)\s`）
@@ -561,6 +579,26 @@ mod tests {
         assert_eq!(Color::BrightGreen.ansi(), "\u{1b}[92m");
         assert_eq!(Color::BrightYellow.ansi(), "\u{1b}[93m");
         assert_eq!(Color::Yellow.ansi(), "\u{1b}[33m");
+        assert_eq!(Color::BrightMagenta.ansi(), "\u{1b}[95m");
         assert_eq!(RESET, "\u{1b}[0m");
+    }
+
+    #[test]
+    fn log_source_is_read_out_of_the_prefix() {
+        // 插件日志按这个前缀去查已登记的显示名，命中才染淡紫
+        assert_eq!(
+            source_of("[BluearchivePlugin] 活动推送已启用"),
+            Some("BluearchivePlugin")
+        );
+        assert_eq!(source_of("[Arona] hello"), Some("Arona"));
+        // 细化到动作后仍要认得插件名，否则淡紫配色会跟着丢
+        assert_eq!(
+            source_of("[BluearchivePlugin:定时推送] 开始推送"),
+            Some("BluearchivePlugin")
+        );
+        assert_eq!(source_of("plain line"), None);
+        assert_eq!(source_of("[没有闭合的括号"), None);
+        // 三方库的日志目标不是插件名，不该被当成插件日志
+        assert_eq!(color_for_line("[wgpu_core::instance] Adapter"), None);
     }
 }

@@ -6,6 +6,7 @@
 //!   config/arona.yml          框架配置（授权 / 黑名单 / 分群 / 禁用插件）
 //!   config/onebot.yml         OneBot 连接配置
 //!   config/<插件>/arona.yml   某个插件自己的配置（如 config/bluearchive/arona.yml）
+//!   data/arona/               框架自己的数据（聊天记录缓存 chatlog.db）
 //!   data/<插件>/…             某个插件自己的数据（如 data/bluearchive/image、arona.db）
 //!   logs/                     按天滚动的日志与 startup-error.log
 //!   plugins/<插件>/           某个插件的目录（清单 plugin.yml 与随包资源）
@@ -107,6 +108,19 @@ pub fn gui_preference_file() -> PathBuf {
 }
 
 // ==================== 插件目录接口 ====================
+
+/// 框架自己的数据目录（data/arona）：聊天记录缓存等框架级存储放这里，
+/// 与插件的 data/<插件>/ 分开，删插件不会带走框架的数据，反之亦然
+pub fn framework_data_dir() -> PathBuf {
+    let dir = data_root().join("arona");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+/// 框架侧聊天记录库（data/arona/chatlog.db）
+pub fn chatlog_file() -> PathBuf {
+    framework_data_dir().join("chatlog.db")
+}
 
 /// 某个插件的目录（plugins/<id>，放清单与随包资源）
 pub fn plugin_dir(plugin: &str) -> PathBuf {

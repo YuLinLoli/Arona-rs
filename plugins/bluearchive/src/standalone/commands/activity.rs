@@ -166,7 +166,7 @@ pub fn enable_image_refresh_job() {
         "AronaActivityImageRefreshDaily",
         crate::PLUGIN_ID,
         Arc::new(|| {
-            tokio::spawn(async move {
+            crate::in_scope("刷新活动图", async move {
                 refresh_all_images().await;
             });
         }),

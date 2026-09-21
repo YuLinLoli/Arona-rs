@@ -95,6 +95,11 @@ impl ManagedPlugin {
         self.meta.id
     }
 
+    /// 本插件的后台任务作用域（给 [`crate::plugin::scope_of`] 用）
+    pub(crate) fn scope_handle(&self) -> Arc<PluginScope> {
+        self.scope.clone()
+    }
+
     pub fn loader(&self) -> &'static str {
         self.loader
     }
@@ -355,7 +360,8 @@ impl PluginManager {
                 continue;
             }
             let registrar = PluginRegistrar::new(plugin.id(), &framework);
-            if let Err(reason) = plugin.instance.install(&registrar) {
+            let outcome = guarded_call(&plugin, "登记", || plugin.instance.install(&registrar));
+            if let Err(reason) = outcome {
                 self.fail(&plugin, reason, &mut failures);
                 continue;
             }
@@ -418,9 +424,8 @@ impl PluginManager {
             &self.framework(),
         );
         plugin.attach_context(context.clone());
-        plugin
-            .instance
-            .configure(&context)
+        let outcome = guarded_call(plugin, "装配", || plugin.instance.configure(&context));
+        outcome
             .map(|_| plugin.set_state(PluginState::Ready))
             .inspect_err(|reason| {
                 self.revoke(plugin);
@@ -435,7 +440,7 @@ impl PluginManager {
             plugin.set_state(PluginState::Failed(reason.clone()));
             return Err(reason);
         };
-        match plugin.instance.start(&context) {
+        match guarded_call(plugin, "启动", || plugin.instance.start(&context)) {
             Ok(()) => {
                 plugin.set_state(PluginState::Active);
                 log::info(format!(
@@ -473,7 +478,7 @@ impl PluginManager {
     pub fn disable(&self, plugin: &Arc<ManagedPlugin>) {
         if plugin.state().is_running() {
             if let Some(context) = plugin.context() {
-                plugin.instance.stop(&context);
+                guard_void(plugin, "停用", || plugin.instance.stop(&context));
             }
         }
         self.revoke(plugin);
@@ -548,7 +553,9 @@ impl PluginManager {
                 continue;
             }
             if let Some(context) = plugin.context() {
-                plugin.instance.on_config_reload(&context);
+                guard_void(plugin, "配置重载", || {
+                    plugin.instance.on_config_reload(&context)
+                });
             }
         }
     }
@@ -558,7 +565,7 @@ impl PluginManager {
         for plugin in self.ordered().iter().rev() {
             if plugin.state().is_running() {
                 if let Some(context) = plugin.context() {
-                    plugin.instance.stop(&context);
+                    guard_void(plugin, "停用", || plugin.instance.stop(&context));
                 }
             }
             self.revoke(plugin);
@@ -600,6 +607,38 @@ impl PluginManager {
                 "已回收插件 {id} 的资源: 后台任务 {tasks} / 定时任务 {jobs} / 事件订阅 {hooks} / 共享能力 {services} / 服务开关 {boards}"
             ));
         }
+    }
+}
+
+/// 跑一个有返回值的同步生命周期回调（install/configure/start）。
+///
+/// 插件代码是外来的，panic 不许掀翻宿主，也不许让框架跳过后续的回收：
+/// panic 一律折算成该阶段的失败原因，走调用方已有的 `revoke` + `Failed` 分支。
+/// 顺带把日志来源切成 `[插件名:阶段]`——插件里打的日志不该顶着 `[Arona]` 分不清是谁。
+fn guarded_call(
+    plugin: &Arc<ManagedPlugin>,
+    site: &str,
+    f: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    crate::runtime::log::with_source(&crate::plugin::log_source(plugin.id(), site), || {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
+            .unwrap_or_else(|_| Err(format!("在{site}阶段 panic（已被框架隔离，栈见上方日志）")))
+    })
+}
+
+/// 跑一个无返回值的同步生命周期回调（stop/on_config_reload）：
+/// panic 只记日志，绝不中断框架后续的回收流程。
+fn guard_void(plugin: &Arc<ManagedPlugin>, site: &str, f: impl FnOnce()) {
+    let panicked =
+        crate::runtime::log::with_source(&crate::plugin::log_source(plugin.id(), site), || {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_err()
+        });
+    if panicked {
+        // 这句是框架自己的隔离声明，所以打在来源作用域之外，仍挂 [Arona]
+        log::error(format!(
+            "插件 {} 在{site}阶段 panic（已被框架隔离，流程继续，栈见上方日志）",
+            plugin.meta().name
+        ));
     }
 }
 

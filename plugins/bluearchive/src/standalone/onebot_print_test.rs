@@ -83,6 +83,7 @@ async fn group_message_is_logged_immediately_over_ws_forward() {
     // 这条用例只关心「收到消息先打印」的时序，不需要任何命令
     let business = Arc::new(StandaloneBusinessHandler::new(
         config.clone(),
+        arona::framework::Framework::global_arc(),
         Arc::new(arona::runtime::dispatcher::CommandDispatcher::new()),
         registry.clone(),
     ));

@@ -32,8 +32,10 @@ use crate::services::ServiceManager;
 use std::sync::{Arc, OnceLock};
 
 /// 一套插件契约注册表。字段都是 `Arc`，克隆实例引用即可传给上下文。
+/// 进程默认实例（`Framework::global` / `global_arc` 共用同一份）
+static GLOBAL: OnceLock<Arc<Framework>> = OnceLock::new();
+
 pub struct Framework {
-    options: FrameworkOptions,
     gating: Arc<Gating>,
     commands: Arc<CommandRegistry>,
     hooks: Arc<HookRegistry>,
@@ -54,6 +56,10 @@ pub struct FrameworkOptions {
     pub panic_disable_threshold: u32,
     /// 没有显式声明 `with_prefix_match` 的命令，是否也允许最短前缀匹配（默认关）
     pub prefix_match_by_default: bool,
+    /// 命令名允许的写法前缀。**只影响登记之后的规范化**：不带其中任何一个前缀的命令名，
+    /// 登记时会被补上列表里的第一个（`"arona"` → `"/arona"`），于是"arona 好可爱"这种
+    /// 日常句子不再被当成命令。设为空列表 = 关掉这条规则（纯聊天式命令）。
+    pub command_prefixes: Vec<String>,
 }
 
 impl Default for FrameworkOptions {
@@ -61,6 +67,7 @@ impl Default for FrameworkOptions {
         FrameworkOptions {
             panic_disable_threshold: Framework::DEFAULT_PANIC_THRESHOLD,
             prefix_match_by_default: false,
+            command_prefixes: vec![Framework::DEFAULT_COMMAND_PREFIX.to_string()],
         }
     }
 }
@@ -83,6 +90,15 @@ impl FrameworkBuilder {
         self
     }
 
+    /// 设定命令名的写法前缀（第一个用于自动补全；空列表表示不做前缀规范化）
+    pub fn command_prefixes(
+        mut self,
+        prefixes: impl IntoIterator<Item = impl Into<String>>,
+    ) -> FrameworkBuilder {
+        self.options.command_prefixes = prefixes.into_iter().map(Into::into).collect();
+        self
+    }
+
     pub fn build(self) -> Arc<Framework> {
         Framework::with_options(self.options)
     }
@@ -91,6 +107,9 @@ impl FrameworkBuilder {
 impl Framework {
     /// 插件连续 panic 多少次就隔离停用
     pub const DEFAULT_PANIC_THRESHOLD: u32 = 5;
+
+    /// 命令名的默认写法前缀
+    pub const DEFAULT_COMMAND_PREFIX: &'static str = "/";
 
     /// 新建一套完全隔离的注册表（测试/多实例宿主用）
     pub fn new() -> Arc<Framework> {
@@ -107,13 +126,14 @@ impl Framework {
             gating.clone(),
         ));
         let prefix_match_by_default = options.prefix_match_by_default;
+        let command_prefixes = options.command_prefixes.clone();
         let framework = Arc::new(Framework {
-            options,
             gating: gating.clone(),
             commands: Arc::new(CommandRegistry::new(
                 gating.clone(),
                 health.clone(),
                 prefix_match_by_default,
+                command_prefixes,
             )),
             hooks: Arc::new(HookRegistry::new(gating.clone(), health.clone())),
             container: Arc::new(ServiceContainer::new(gating.clone())),
@@ -129,6 +149,8 @@ impl Framework {
         // 它们先于 Framework 造出来，所以构造完再回填一次。
         plugins.attach(&framework);
         health.attach(&framework);
+        // 定时任务表同理：处理器 panic 时要记到归属插件名下，而不是让调度循环静默消失
+        framework.jobs().attach(&framework);
         framework
     }
 
@@ -141,8 +163,12 @@ impl Framework {
 
     /// 进程默认实例
     pub fn global() -> &'static Framework {
-        static FRAMEWORK: OnceLock<Arc<Framework>> = OnceLock::new();
-        FRAMEWORK.get_or_init(Framework::new)
+        GLOBAL.get_or_init(Framework::new)
+    }
+
+    /// 进程默认实例的 owned 句柄：要给别的对象长期持有、又不想拖 `'static` 生命周期时用
+    pub fn global_arc() -> Arc<Framework> {
+        GLOBAL.get_or_init(Framework::new).clone()
     }
 
     /// 本实例是否就是进程默认实例（只有它可以写进程级的配置文件）
@@ -150,9 +176,24 @@ impl Framework {
         std::ptr::eq(self, Framework::global())
     }
 
-    /// 本实例的构造选项
-    pub fn options(&self) -> &FrameworkOptions {
-        &self.options
+    /// 本实例当前的选项快照。
+    /// 值是从各注册表的活状态读出来的——构造完之后再改（arona.yml 热重载）也不会读到旧副本。
+    pub fn options(&self) -> FrameworkOptions {
+        FrameworkOptions {
+            panic_disable_threshold: self.health.threshold(),
+            prefix_match_by_default: self.commands.prefix_match_by_default(),
+            command_prefixes: self.commands.command_prefixes(),
+        }
+    }
+
+    /// 设定 panic 隔离阈值（0 表示只记日志、不因 panic 停用插件）
+    pub fn set_panic_disable_threshold(&self, threshold: u32) {
+        self.health.set_threshold(threshold);
+    }
+
+    /// 设定「未显式声明的命令也允许最短前缀匹配」
+    pub fn set_prefix_match_by_default(&self, enabled: bool) {
+        self.commands.set_prefix_match_by_default(enabled);
     }
 
     /// panic 记账与隔离停用判定

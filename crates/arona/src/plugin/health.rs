@@ -1,10 +1,18 @@
 //! 插件健康度与 panic 隔离（对应 mirai 的 `broadcastAndDumpInterceptedExceptions`）
 //!
 //! 插件代码是外来的：它可能 panic。改造前一条钩子 panic 会让本次广播的后续钩子、
-//! 乃至整条消息的命令分发一起丢掉，而且日志里只有一句裸 panic。现在每个入口都过
-//! [`guarded`]：panic 被吞下并记在**归属插件**名下，其余处理器照常跑；
-//! 同一插件连续 panic 到阈值（[`crate::framework::FrameworkOptions::panic_disable_threshold`]）
-//! 时由框架把它隔离停用，不再让它继续捣乱。
+//! 乃至整条消息的命令分发一起丢掉，而且日志里只有一句裸 panic。现在插件的每个入口
+//! 都被框架兜住，panic 记在**归属插件**名下，其余处理器照常跑；同一插件连续 panic
+//! 到阈值（[`crate::framework::FrameworkOptions::panic_disable_threshold`]）时由框架
+//! 把它隔离停用，不再让它继续捣乱。
+//!
+//! 兜法按入口形态分三处，记账统一走这张 [`HealthBoard`]：
+//! - [`guarded`]：异步入口 —— 命令处理器与命令兜底（`runtime::dispatcher`）、
+//!   入站事件钩子与出站钩子（`onebot::hooks`）
+//! - `plugin::manager` 的 `guarded_call` / `guard_void`：同步生命周期回调。
+//!   install/configure/start 的 panic 折算成该阶段失败并走回收；stop/on_config_reload
+//!   只记日志，绝不中断框架后续的回收流程
+//! - `quartz` 的 `TaskEntry::invoke`：定时任务 panic 只跳过本次，继续按表调度
 use crate::framework::Framework;
 use crate::runtime::config::Gating;
 use crate::runtime::message::BoxFuture;
@@ -18,12 +26,15 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 ///
 /// 用 `poll_fn` 手写而不是 `futures::FutureExt::catch_unwind`，是因为后者的
 /// `Self: UnwindSafe` 约束对 `Pin<Box<dyn Future + Send>>` 这种 trait object 不成立。
-pub async fn guarded<'a, T>(future: BoxFuture<'a, T>) -> Option<T>
+/// 每次 poll 都把日志来源切成 `[插件名:动作]`：插件处理器里打的日志因此说得出是谁、
+/// 在干哪件事，而不是和框架日志混成一片 `[Arona]`。
+pub async fn guarded<'a, T>(plugin: &str, action: &str, future: BoxFuture<'a, T>) -> Option<T>
 where
     T: Send + 'static,
 {
     use std::task::Poll;
 
+    let source = crate::plugin::log_source(plugin, action);
     let mut pending = Some(future);
     poll_fn(|context| {
         let Some(pinned) = pending.as_mut() else {
@@ -32,7 +43,9 @@ where
         };
         // 这里的 AssertUnwindSafe 是安全的：panic 之后这个半路断掉的 future 会被直接丢弃，
         // 我们再也不会去 poll 它
-        match std::panic::catch_unwind(AssertUnwindSafe(|| pinned.as_mut().poll(context))) {
+        match crate::runtime::log::with_source(&source, || {
+            std::panic::catch_unwind(AssertUnwindSafe(|| pinned.as_mut().poll(context)))
+        }) {
             Ok(Poll::Ready(value)) => Poll::Ready(Some(value)),
             Ok(Poll::Pending) => Poll::Pending,
             Err(_) => Poll::Ready(None),

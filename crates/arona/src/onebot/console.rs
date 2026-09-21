@@ -114,6 +114,16 @@ fn sender_name(event: &OneBotEvent) -> String {
 }
 
 pub fn format_message(self_id: i64, event: &OneBotEvent, group_name: Option<&str>) -> String {
+    format_message_text(self_id, event, group_name, &protocol::extract_text(event))
+}
+
+/// 已经解析过消息段的调用方（事件入口）走这条：文本现成，不必为打印再解一遍段
+pub fn format_message_text(
+    self_id: i64,
+    event: &OneBotEvent,
+    group_name: Option<&str>,
+    text: &str,
+) -> String {
     let sender = format!(
         "{}({})",
         sender_name(event),
@@ -122,7 +132,6 @@ pub fn format_message(self_id: i64, event: &OneBotEvent, group_name: Option<&str
             .map(|v| v.to_string())
             .unwrap_or_else(|| "?".to_string())
     );
-    let text = protocol::extract_text(event);
     let line = if event.message_type.as_deref() == Some("group") && event.group_id.is_some() {
         let group_id = event.group_id.unwrap();
         let group = group_name
@@ -137,7 +146,12 @@ pub fn format_message(self_id: i64, event: &OneBotEvent, group_name: Option<&str
 }
 
 pub fn print_message(self_id: i64, event: &OneBotEvent, group_name: Option<&str>) {
-    color::print_rule_line(&format_message(self_id, event, group_name));
+    print_message_text(self_id, event, group_name, &protocol::extract_text(event));
+}
+
+/// 同 [`print_message`]，但文本由调用方提供（同一条事件只解一次消息段）
+pub fn print_message_text(self_id: i64, event: &OneBotEvent, group_name: Option<&str>, text: &str) {
+    color::print_rule_line(&format_message_text(self_id, event, group_name, text));
 }
 
 fn format_segment(segment: &MessageSegment) -> String {
@@ -154,7 +168,11 @@ fn format_segment(segment: &MessageSegment) -> String {
         MessageSegment::Location { name, .. } => format!("[location:{name}]"),
         MessageSegment::Json(_) => "[json]".to_string(),
         MessageSegment::Xml(_) => "[xml]".to_string(),
+        MessageSegment::Forward { title, id, .. } if !id.is_empty() => {
+            format!("[合并转发:{title}(id={id})]")
+        }
         MessageSegment::Forward { title, .. } => format!("[合并转发:{title}]"),
+        MessageSegment::Raw { kind, .. } => format!("[{kind}]"),
         MessageSegment::Image { url, file, data } => {
             if data.is_some() {
                 "[arona:image,url=base64://...]".to_string()

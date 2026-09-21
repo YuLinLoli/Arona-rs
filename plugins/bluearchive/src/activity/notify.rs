@@ -35,7 +35,7 @@ pub fn enable_daily_job(hour: u32) {
         "StandaloneActivityNotify",
         crate::PLUGIN_ID,
         Arc::new(|| {
-            tokio::spawn(async move {
+            crate::in_scope("定时推送", async move {
                 push(false).await;
             });
         }),
@@ -47,7 +47,7 @@ pub fn enable_daily_job(hour: u32) {
             "StandaloneActivityNotifyInit",
             crate::PLUGIN_ID,
             Arc::new(|| {
-                tokio::spawn(async move {
+                crate::in_scope("预警调度", async move {
                     push(true).await;
                 });
             }),
@@ -123,9 +123,11 @@ async fn push_server(server: ServerLocale, prefix: &str, targets: &[i64]) {
         }
     };
     for &group_id in targets {
-        let receipt =
-            arona::runtime::services::send_message(MessageTarget::Group(group_id), message.clone())
-                .await;
+        let receipt = arona::plugin::action_async(
+            "发送消息",
+            arona::runtime::services::send_message(MessageTarget::Group(group_id), message.clone()),
+        )
+        .await;
         if receipt.message_id.is_none() {
             arona::runtime::log::warning(format!(
                 "推送{}活动到群 {group_id} 失败",
@@ -245,7 +247,7 @@ fn insert_alert(
         crate::PLUGIN_ID,
         Arc::new(move || {
             let activities = group.clone();
-            tokio::spawn(async move {
+            crate::in_scope("活动预警", async move {
                 send_alert(&activities, locale, before_hours).await;
             });
         }),
@@ -284,7 +286,7 @@ fn insert_image_refresh(expected_ms: i64, locale: ServerLocale) {
         &key,
         crate::PLUGIN_ID,
         Arc::new(move || {
-            tokio::spawn(async move {
+            crate::in_scope("刷新活动图", async move {
                 crate::standalone::commands::activity::refresh_image(locale).await;
             });
         }),
@@ -333,9 +335,12 @@ async fn send_alert(activity: &[Activity], locale: ServerLocale, before_hours: i
     for text in texts {
         let message = OutgoingMessage::text(text);
         for &group_id in &targets {
-            let receipt = arona::runtime::services::send_message(
-                MessageTarget::Group(group_id),
-                message.clone(),
+            let receipt = arona::plugin::action_async(
+                "发送消息",
+                arona::runtime::services::send_message(
+                    MessageTarget::Group(group_id),
+                    message.clone(),
+                ),
             )
             .await;
             if receipt.message_id.is_none() {
@@ -390,9 +395,7 @@ mod tests {
         ) -> BoxFuture<'a, MessageReceipt> {
             Box::pin(async move {
                 self.sent.lock().unwrap().push((target, message));
-                MessageReceipt {
-                    message_id: Some(1),
-                }
+                MessageReceipt::new(Some(1))
             })
         }
     }

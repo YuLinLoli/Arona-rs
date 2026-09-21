@@ -22,9 +22,7 @@ impl MessageSender for CaptureSender {
     ) -> BoxFuture<'a, MessageReceipt> {
         Box::pin(async move {
             self.sent.lock().unwrap().push((target, message));
-            MessageReceipt {
-                message_id: Some(1),
-            }
+            MessageReceipt::new(Some(1))
         })
     }
 }
@@ -89,7 +87,9 @@ fn image_files(message: &OutgoingMessage) -> Vec<String> {
 
 fn forward_of(message: &OutgoingMessage) -> Option<(String, Vec<ForwardMessage>)> {
     message.segments.iter().find_map(|segment| match segment {
-        MessageSegment::Forward { title, messages } => Some((title.clone(), messages.clone())),
+        MessageSegment::Forward {
+            title, messages, ..
+        } => Some((title.clone(), messages.clone())),
         _ => None,
     })
 }
