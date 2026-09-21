@@ -60,6 +60,7 @@ arona-host  ──depends──▶  arona (框架)
 | `configs()` | 插件配置文件的加载/待补状态 | `ConfigManager` |
 | `jobs()` | 定时任务表 | — |
 | `loaders()` / `plugins()` | 装载器登记表与插件表 | `PluginManager` |
+| `health()` | panic 隔离面板（按插件计失败次数、达阈值停用） | `broadcastAndDumpInterceptedExceptions` |
 
 两轨入口：
 
@@ -67,6 +68,8 @@ arona-host  ──depends──▶  arona (框架)
   GUI 用的 `runtime::config::*` 等自由函数统统转发到它，所以既有调用方（含 GUI）一行都不用改。
 - `Framework::new()` —— 一套全空的隔离实例，返回 `Arc<Framework>`。测试与将来的多实例宿主用它；
   `PluginManager` / `PluginContext` 拿的是实例引用，不碰进程级状态。
+- `Framework::builder()` —— 带构造选项的入口（`Framework::builder().panic_disable_threshold(3).build()`），
+  对应 mirai 的 `MiraiInstance.new { .. }`。选项见 §20。
 
 `PluginRegistrar::framework()` 与 `PluginContext::framework()` 把实例交给插件，插件登记出去的每一样东西
 因此天然知道自己属于哪张表、归属哪家插件——按归属回收才有依据（§13）。
@@ -87,6 +90,13 @@ arona-host  ──depends──▶  arona (框架)
 | `ApiVersion.isCompatibleWith`（主版本相等 + 框架次版本不低于要求） | `ApiVersion::satisfies` + `check_api` 握手 | 同上 + `manager.rs` |
 | `plugin.depend` / `softDepend` | `PluginMeta::depends` / `soft_depends`，`PluginManager::ordered()` 拓扑排序 | `manager.rs` |
 | `CommandManager.registerCommand` | `ctx.command(..)` / `ctx.commands(..)`，按框架实例持有、条目带插件归属 | `runtime/dispatcher.rs` |
+| `commandRegistry { string("...") int("分钟") optional() }`（`ArgParserCombinationDSL`） | `CommandRegistration::with_args(vec![arg::i64("分钟").optional() ..])`，缺参/类型错的用法回显由框架给 | `runtime/args.rs` |
+| `SimpleCommandDispatcher.shortestPrefixMatch` | `CommandRegistration::with_prefix_match(true)` + `FrameworkOptions::prefix_match_by_default`（最短前缀唯一即命中） | 同上 + `framework.rs` |
+| `PermissionService` / `MiraiPermission` | `Permission::{Anyone,GroupAdmin,GroupOwner}` + `GroupRole`（`ctx.with_permission(..)`，身份优先读 `sender.role`，回查带缓存） | `runtime/dispatcher.rs` |
+| `MiraiInstance.new { .. }`（构造选项） | `Framework::builder().panic_disable_threshold(..).build()` / `Framework::with_options(..)` | `framework.rs` |
+| `broadcastAndDumpInterceptedExceptions`（插件异常不冒泡到宿主） | 命令/钩子/兜底三侧统一过 `guarded()`：panic 被 `catch_unwind` 吃掉、记账、连续达阈值自动停用该插件 | `plugin/health.rs` |
+| `GroupMessageEvent` / `FriendMessageEvent` / `NudgedEvent` 事件族 | `EventBody`（强类型事件体）+ `BodyFilter` 子类型订阅：`ctx.on_group_message(..)`、`ctx.listen_where(&[BodyFilter::..], ..)` | `onebot/hooks.rs` |
+| `MessageChain` / `Element`（At、Image、Source、QuoteReply、Face、FlashMessage…） | `MessageSegment` 14 段（文本/@/@全体/引用/图片/表情/语音/视频/文件/戳一戳/位置/json/xml/合并转发），收发双向同一套类型 | §19 |
 | `EventPriority`（Monitor→Normal→High→Low→Lowest） | `ListenerPriority` / `CommandPriority`（同一份 `runtime::priority::Priority`） | `runtime/priority.rs` |
 | `event.intercept()` | `HookFlow::Handled` | `onebot/hooks.rs` |
 | `plugin.instance.coroutineScope.launch` | `ctx.spawn(..)` / `PluginScope` | `plugin/scope.rs` |
@@ -250,11 +260,15 @@ GUI「群管理 → 功能开关」与配置模板注释都据此生成。拿不
 的写法——那正是"框架只能挂一个功能插件"的老根因。
 
 ```rust
-use arona::runtime::dispatcher::{CommandRegistration, fallback, handler};
+use arona::runtime::args::arg;
+use arona::runtime::dispatcher::{
+    CommandRegistration, Permission, fallback, handler, typed_handler,
+};
 use arona::runtime::priority::CommandPriority;
 
 fn configure(&self, ctx: &PluginContext) -> Result<(), String> {
     ctx.commands(vec![
+        // 写法一：自己拿原始词表
         CommandRegistration::new(
             vec!["/单抽".into(), "gacha_one".into()],
             "单抽一次, 可选服务器",
@@ -263,6 +277,27 @@ fn configure(&self, ctx: &PluginContext) -> Result<(), String> {
         .with_feature("gacha")             // 绑分群功能开关；该群关掉时视为未匹配
         .with_usage("/单抽 [jp|global|cn]") // 帮助页展示
         .with_priority(CommandPriority::High), // 命令名撞车时的胜出方，默认 Normal
+
+        // 写法二：声明参数与身份，切词/类型转换/范围校验/用法回显全交给框架
+        CommandRegistration::typed(
+            vec!["/禁言".into()],
+            "禁言指定分钟数",
+            typed_handler(|context, args| async move {
+                let minutes = args.i64("分钟").unwrap_or(10);
+                let reason = args.text("原因").unwrap_or("未填").to_string();
+                /* 返回 Some(消息) 由框架发回，无需自己 reply */
+                Some(arona::runtime::message::OutgoingMessage::text(format!(
+                    "已禁言 {minutes} 分钟：{reason}"
+                )))
+            }),
+        )
+        .with_args(vec![
+            arg::i64("分钟").optional().with_default("10").range(1, 1440),
+            arg::rest("原因").optional(), // 吃掉剩下的全部文本
+        ])
+        .with_permission(Permission::GroupAdmin) // 群管理员/群主才能用，否则框架直接回绝
+        .with_prefix_match(true),                // "/禁" 这种最短前缀也能命中
+
     ]);
 
     // 未命中任何命令时的兜底（同优先级下按登记顺序依次调用）
@@ -272,10 +307,27 @@ fn configure(&self, ctx: &PluginContext) -> Result<(), String> {
 }
 ```
 
+`arg` 模块给的类型：`text`（一个非空白词）、`rest`（吃掉剩余）、`i64`、`bool`
+（`是/否`、`true/false`、`on/off`、`开/关`、`1/0`）、`choice(name, &["a","b"])`（大小写不敏感，命中后给候选表里的原样写法）。
+修饰器 `optional()` / `with_default(v)` / `range(min, max)` / `placeholder(p)`。
+声明了参数就不必再写 `with_usage`——框架按声明自动生成（`/禁言 <分钟> [原因]`）。
+
+`Permission` 三档：`Anyone`（默认）、`GroupAdmin`、`GroupOwner`。判定顺序是
+**框架管理员名单（`arona.yml` 的 managers）一律放行 → 事件自带的 `sender.role` → 都没有才回查
+`get_group_member_info`（按 群号+QQ 缓存 60 秒、3 秒超时）**，所以正常群聊里权限门控不产生网络往返。
+私聊没有群身份，`GroupAdmin`/`GroupOwner` 只对框架管理员开放。
+
 要点：
 - **不用（也没机会）填插件 id**：`ctx` 自带归属，框架按它做停用与回收。
+- **群里 @机器人 后跟命令能直接命中**：框架在查命令表之前就把"@机器人本身""@全体成员""引用""图片"
+  这些召唤性前导段剥掉了（`onebot::protocol::command_text`，对齐 mirai 进 `CommandManager` 前剥 `At(bot)`）。
+  `context.text` 就是剥过的那份；`context.text` 之外的原始段落仍在 `EventContext::segments` 里（§9、§19）。
+- **处理器 `Some(OutgoingMessage)` 由框架发回**（发向 = 群聊回群、私聊回人），不用再自己 `reply`；
+  已经自己 `reply` 过的返回 `None`，不会重复发。
 - 命令名撞上别家插件时框架只记告警、按 `priority` 定胜出方（同优先级先到先得），**其余命令照常登记**，
   不会因为一家冲突就整批失败。分发时同名命令只调用排在最前的那一家，别家不会跟着响应一遍。
+- 前缀匹配默认关闭（一个字母能撞上一堆命令），单个命令用 `with_prefix_match(true)` 打开，
+  或整套实例用 `Framework::builder().prefix_match_by_default(true)`。歧义时框架回显候选列表，不猜。
 - `ctx.own_commands()` 拿本插件名下的命令概览（自绘帮助页用）；全表看 `arona::runtime::dispatcher::commands()`
   （默认实例那份，等价于 `Framework::global().commands()`）。
 - `configure()` 里可拿到 `ctx.onebot_config`（协议配置快照，需要 self_id / nickname 时用）与 `ctx.test_notify`
@@ -285,21 +337,34 @@ fn configure(&self, ctx: &PluginContext) -> Result<(), String> {
 
 插件入口不止"注册命令"——命令只在文本命中 `/抽卡` 这类前缀时才进插件。成员进群打招呼、被踢后清理数据、
 有人申请加群、群名被改、别人引用了机器人的消息，这些属于 notice/request/meta 事件，
-或者属于"命中命令之前先被看一眼"的消息事件。统一入口是 `ctx.listen(..)`（底层是 `arona::onebot::hooks`）：
+或者属于"命中命令之前先被看一眼"的消息事件。统一入口是 `ctx.listen(..)` / `ctx.listen_where(..)`
+（底层是 `arona::onebot::hooks`）：
 
 ```rust
 use arona::onebot::{EventContext, EventKind, HookFlow};
-use arona::onebot::hooks::{event_handler, ListenerPriority};
+use arona::onebot::hooks::{BodyFilter, EventBody, NoticeKind, event_handler, ListenerPriority};
 
 fn configure(&self, ctx: &PluginContext) -> Result<(), String> {
-    ctx.on_notice(event_handler(|e: std::sync::Arc<EventContext>| {
-        Box::pin(async move {
-            if e.field_str("notice_type") == Some("group_increase") {
+    // 只订阅"成员进群"这一种子事件，框架先把别的过滤掉，插件里不用自己比字符串
+    ctx.listen_where(
+        &[BodyFilter::Notice(NoticeKind::GroupIncrease)],
+        ListenerPriority::Normal,
+        event_handler(|e: std::sync::Arc<EventContext>| {
+            Box::pin(async move {
                 let _ = e.reply("老师好！").await;
-            }
-            HookFlow::Pass                 // 通知事件一般继续往下走
-        })
-    }));
+                HookFlow::Pass                 // 通知事件一般继续往下走
+            })
+        }),
+    );
+
+    // 群消息 / 私聊消息有专用入口
+    ctx.on_group_message(event_handler(|e| Box::pin(async move {
+        // 需要更细的分支就 match 强类型事件体，而不是拼字符串
+        if matches!(&e.body, EventBody::GroupMessage { sub_type: Some(s) } if s == "anonymous") {
+            return HookFlow::Handled;          // 匿名消息直接吞掉
+        }
+        HookFlow::Pass
+    })));
 
     ctx.listen(
         &[EventKind::Message],
@@ -316,9 +381,17 @@ fn configure(&self, ctx: &PluginContext) -> Result<(), String> {
 }
 ```
 
-`EventContext` 提供：`kind`、原始 `event`、`text`、`segments`、`api: OneBotApi`（§14），
+`EventContext` 提供：`kind`、归位后的强类型 `body`（`EventBody::{GroupMessage,PrivateMessage,Notice,Request,Meta,Other}`）、
+原始 `event`、`text`、`command_text`（剥掉"@机器人/引用/图片"等召唤前缀、用来匹配命令的那份文本）、
+`segments`（§19 的全部消息段）、`api: OneBotApi`（§14），
 以及 `user_id()/group_id()/is_group()/is_private()/message_id()/field(key)/field_str(key)`、
 `target()`、`reply(text)`、`reply_message(OutgoingMessage)`、`recall(message_id)`。
+
+`BodyFilter` 的档位：`All`、`Kind(EventKind)`（大类）、`GroupMessage` / `PrivateMessage`、
+`Notice(NoticeKind)`、`Request(RequestKind)`、`Meta(MetaKind)`。
+`NoticeKind` 覆盖 `group_upload/group_decrease/group_increase/group_admin/group_ban/group_recall/poke/nudge/群名片/群头衔/notify`，
+`RequestKind` 覆盖加好友、加群申请、被邀请加群，`MetaKind` 覆盖心跳与生命周期。
+实现端自定义的类型一律落到 `Other`，`field_str` 仍能拿到原始字符串——**优先用 `body`/`BodyFilter`，字符串比较是兜底**。
 
 优先级序（`arona::runtime::priority::Priority`，数值越小越先执行）：
 `Monitor → Normal（默认） → High → Low → Lowest`，同档按登记顺序。注意 `High` 排在 `Normal` 之前、
@@ -650,3 +723,75 @@ GUI 相关的落地细节（改动前务必先读）：
   （`PluginContext` 是 `Arc` 包装的廉价克隆）。
 - 插件代码里不要 `std::process::exit`，也不要长阻塞主线程；耗时活计用 `ctx.spawn(..)`（§10）或 `arona::quartz`。
 - 日志走 `arona::runtime::log::{info, warning, error}`，不要用 `println!`（GUI 模式没有控制台）。
+  调试用的 `runtime::log::debug(..)` 只在控制台开着时输出，不进日志文件。
+
+## 19. 消息段全谱：收与发用同一套类型
+
+对应 mirai 的 `MessageChain` / `Element`。`arona::runtime::message::MessageSegment` 共 14 段，
+入站（`EventContext::segments`）与出站（`OutgoingMessage`）都是它，插件不需要碰 JSON：
+
+| 段 | 入站来自 | 出站映射（`onebot::protocol::segment_to_json`） |
+| --- | --- | --- |
+| `Text` | `text` 段 / CQ 码外的裸文本 | `{"type":"text","data":{"text":…}}` |
+| `At(qq)` / `AtAll` | `at`（`qq` 是数字或字符串，`"all"` → `AtAll`） | `at` + `qq` |
+| `Reply(id)` | `reply`（别人引用了某条消息） | `reply` + `id`（出站即"引用回复那条"） |
+| `Image{url,file,data}` | `image` | `image` + `file`（取值优先级见下） |
+| `Face(id)` | `face`（QQ 表情号，字符串保留） | `face`：能转 `i64` 就发数字，否则原样 |
+| `Record{url,file}` | `record` / `voice`（两种写法都认） | `record` + `file` |
+| `Video{url,file}` | `video` | `video` + `file` |
+| `File{file_id,name,size}` | `file`（群文件上传） | `file` + `file_id`/`file_name`/`file_size` |
+| `Poke{name,target}` | `poke`（`type`/`target_id`，也吃 `target`） | `poke` + `type`/`target_id` |
+| `Location{…}` | `location`（`lat`/`lon` 数字或字符串都行） | `location` + `name`/`address`/`lat`/`lon` |
+| `Json(card)` / `Xml(card)` | `json`/`xml`：`data.data` 给对象直接用，给 JSON 字符串会先解析 | `json`/`xml` + `data` |
+| `Forward{title,messages}` | `forward`/`node`（递归解析 `content`，空内容整段丢弃） | 普通发送接口不支持合并转发 → 占位文本；真发送见下 |
+
+图片/语音/视频的统一取值（`media_value`）：**URL > 内存字节 > 本地文件**。
+内存字节和本地文件都编成 `base64://…`；只有 `config/onebot.yml` 顶层的 `send_image_as_file: true`
+（同机部署用的"图片按文件直传"）且文件确实存在时才改成 `file:///…` URI，免去一次大图 base64，
+实现端按原始文件上传因此不被压缩。中文与空格路径按 RFC 8089 百分号编码，Windows 盘符冒号保持原样。
+
+出站构造：`OutgoingMessage::{new, text, at, at_all, quoted, image_file, image_data, record_file,
+video_file, json_card, xml_card, forward}`，再加 `.with_revoke(毫秒)` 让框架发完自动撤回。
+`ctx.reply(..)` / `context.reply_message(..)` / `api.send(target, msg)` 都吃它。
+
+合并转发（`Forward` 段）由发送器自动分流：`onebot::message_sender` 把一条消息里的 `Forward` 摘出来走
+`send_forward_msg`，其余段照常发送，所以插件把合并转发当普通段拼进消息链就行，不用自己分两次调接口。
+
+入站解析两条路都通：实现端给 `message` 数组（推荐，`parse_segment` 逐段还原，认不出的类型直接丢弃）
+或只给 `raw_message` CQ 码（`decode_cq_message`：按 `[CQ:类型,键=值]` 还原，`&#44;/&#58;/&#93;/&amp;`
+实体自动解转义，未知 CQ 码整段留成原文文本，绝不吞字）。
+
+`MessageSegment::is_mention_of(self_id)` 判断"这是在召唤机器人吗"（@机器人 与 @全体都算），
+`command_text(event, self_id)` 就是靠它剥命令前缀的（§8）。
+
+## 20. panic 隔离、自动停用与框架构造选项
+
+mirai 用 `broadcastAndDumpInterceptedExceptions` 保证"一个订阅者炸了不影响别人"。
+Arona 的等价物在框架侧：命令、事件钩子、兜底处理器三处调用统一过 `guarded`，用
+`poll_fn + catch_unwind(AssertUnwindSafe(..))` 把 `async` 处理器的 panic 就地吃掉——
+**不会拖垮 tokio task，也不会中断这一批事件的其余订阅者**。
+
+记账的是 `arona::plugin::health::HealthBoard`（挂在框架实例上，`framework.health()`）：
+
+```rust
+framework.health().failures("bluearchive");     // 当前连击数（成功一次即清零）
+framework.health().forget("bluearchive");       // 插件重新装配时清空
+```
+
+同一插件**连续** panic 到达阈值（默认 5 次）时，框架先把该插件写进停用名单（命令与钩子立刻不再路由，
+不需要 `Framework` 已 attach），再登记隔离原因（`framework.quarantine(id, threshold)` 返回 `true` 表示
+"本次从可用变隔离"，只有进程默认实例会把它写进 `arona.yml`），日志写明炸在哪个命令/钩子上。
+`revoke_resources` 顺手 `health().forget(id)`，所以用户从 GUI 或 `arona.yml` 重新启用它时计数从零开始——
+**不会因为一个老计数被秒停用**。插件自己不需要 `catch_unwind`，但也不该拿 panic 当控制流。
+
+构造选项（mirai 的 `MiraiInstance.new { .. }`）：
+
+```rust
+let framework = arona::framework::Framework::builder()
+    .panic_disable_threshold(3)      // 连续 3 次 panic 即停用；0 = 只记日志不停用
+    .prefix_match_by_default(true)   // 全部命令开放最短前缀匹配（默认关）
+    .build();                        // 返回 Arc<Framework>，与 global() 那套完全隔离
+```
+
+读回来用 `framework.options()`，隔离名单看 `framework.health()`。
+默认实例（`Framework::global()`）用的是默认选项，GUI 与 `arona.yml` 的行为不受影响。

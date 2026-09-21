@@ -82,8 +82,8 @@ pub struct PluginInfo {
     pub enabled: bool,
     /// 该插件登记的功能开关
     pub features: Vec<runtime_config::Feature>,
-    /// 该插件订阅的事件类型中文名（消息/通知/请求/元事件）
-    pub hooks: Vec<&'static str>,
+    /// 该插件订阅的事件范围中文名（消息/通知:成员进群/请求/元事件）
+    pub hooks: Vec<String>,
     /// 插件目录 plugins/<id>/
     pub plugin_dir: PathBuf,
     /// 配置文件 config/<id>/arona.yml（没有登记配置区时文件不存在）

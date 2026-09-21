@@ -9,7 +9,7 @@ use crate::config::onebot::OneBotConfig;
 use crate::config::plugin_config::ConfigEntry;
 use crate::framework::Framework;
 use crate::onebot::api::OneBotApi;
-use crate::onebot::hooks::{EventHandler, EventKind, ListenerPriority};
+use crate::onebot::hooks::{BodyFilter, EventHandler, EventKind, ListenerPriority};
 use crate::plugin::scope::PluginScope;
 use crate::runtime::config::Feature;
 use crate::runtime::dispatcher::{CommandRegistration, FallbackHandler};
@@ -211,6 +211,38 @@ impl PluginContext {
     /// 只订阅消息事件（默认优先级）
     pub fn on_message(&self, handler: Arc<dyn EventHandler>) {
         self.listen(&[EventKind::Message], ListenerPriority::default(), handler);
+    }
+
+    /// 按**事件子类**订阅（mirai 的 `GroupMessageEvent`/`NudgeEvent` 这一族）：
+    /// 例如 `&[BodyFilter::Notice(NoticeKind::GroupIncrease)]` 只在有人进群时被叫到，
+    /// 子类判定由框架完成，插件不必自己从 `ctx.event.raw` 里比字符串。
+    pub fn listen_where(
+        &self,
+        filters: &[BodyFilter],
+        priority: ListenerPriority,
+        handler: Arc<dyn EventHandler>,
+    ) {
+        self.framework()
+            .hooks()
+            .subscribe_where(self.plugin_id(), filters, priority, handler);
+    }
+
+    /// 只订阅群消息（默认优先级）
+    pub fn on_group_message(&self, handler: Arc<dyn EventHandler>) {
+        self.listen_where(
+            &[BodyFilter::GroupMessage],
+            ListenerPriority::default(),
+            handler,
+        );
+    }
+
+    /// 只订阅私聊消息（默认优先级）
+    pub fn on_private_message(&self, handler: Arc<dyn EventHandler>) {
+        self.listen_where(
+            &[BodyFilter::PrivateMessage],
+            ListenerPriority::default(),
+            handler,
+        );
     }
 
     pub fn on_notice(&self, handler: Arc<dyn EventHandler>) {

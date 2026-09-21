@@ -136,6 +136,24 @@ fn deserialize<T: for<'de> Deserialize<'de>>(
         .map_err(|err| OneBotError::BadResponse(format!("{action} 的 data 无法解析: {err}")))
 }
 
+/// 群身份字段各家写法不一：OneBot v11 回字符串（owner/admin/member），NTQQ 系回数字
+/// （1 群主 / 2 管理员 / 3 成员）。统一折成数字，认不出的按成员。
+fn role_as_number<'de, D>(deserializer: D) -> Result<i64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    Ok(match &value {
+        Value::Number(number) => number.as_i64().unwrap_or(3),
+        Value::String(text) => match text.to_ascii_lowercase().as_str() {
+            "owner" | "creator" | "群主" => 1,
+            "admin" | "administrator" | "管理员" => 2,
+            _ => 3,
+        },
+        _ => 3,
+    })
+}
+
 /// OneBot 动作出口（无状态：每次调用现取可用连接）
 #[derive(Clone, Copy, Debug, Default)]
 pub struct OneBotApi;
@@ -956,7 +974,12 @@ pub struct GroupMemberInfo {
     pub last_sent_time: i64,
     /// 实现端的身份字段名不统一（group_rank / role / permission），都收下
     pub group_rank: i64,
-    #[serde(default, alias = "role", alias = "permission")]
+    #[serde(
+        default,
+        alias = "role",
+        alias = "permission",
+        deserialize_with = "role_as_number"
+    )]
     pub role: i64,
     pub unimportant_flag: bool,
     #[serde(flatten)]

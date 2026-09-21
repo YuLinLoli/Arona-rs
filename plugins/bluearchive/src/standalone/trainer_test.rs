@@ -60,6 +60,7 @@ fn context(sender: Arc<CaptureSender>, text: &str) -> Arc<CommandContext> {
         text: text.to_string(),
         sender_name: Some("测试老师".to_string()),
         is_admin: true,
+        sender_role: None,
         sender,
     })
 }

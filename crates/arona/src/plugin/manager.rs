@@ -480,6 +480,19 @@ impl PluginManager {
         plugin.set_state(PluginState::Disabled);
     }
 
+    /// 按 id 停用并回收（框架自动隔离 panic 插件时用；id 未知时返回 false）
+    pub fn disable_id(&self, plugin: &str) -> bool {
+        match self.find(plugin) {
+            Some(plugin) => {
+                if plugin.state() != PluginState::Disabled {
+                    self.disable(&plugin);
+                }
+                true
+            }
+            None => false,
+        }
+    }
+
     /// 单个插件"配好并跑起来"（供启动与运行期开关共用）
     fn bring_up(&self, plugin: &Arc<ManagedPlugin>) {
         if self.assemble(plugin).is_err() {
@@ -581,6 +594,7 @@ impl PluginManager {
         framework.commands().unregister_plugin(id);
         let services = framework.container().revoke_plugin(id);
         let boards = framework.services().revoke(id);
+        framework.health().forget(id);
         if tasks + jobs + hooks + services + boards > 0 {
             log::info(format!(
                 "已回收插件 {id} 的资源: 后台任务 {tasks} / 定时任务 {jobs} / 事件订阅 {hooks} / 共享能力 {services} / 服务开关 {boards}"

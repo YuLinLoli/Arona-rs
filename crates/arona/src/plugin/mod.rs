@@ -22,6 +22,7 @@
 //! 所以插件不必（也无法）靠自己在 stop 里清理干净来保证停用生效。
 pub mod context;
 pub mod description;
+pub mod health;
 pub mod manager;
 pub mod scope;
 
@@ -230,6 +231,7 @@ mod tests {
             text: text.to_string(),
             sender_name: None,
             is_admin: false,
+            sender_role: None,
             sender: Arc::new(NullSender),
         })
     }

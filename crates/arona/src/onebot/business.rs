@@ -79,7 +79,8 @@ impl StandaloneBusinessHandler {
         } else {
             console::print_message(self_id, &event, None);
         }
-        let text = protocol::extract_text(&event).trim().to_string();
+        // 命令匹配读的是剥掉"@机器人 前缀"的文本：群消息里 @Arona /单抽 的首词才是命令名
+        let text = protocol::command_text(&event, self_id);
         // 纯图片/表情这类没有文本的消息，没有可分发的命令，但事件钩子照样要收到
         let has_command = !text.is_empty();
         let Some(user_id) = event.user_id else { return };
@@ -112,12 +113,18 @@ impl StandaloneBusinessHandler {
             connection: Some(connection),
             self_id: self.config().self_id,
         });
+        // 群身份直接取事件自带的 sender.role：命令的权限门控靠它，不必再回查一次实现端
+        let sender_role = event
+            .sender
+            .as_ref()
+            .and_then(crate::runtime::dispatcher::GroupRole::from_sender);
         let context = Arc::new(CommandContext {
             user_id,
             group_id: event.group_id,
             text: text.clone(),
             sender_name,
             is_admin,
+            sender_role,
             sender,
         });
         let dispatcher = self.dispatcher.clone();

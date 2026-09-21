@@ -77,13 +77,279 @@ impl EventKind {
     }
 }
 
+/// 通知事件的子类（OneBot 的 `notice_type`，对应 mirai 的 `GroupNoticeEvent` 家族）
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoticeKind {
+    /// 群文件上传
+    FileUpload,
+    /// 群成员退群（含被踢）
+    GroupDecrease,
+    /// 群成员进群
+    GroupIncrease,
+    /// 群管理员变更
+    GroupAdmin,
+    /// 群成员被禁言/解除禁言
+    GroupBan,
+    /// 群内消息撤回
+    GroupRecall,
+    /// 戳一戳
+    Poke,
+    /// 窗一戳（QQ 的 poke 变体）
+    Nudge,
+    /// 群名片变更
+    GroupCardUpdate,
+    /// 群头衔变更
+    GroupTitleUpdate,
+    /// 好友/群内的普通通知（如被 @）
+    Notify,
+    /// 其余（实现端自定义的 notice_type）
+    Other,
+}
+
+impl NoticeKind {
+    /// 按 OneBot 的 `notice_type` 归位
+    pub fn parse(value: &str) -> NoticeKind {
+        match value {
+            "group_upload" => NoticeKind::FileUpload,
+            "group_decrease" => NoticeKind::GroupDecrease,
+            "group_increase" => NoticeKind::GroupIncrease,
+            "group_admin" => NoticeKind::GroupAdmin,
+            "group_ban" => NoticeKind::GroupBan,
+            "group_recall" => NoticeKind::GroupRecall,
+            "poke" => NoticeKind::Poke,
+            "nudge" => NoticeKind::Nudge,
+            "group_card_update" => NoticeKind::GroupCardUpdate,
+            "group_title_update" => NoticeKind::GroupTitleUpdate,
+            "notify" | "friend_notify" => NoticeKind::Notify,
+            _ => NoticeKind::Other,
+        }
+    }
+
+    pub fn display_name(self) -> &'static str {
+        match self {
+            NoticeKind::FileUpload => "群文件上传",
+            NoticeKind::GroupDecrease => "成员退群",
+            NoticeKind::GroupIncrease => "成员进群",
+            NoticeKind::GroupAdmin => "管理员变更",
+            NoticeKind::GroupBan => "禁言",
+            NoticeKind::GroupRecall => "群消息撤回",
+            NoticeKind::Poke => "戳一戳",
+            NoticeKind::Nudge => "戳一戳（nudge）",
+            NoticeKind::GroupCardUpdate => "群名片变更",
+            NoticeKind::GroupTitleUpdate => "群头衔变更",
+            NoticeKind::Notify => "通知",
+            NoticeKind::Other => "其他通知",
+        }
+    }
+}
+
+/// 请求事件的子类（OneBot 的 `request_type`，对应 mirai 的 `VerifyMessage` 家族）
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RequestKind {
+    /// 加好友
+    Friend,
+    /// 加群（用户申请）
+    AddGroup,
+    /// 被邀请加群
+    InviteGroup,
+    /// 其余
+    Other,
+}
+
+impl RequestKind {
+    pub fn parse(value: &str) -> RequestKind {
+        match value {
+            "friend" => RequestKind::Friend,
+            "group" => RequestKind::AddGroup,
+            "add_group" => RequestKind::AddGroup,
+            _ => RequestKind::Other,
+        }
+    }
+
+    pub fn display_name(self) -> &'static str {
+        match self {
+            RequestKind::Friend => "好友申请",
+            RequestKind::AddGroup => "加群申请",
+            RequestKind::InviteGroup => "群邀请",
+            RequestKind::Other => "其他申请",
+        }
+    }
+}
+
+/// 元事件的子类（OneBot 的 `meta_event_type`）
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MetaKind {
+    Heartbeat,
+    /// 客户端掉线、服务恢复等平台级事件（对应 mirai 的 `ClientLaunchFinishedStateEvent` 等）
+    Lifecycle,
+    Other,
+}
+
+impl MetaKind {
+    pub fn parse(value: &str) -> MetaKind {
+        match value {
+            "heartbeat" => MetaKind::Heartbeat,
+            "lifecycle" => MetaKind::Lifecycle,
+            _ => MetaKind::Other,
+        }
+    }
+
+    pub fn display_name(self) -> &'static str {
+        match self {
+            MetaKind::Heartbeat => "心跳",
+            MetaKind::Lifecycle => "生命周期",
+            MetaKind::Other => "其他元事件",
+        }
+    }
+}
+
+/// 强类型的事件体（对应 mirai 的 `GroupMessageEvent`/`NudgeEvent` 这一族）。
+///
+/// 插件不再靠 `field_str("notice_type") == Some("group_increase")` 这种字符串比较分支，
+/// 而是 `match ctx.body` 或直接订阅 [`BodyFilter`]。原始字段仍可从 `ctx.event.raw` 取。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EventBody {
+    /// 群消息（`sub_type`：normal / anonymous / offline / online）
+    GroupMessage {
+        sub_type: Option<String>,
+    },
+    /// 私聊消息（`sub_type`：friend / group(临时会话) 等）
+    PrivateMessage {
+        sub_type: Option<String>,
+    },
+    Notice(NoticeKind),
+    Request(RequestKind),
+    Meta(MetaKind),
+    /// 框架没认出大类的事件（实现端自定义 post_type）
+    Other {
+        post_type: String,
+        sub_type: Option<String>,
+    },
+}
+
+impl EventBody {
+    /// 从 OneBot 事件归位
+    pub fn from_event(event: &OneBotEvent) -> EventBody {
+        let sub_type = event
+            .sub_type
+            .clone()
+            .filter(|value| !value.is_empty() && value != "unknown");
+        match event.post_type.as_str() {
+            "message" => {
+                if event.message_type.as_deref() == Some("group") || event.group_id.is_some() {
+                    EventBody::GroupMessage { sub_type }
+                } else {
+                    EventBody::PrivateMessage { sub_type }
+                }
+            }
+            "notice" => EventBody::Notice(
+                event
+                    .notice_type
+                    .as_deref()
+                    .map(NoticeKind::parse)
+                    .unwrap_or(NoticeKind::Other),
+            ),
+            "request" => EventBody::Request(RequestKind::parse(raw_str(event, "request_type"))),
+            "meta_event" | "meta" => {
+                EventBody::Meta(MetaKind::parse(raw_str(event, "meta_event_type")))
+            }
+            other => EventBody::Other {
+                post_type: other.to_string(),
+                sub_type,
+            },
+        }
+    }
+
+    /// 所属事件大类
+    pub fn kind(&self) -> Option<EventKind> {
+        match self {
+            EventBody::GroupMessage { .. } | EventBody::PrivateMessage { .. } => {
+                Some(EventKind::Message)
+            }
+            EventBody::Notice(_) => Some(EventKind::Notice),
+            EventBody::Request(_) => Some(EventKind::Request),
+            EventBody::Meta(_) => Some(EventKind::Meta),
+            EventBody::Other { .. } => None,
+        }
+    }
+
+    /// 展示名（GUI 与日志用）
+    pub fn display_name(&self) -> String {
+        match self {
+            EventBody::GroupMessage { .. } => "群消息".to_string(),
+            EventBody::PrivateMessage { .. } => "私聊消息".to_string(),
+            EventBody::Notice(kind) => format!("通知:{}", kind.display_name()),
+            EventBody::Request(kind) => format!("申请:{}", kind.display_name()),
+            EventBody::Meta(kind) => format!("元事件:{}", kind.display_name()),
+            EventBody::Other { post_type, .. } => format!("其他:{post_type}"),
+        }
+    }
+}
+
+/// 从事件原始 JSON 里取字符串字段（缺失/非字符串都给空串）
+fn raw_str<'a>(event: &'a OneBotEvent, key: &str) -> &'a str {
+    event
+        .raw
+        .get(key)
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+}
+
+/// 订阅过滤器：比 [`EventKind`] 更细一层，直接对上事件子类
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BodyFilter {
+    /// 全部事件
+    All,
+    /// 某个大类
+    Kind(EventKind),
+    /// 群消息 / 私聊消息
+    GroupMessage,
+    PrivateMessage,
+    Notice(NoticeKind),
+    Request(RequestKind),
+    Meta(MetaKind),
+}
+
+impl BodyFilter {
+    /// 这个过滤器是否收该事件
+    pub fn matches(&self, body: &EventBody) -> bool {
+        match self {
+            BodyFilter::All => true,
+            BodyFilter::Kind(kind) => body.kind() == Some(*kind),
+            BodyFilter::GroupMessage => matches!(body, EventBody::GroupMessage { .. }),
+            BodyFilter::PrivateMessage => matches!(body, EventBody::PrivateMessage { .. }),
+            BodyFilter::Notice(kind) => matches!(body, EventBody::Notice(found) if found == kind),
+            BodyFilter::Request(kind) => {
+                matches!(body, EventBody::Request(found) if found == kind)
+            }
+            BodyFilter::Meta(kind) => matches!(body, EventBody::Meta(found) if found == kind),
+        }
+    }
+
+    pub fn display_name(&self) -> String {
+        match self {
+            BodyFilter::All => "全部事件".to_string(),
+            BodyFilter::Kind(kind) => kind.display_name().to_string(),
+            BodyFilter::GroupMessage => "群消息".to_string(),
+            BodyFilter::PrivateMessage => "私聊消息".to_string(),
+            BodyFilter::Notice(kind) => format!("通知:{}", kind.display_name()),
+            BodyFilter::Request(kind) => format!("申请:{}", kind.display_name()),
+            BodyFilter::Meta(kind) => format!("元事件:{}", kind.display_name()),
+        }
+    }
+}
+
 /// 投递给钩子的上下文
 pub struct EventContext {
     pub kind: EventKind,
     /// 原始事件（`raw` 里能取到 notice_type / request_type 等细节字段）
     pub event: OneBotEvent,
-    /// 消息纯文本（非消息事件为空串）
+    /// 强类型事件体：`match ctx.body` 就能按子类分支，不必再比字符串
+    pub body: EventBody,
+    /// 消息纯文本（非消息事件为空串；@ 段渲染成 `@qq号`）
     pub text: String,
+    /// 剥掉"@机器人 前缀"的文本。插件想自己在钩子里匹配命令时用这个而不是 `text`
+    pub command_text: String,
     /// 消息段（非消息事件为空）
     pub segments: Vec<MessageSegment>,
     /// OneBot 动作出口：回复、撤回、查资料都走它
@@ -204,7 +470,8 @@ where
 #[derive(Clone)]
 struct Hook {
     plugin: String,
-    kinds: Vec<EventKind>,
+    /// 订阅范围；空表示 [`BodyFilter::All`]
+    filters: Vec<BodyFilter>,
     priority: ListenerPriority,
     handler: Arc<dyn EventHandler>,
     /// 登记序号：同优先级下保持注册顺序稳定
@@ -217,14 +484,19 @@ pub struct HookRegistry {
     /// 登记序号发号器（表内单调即可）
     seq: AtomicU64,
     gating: Arc<Gating>,
+    health: Arc<crate::plugin::health::HealthBoard>,
 }
 
 impl HookRegistry {
-    pub(crate) fn new(gating: Arc<Gating>) -> HookRegistry {
+    pub(crate) fn new(
+        gating: Arc<Gating>,
+        health: Arc<crate::plugin::health::HealthBoard>,
+    ) -> HookRegistry {
         HookRegistry {
             hooks: RwLock::new(Vec::new()),
             seq: AtomicU64::new(0),
             gating,
+            health,
         }
     }
 
@@ -237,18 +509,40 @@ impl HookRegistry {
         priority: ListenerPriority,
         handler: Arc<dyn EventHandler>,
     ) {
-        self.hooks.write().unwrap().push(Hook {
-            plugin: plugin.to_string(),
-            kinds: kinds.to_vec(),
+        self.subscribe_where(
+            plugin,
+            &kinds
+                .iter()
+                .copied()
+                .map(BodyFilter::Kind)
+                .collect::<Vec<_>>(),
             priority,
             handler,
-            seq: self.seq.fetch_add(1, Ordering::SeqCst),
-        });
+        );
     }
 
     /// 订阅事件（`kinds` 为空表示全部类型），默认 [`ListenerPriority::Normal`]。
     pub fn subscribe(&self, plugin: &str, kinds: &[EventKind], handler: Arc<dyn EventHandler>) {
         self.subscribe_at(plugin, kinds, ListenerPriority::default(), handler);
+    }
+
+    /// 按**事件子类**订阅（mirai 的 `GroupMessageEvent`/`NudgeEvent` 这一族）：
+    /// `&[BodyFilter::Notice(NoticeKind::GroupIncrease)]` 就只在有人进群时被叫到，
+    /// 框架过滤，插件不必自己从 raw 里比字符串。
+    pub fn subscribe_where(
+        &self,
+        plugin: &str,
+        filters: &[BodyFilter],
+        priority: ListenerPriority,
+        handler: Arc<dyn EventHandler>,
+    ) {
+        self.hooks.write().unwrap().push(Hook {
+            plugin: plugin.to_string(),
+            filters: filters.to_vec(),
+            priority,
+            handler,
+            seq: self.seq.fetch_add(1, Ordering::SeqCst),
+        });
     }
 }
 
@@ -301,24 +595,24 @@ impl HookRegistry {
             .count()
     }
 
-    /// 全部钩子的订阅概览：(插件名, 事件类型中文名)
-    pub fn subscriptions(&self) -> Vec<(String, Vec<&'static str>)> {
-        let mut result: Vec<(String, Vec<&'static str>)> = Vec::new();
+    /// 全部钩子的订阅概览：(插件名, 订阅范围展示名)
+    pub fn subscriptions(&self) -> Vec<(String, Vec<String>)> {
+        let mut result: Vec<(String, Vec<String>)> = Vec::new();
         for hook in self.hooks.read().unwrap().iter() {
-            let kinds = hook
-                .kinds
-                .iter()
-                .map(|kind| kind.display_name())
-                .collect::<Vec<_>>();
+            let scopes: Vec<String> = if hook.filters.is_empty() {
+                vec![BodyFilter::All.display_name()]
+            } else {
+                hook.filters.iter().map(BodyFilter::display_name).collect()
+            };
             match result.iter_mut().find(|(name, _)| *name == hook.plugin) {
                 Some((_, existing)) => {
-                    for kind in kinds {
-                        if !existing.contains(&kind) {
-                            existing.push(kind);
+                    for scope in scopes {
+                        if !existing.contains(&scope) {
+                            existing.push(scope);
                         }
                     }
                 }
-                None => result.push((hook.plugin.clone(), kinds)),
+                None => result.push((hook.plugin.clone(), scopes)),
             }
         }
         result
@@ -331,7 +625,11 @@ impl HookRegistry {
 
     /// 把事件投给订阅者；返回 true 表示已被插件消费（消息事件不再走命令分发）
     pub async fn dispatch(&self, event: &OneBotEvent) -> bool {
-        let Some(kind) = EventKind::from_post_type(&event.post_type) else {
+        let body = EventBody::from_event(event);
+        let Some(kind) = body
+            .kind()
+            .or_else(|| EventKind::from_post_type(&event.post_type))
+        else {
             return false;
         };
         // 先把要跑的钩子取出来再执行：钩子里很可能回头 subscribe/unsubscribe，
@@ -340,7 +638,7 @@ impl HookRegistry {
             let guard = self.hooks.read().unwrap();
             let mut hooks: Vec<Hook> = guard
                 .iter()
-                .filter(|hook| hook.kinds.contains(&kind))
+                .filter(|hook| hook.filters.is_empty() || hook_wants(&hook.filters, &body))
                 .filter(|hook| self.gate_open(&hook.plugin, event.group_id))
                 .cloned()
                 .collect();
@@ -350,20 +648,44 @@ impl HookRegistry {
         if hooks.is_empty() {
             return false;
         }
+        let self_id = if event.self_id != 0 {
+            event.self_id
+        } else {
+            self.gating.bot_id()
+        };
         let context = Arc::new(EventContext {
             kind,
             text: protocol::extract_text(event),
+            command_text: protocol::command_text(event, self_id),
             segments: protocol::extract_segments(event),
+            body,
             event: event.clone(),
             api: OneBotApi::global(),
         });
         for hook in hooks {
-            if hook.handler.handle(context.clone()).await == HookFlow::Handled {
-                return true;
+            // 一次 panic 只废掉这一个处理器（mirai 的 broadcastAndDumpInterceptedExceptions）
+            let flow = crate::plugin::health::guarded(hook.handler.handle(context.clone())).await;
+            match flow {
+                Some(HookFlow::Handled) => {
+                    self.health.record_success(&hook.plugin);
+                    return true;
+                }
+                Some(HookFlow::Pass) => self.health.record_success(&hook.plugin),
+                None => {
+                    if self.health.record_panic(&hook.plugin, "事件处理器") {
+                        // 已经被隔离停用：剩下的事件不必再问它
+                        break;
+                    }
+                }
             }
         }
         false
     }
+}
+
+/// 订阅过滤器是否命中（`filters` 为空由调用方按"全收"处理）
+fn hook_wants(filters: &[BodyFilter], body: &EventBody) -> bool {
+    filters.iter().any(|filter| filter.matches(body))
 }
 
 fn global() -> &'static HookRegistry {
@@ -395,9 +717,19 @@ pub fn hook_count(plugin: &str) -> usize {
     global().hook_count(plugin)
 }
 
-/// 全部钩子的订阅概览：(插件名, 事件类型中文名)
-pub fn subscriptions() -> Vec<(String, Vec<&'static str>)> {
+/// 全部钩子的订阅概览：(插件名, 订阅范围展示名)
+pub fn subscriptions() -> Vec<(String, Vec<String>)> {
     global().subscriptions()
+}
+
+/// 按事件子类订阅（进程默认实例）
+pub fn subscribe_where(
+    plugin: &str,
+    filters: &[BodyFilter],
+    priority: ListenerPriority,
+    handler: Arc<dyn EventHandler>,
+) {
+    global().subscribe_where(plugin, filters, priority, handler);
 }
 
 /// 把事件投给订阅者；返回 true 表示已被插件消费（消息事件不再走命令分发）
@@ -442,10 +774,19 @@ mod tests {
         })
     }
 
+    /// 一张独立的钩子表：门控与健康度共用同一个 Gating，达阈值时的停用才真的作用在它身上
+    fn registry(gating: Arc<Gating>) -> Arc<HookRegistry> {
+        let health = Arc::new(crate::plugin::health::HealthBoard::new(
+            crate::framework::Framework::DEFAULT_PANIC_THRESHOLD,
+            gating.clone(),
+        ));
+        Arc::new(HookRegistry::new(gating, health))
+    }
+
     /// 回归：钩子执行时必须已经释放钩子表读锁，否则钩子里再 subscribe 会自死锁
     #[tokio::test]
     async fn hook_may_touch_registry_while_running() {
-        let registry = Arc::new(HookRegistry::new(Arc::new(Gating::default())));
+        let registry = registry(Arc::new(Gating::default()));
         let plugin = "HookReentryTestPlugin";
         let notice_flag = Arc::new(AtomicBool::new(false));
         registry.subscribe(
@@ -488,7 +829,7 @@ mod tests {
     #[tokio::test]
     async fn disabled_plugin_gets_no_events() {
         let gating = Arc::new(Gating::default());
-        let registry = Arc::new(HookRegistry::new(gating.clone()));
+        let registry = registry(gating.clone());
         let plugin = "HookDisabledTestPlugin";
         let flag = Arc::new(AtomicBool::new(false));
         registry.subscribe(plugin, &[EventKind::Message], passes(flag.clone()));
@@ -504,7 +845,7 @@ mod tests {
     #[tokio::test]
     async fn group_switch_only_affects_that_group() {
         let gating = Arc::new(Gating::default());
-        let registry = Arc::new(HookRegistry::new(gating.clone()));
+        let registry = registry(gating.clone());
         let plugin = "HookGroupSwitchTestPlugin";
         let group_id = 777_001_i64;
         let flag = Arc::new(AtomicBool::new(false));
@@ -535,7 +876,7 @@ mod tests {
     /// 返回 Handled 的钩子要短路：后面的钩子与命令分发都不再执行
     #[tokio::test]
     async fn handled_flow_short_circuits() {
-        let registry = Arc::new(HookRegistry::new(Arc::new(Gating::default())));
+        let registry = registry(Arc::new(Gating::default()));
         let plugin = "HookHandledTestPlugin";
         let second = Arc::new(AtomicBool::new(false));
         registry.subscribe(
@@ -555,7 +896,7 @@ mod tests {
     #[tokio::test]
     async fn priority_orders_listeners_ahead_of_registration() {
         use crate::runtime::priority::ListenerPriority;
-        let registry = Arc::new(HookRegistry::new(Arc::new(Gating::default())));
+        let registry = registry(Arc::new(Gating::default()));
         let plugin = "HookPriorityTestPlugin";
         let order = Arc::new(Mutex::new(Vec::<&'static str>::new()));
         let record = |name: &'static str| {
@@ -598,7 +939,7 @@ mod tests {
     /// 非消息事件也要能投递；未知 post_type 直接忽略
     #[tokio::test]
     async fn notice_dispatches_and_unknown_post_type_does_not() {
-        let registry = Arc::new(HookRegistry::new(Arc::new(Gating::default())));
+        let registry = registry(Arc::new(Gating::default()));
         let plugin = "HookNoticeTestPlugin";
         let flag = Arc::new(AtomicBool::new(false));
         registry.subscribe(plugin, &[EventKind::Notice], passes(flag.clone()));
@@ -619,7 +960,9 @@ mod tests {
         let context = EventContext {
             kind: EventKind::Notice,
             event: event("notice", Some(6)),
+            body: EventBody::Notice(NoticeKind::parse("group_increase")),
             text: String::new(),
+            command_text: String::new(),
             segments: Vec::new(),
             api: OneBotApi::global(),
         };
@@ -627,5 +970,6 @@ mod tests {
         assert_eq!(context.field_str("missing"), None);
         assert_eq!(context.group_id(), Some(6));
         assert_eq!(context.message_id(), Some(7));
+        assert_eq!(context.body.kind(), Some(EventKind::Notice));
     }
 }

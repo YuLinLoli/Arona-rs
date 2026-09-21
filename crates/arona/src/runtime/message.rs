@@ -1,20 +1,73 @@
 //! 消息模型与发送抽象（对应原版 runtime 包 MessageSender/OutgoingMessage 等）
 
-/// 消息段（对应原版 MessageSegment）
+use serde_json::Value;
+
+/// 消息段（对应 mirai 的 `MessageMetadata`/`Element` 体系与 OneBot v11 的 segment）
 #[derive(Clone, Debug)]
 pub enum MessageSegment {
     Text(String),
     At(i64),
+    /// @全体成员
+    AtAll,
+    /// 引用某条消息（入站是"别人引用了机器人/某人"，出站是"回复那条消息"）
+    Reply(i64),
     Image {
         url: Option<String>,
         file: Option<String>,
         data: Option<Vec<u8>>,
     },
+    /// QQ 表情（实现端给的表情号）
+    Face(String),
+    /// 语音
+    Record {
+        url: Option<String>,
+        file: Option<String>,
+    },
+    /// 视频
+    Video {
+        url: Option<String>,
+        file: Option<String>,
+    },
+    /// 群文件（入站带 file_id，出站按 file_id 分享已上传的文件）
+    File {
+        file_id: String,
+        name: String,
+        size: u64,
+    },
+    /// 戳一戳
+    Poke {
+        /// 动作名（"bubble"、"punch" 之类，由实现端定义）
+        name: String,
+        /// 被戳的人，0 表示戳自己
+        target: i64,
+    },
+    /// 位置共享
+    Location {
+        name: String,
+        address: String,
+        latitude: f64,
+        longitude: f64,
+    },
+    /// 卡片消息（OneBot 的 json 段，如音乐/小程序分享）
+    Json(Value),
+    /// 卡片消息（OneBot 的 xml 段，机器人消息里的链接卡片多为这种）
+    Xml(Value),
     /// 合并转发
     Forward {
         title: String,
         messages: Vec<ForwardMessage>,
     },
+}
+
+impl MessageSegment {
+    /// 该段是否只是"召唤机器人"的前缀（群里 @机器人 后跟命令时的头几段）
+    pub fn is_mention_of(&self, self_id: i64) -> bool {
+        match self {
+            MessageSegment::At(user_id) => *user_id == self_id,
+            MessageSegment::AtAll => true,
+            _ => false,
+        }
+    }
 }
 
 /// 合并转发中的一条节点消息
@@ -34,6 +87,14 @@ pub struct OutgoingMessage {
 }
 
 impl OutgoingMessage {
+    /// 任意段组合
+    pub fn new(segments: Vec<MessageSegment>) -> OutgoingMessage {
+        OutgoingMessage {
+            segments,
+            revoke_after_millis: None,
+        }
+    }
+
     pub fn text(value: impl Into<String>) -> OutgoingMessage {
         OutgoingMessage {
             segments: vec![MessageSegment::Text(value.into())],
@@ -44,6 +105,24 @@ impl OutgoingMessage {
     pub fn at(user_id: i64) -> OutgoingMessage {
         OutgoingMessage {
             segments: vec![MessageSegment::At(user_id)],
+            revoke_after_millis: None,
+        }
+    }
+
+    pub fn at_all() -> OutgoingMessage {
+        OutgoingMessage {
+            segments: vec![MessageSegment::AtAll],
+            revoke_after_millis: None,
+        }
+    }
+
+    /// 引用某条消息后再说这些内容（mirai 的 `QuoteReply`）
+    pub fn quoted(message_id: i64, text: impl Into<String>) -> OutgoingMessage {
+        OutgoingMessage {
+            segments: vec![
+                MessageSegment::Reply(message_id),
+                MessageSegment::Text(text.into()),
+            ],
             revoke_after_millis: None,
         }
     }
@@ -70,6 +149,42 @@ impl OutgoingMessage {
         }
     }
 
+    pub fn record_file(file: impl Into<String>) -> OutgoingMessage {
+        OutgoingMessage {
+            segments: vec![MessageSegment::Record {
+                url: None,
+                file: Some(file.into()),
+            }],
+            revoke_after_millis: None,
+        }
+    }
+
+    pub fn video_file(file: impl Into<String>) -> OutgoingMessage {
+        OutgoingMessage {
+            segments: vec![MessageSegment::Video {
+                url: None,
+                file: Some(file.into()),
+            }],
+            revoke_after_millis: None,
+        }
+    }
+
+    /// 卡片消息（json 段）
+    pub fn json_card(card: Value) -> OutgoingMessage {
+        OutgoingMessage {
+            segments: vec![MessageSegment::Json(card)],
+            revoke_after_millis: None,
+        }
+    }
+
+    /// 卡片消息（xml 段）
+    pub fn xml_card(card: Value) -> OutgoingMessage {
+        OutgoingMessage {
+            segments: vec![MessageSegment::Xml(card)],
+            revoke_after_millis: None,
+        }
+    }
+
     pub fn forward(title: impl Into<String>, messages: Vec<ForwardMessage>) -> OutgoingMessage {
         OutgoingMessage {
             segments: vec![MessageSegment::Forward {
@@ -82,6 +197,12 @@ impl OutgoingMessage {
 
     pub fn with_revoke(mut self, millis: u64) -> OutgoingMessage {
         self.revoke_after_millis = Some(millis);
+        self
+    }
+
+    /// 在开头挂上引用（把已拼好的消息变成"回复某条消息"）
+    pub fn with_quote(mut self, message_id: i64) -> OutgoingMessage {
+        self.segments.insert(0, MessageSegment::Reply(message_id));
         self
     }
 }

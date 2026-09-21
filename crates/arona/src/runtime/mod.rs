@@ -1,4 +1,5 @@
 //! 运行期模块（对应原版 runtime 包）
+pub mod args;
 pub mod config;
 pub mod console;
 pub mod crash;

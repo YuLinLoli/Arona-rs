@@ -56,20 +56,36 @@ async fn send_via(
     message: OutgoingMessage,
 ) -> MessageReceipt {
     console::print_outgoing(self_id, target, &message);
-    let forward = message.segments.iter().find_map(|segment| match segment {
-        MessageSegment::Forward { title, messages } => Some((title.clone(), messages.clone())),
-        _ => None,
-    });
-    let receipt = match forward {
-        Some((_title, messages)) => match &connection {
-            Some(conn) => send_forward(conn.clone(), target, &messages).await,
+    // 合并转发段只能走 send_forward_msg，和别的段混在一条消息里时拆成两次发送：
+    // 先发普通部分，再发转发，回执以先拿到的 message_id 为准（自动撤回只撤这一条）
+    let mut nodes: Vec<ForwardMessage> = Vec::new();
+    let mut rest: Vec<MessageSegment> = Vec::new();
+    for segment in &message.segments {
+        match segment {
+            MessageSegment::Forward { messages, .. } => nodes.extend(messages.iter().cloned()),
+            other => rest.push(other.clone()),
+        }
+    }
+    let mut receipt = MessageReceipt::default();
+    if !rest.is_empty() {
+        let plain = OutgoingMessage {
+            segments: rest,
+            revoke_after_millis: None,
+        };
+        match &connection {
+            Some(conn) => receipt = send_normal(conn.clone(), target, &plain).await,
+            None => {}
+        }
+    }
+    if !nodes.is_empty() {
+        let forward_receipt = match &connection {
+            Some(conn) => send_forward(conn.clone(), target, &nodes).await,
             None => MessageReceipt { message_id: None },
-        },
-        None => match &connection {
-            Some(conn) => send_normal(conn.clone(), target, &message).await,
-            None => MessageReceipt { message_id: None },
-        },
-    };
+        };
+        if receipt.message_id.is_none() {
+            receipt = forward_receipt;
+        }
+    }
     schedule_revoke(connection, receipt.clone(), message.revoke_after_millis);
     receipt
 }

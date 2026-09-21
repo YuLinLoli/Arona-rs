@@ -144,18 +144,36 @@ fn format_segment(segment: &MessageSegment) -> String {
     match segment {
         MessageSegment::Text(text) => text.clone(),
         MessageSegment::At(user_id) => format!("[at:qq={user_id}]"),
+        MessageSegment::AtAll => "[at:qq=all]".to_string(),
+        MessageSegment::Reply(message_id) => format!("[reply:id={message_id}]"),
+        MessageSegment::Face(id) => format!("[face:id={id}]"),
+        MessageSegment::Record { url, file } => format!("[record:{}]", media_hint(url, file)),
+        MessageSegment::Video { url, file } => format!("[video:{}]", media_hint(url, file)),
+        MessageSegment::File { name, size, .. } => format!("[file:{name}({size})]"),
+        MessageSegment::Poke { name, target } => format!("[poke:{name}(qq={target})]"),
+        MessageSegment::Location { name, .. } => format!("[location:{name}]"),
+        MessageSegment::Json(_) => "[json]".to_string(),
+        MessageSegment::Xml(_) => "[xml]".to_string(),
         MessageSegment::Forward { title, .. } => format!("[合并转发:{title}]"),
         MessageSegment::Image { url, file, data } => {
             if data.is_some() {
                 "[arona:image,url=base64://...]".to_string()
-            } else if let Some(url) = url {
-                format!("[arona:image,url={url}]")
-            } else if let Some(file) = file {
-                format!("[arona:image,file={file}]")
             } else {
-                "[arona:image]".to_string()
+                match media_hint(url, file) {
+                    hint if hint.is_empty() => "[arona:image]".to_string(),
+                    hint => format!("[arona:image,{hint}]"),
+                }
             }
         }
+    }
+}
+
+/// 控制台里媒体段的取值提示：URL 优先，其次文件路径
+fn media_hint(url: &Option<String>, file: &Option<String>) -> String {
+    match (url, file) {
+        (Some(url), _) => format!("url={url}"),
+        (_, Some(file)) => format!("file={file}"),
+        _ => String::new(),
     }
 }
 

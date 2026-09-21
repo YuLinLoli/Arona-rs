@@ -81,6 +81,12 @@ pub fn info(message: impl Into<String>) {
     log("INFO", &message);
 }
 
+/// 诊断级日志（插件恢复、配置回写失败这类不值得惊动运维的细节）
+pub fn debug(message: impl Into<String>) {
+    let message = message.into();
+    log("DEBUG", &message);
+}
+
 pub fn warning(message: impl Into<String>) {
     let message = message.into();
     log("WARNING", &message);
