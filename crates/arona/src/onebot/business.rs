@@ -7,6 +7,7 @@ use crate::onebot::message_sender::OneBotMessageSender;
 use crate::onebot::model::{OneBotAction, OneBotEvent};
 use crate::onebot::protocol;
 use crate::runtime::dispatcher::{CommandContext, CommandDispatcher};
+use crate::runtime::message::MessageSegment;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
@@ -81,6 +82,12 @@ impl StandaloneBusinessHandler {
         }
         // 命令匹配读的是剥掉"@机器人 前缀"的文本：群消息里 @Arona /单抽 的首词才是命令名
         let text = protocol::command_text(&event, self_id);
+        let segments = protocol::extract_segments(&event);
+        // 引用段被 command_text 剥掉了，插件要靠这个值才知道"用户引用了哪条消息"
+        let quoted = segments.iter().find_map(|segment| match segment {
+            MessageSegment::Reply(message_id) => Some(*message_id),
+            _ => None,
+        });
         // 纯图片/表情这类没有文本的消息，没有可分发的命令，但事件钩子照样要收到
         let has_command = !text.is_empty();
         let Some(user_id) = event.user_id else { return };
@@ -125,6 +132,10 @@ impl StandaloneBusinessHandler {
             sender_name,
             is_admin,
             sender_role,
+            message_id: event.message_id,
+            time: event.time,
+            quoted,
+            segments,
             sender,
         });
         let dispatcher = self.dispatcher.clone();

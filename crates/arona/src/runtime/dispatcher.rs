@@ -14,7 +14,9 @@
 //! - 命令名可开最短前缀匹配（`/ban` 能命中 `/banuser`），歧义时回显候选；
 //! - 处理器 panic 只废掉这一次调用，并记在归属插件名下（见 [`crate::plugin::health`]）。
 use super::args::{self, ArgSpec, Args};
-use super::message::{BoxFuture, MessageReceipt, MessageSender, MessageTarget, OutgoingMessage};
+use super::message::{
+    BoxFuture, MessageReceipt, MessageSegment, MessageSender, MessageTarget, OutgoingMessage,
+};
 use super::priority::{CommandPriority, Priority};
 use crate::framework::Framework;
 use crate::plugin::health::HealthBoard;
@@ -110,6 +112,14 @@ pub struct CommandContext {
     pub is_admin: bool,
     /// 事件里自带的群身份；私聊或实现端没给 sender.role 时为 None
     pub sender_role: Option<GroupRole>,
+    /// 本条消息的 message_id（实现端没回时为 None）
+    pub message_id: Option<i64>,
+    /// 本条消息的时间戳（秒），用来判断"引用的那条还能不能在协议层引用到"
+    pub time: i64,
+    /// 这条消息引用了哪条消息（OneBot 的 reply 段）。`text` 里已剥掉它，值留在这里
+    pub quoted: Option<i64>,
+    /// 完整消息段：命令文本剥掉了召唤前缀，段里仍能看到 @、引用与图片
+    pub segments: Vec<MessageSegment>,
     pub sender: Arc<dyn MessageSender>,
 }
 
@@ -899,6 +909,10 @@ mod tests {
             sender_name: None,
             is_admin: false,
             sender_role: None,
+            message_id: None,
+            time: 0,
+            quoted: None,
+            segments: Vec::new(),
             sender: Arc::new(NullSender),
         })
     }
@@ -1256,6 +1270,10 @@ mod tests {
             sender_name: None,
             is_admin: false,
             sender_role: None,
+            message_id: None,
+            time: 0,
+            quoted: None,
+            segments: Vec::new(),
             sender,
         });
         assert!(registry.dispatch(context).await);

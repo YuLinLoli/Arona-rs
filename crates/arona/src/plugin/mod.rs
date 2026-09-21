@@ -232,6 +232,10 @@ mod tests {
             sender_name: None,
             is_admin: false,
             sender_role: None,
+            message_id: None,
+            time: 0,
+            quoted: None,
+            segments: Vec::new(),
             sender: Arc::new(NullSender),
         })
     }
