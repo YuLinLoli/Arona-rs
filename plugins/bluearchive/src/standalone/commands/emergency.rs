@@ -12,15 +12,18 @@ pub struct EmergencyStop {
     duration_minutes: i64,
     start_ms: i64,
     votes: HashSet<i64>,
+    /// 投票通过时要关停的服务表（本插件被装配进的那套注册表）
+    board: Arc<services::ServiceManager>,
 }
 
 impl EmergencyStop {
-    pub fn new() -> EmergencyStop {
+    pub fn new(board: Arc<services::ServiceManager>) -> EmergencyStop {
         EmergencyStop {
             times: 5,
             duration_minutes: 5,
             start_ms: chrono::Utc::now().timestamp_millis(),
             votes: HashSet::new(),
+            board,
         }
     }
 
@@ -34,7 +37,7 @@ impl EmergencyStop {
         }
         self.votes.insert(user_id);
         if self.votes.len() >= self.times {
-            for service in services::manager().all() {
+            for service in self.board.all() {
                 service.enable.store(false, Ordering::SeqCst);
             }
             return Some(OutgoingMessage::text("达到目标票数,紧急停止"));
@@ -45,11 +48,5 @@ impl EmergencyStop {
             self.times,
             self.duration_minutes - minutes
         )))
-    }
-}
-
-impl Default for EmergencyStop {
-    fn default() -> Self {
-        EmergencyStop::new()
     }
 }

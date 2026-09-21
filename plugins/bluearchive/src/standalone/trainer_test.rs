@@ -30,7 +30,7 @@ impl MessageSender for CaptureSender {
 }
 
 fn setup() -> (
-    Arc<arona::runtime::dispatcher::SimpleCommandDispatcher>,
+    Arc<arona::runtime::dispatcher::CommandDispatcher>,
     Arc<CaptureSender>,
     i64,
 ) {
@@ -45,7 +45,8 @@ fn setup() -> (
         send_image_as_file: false,
         connections: std::collections::BTreeMap::new(),
     };
-    let dispatcher = crate::standalone::dispatcher::build(config);
+    crate::standalone::dispatcher::register_into_table(config);
+    let dispatcher = Arc::new(arona::runtime::dispatcher::CommandDispatcher::new());
     let sender = Arc::new(CaptureSender {
         sent: Mutex::new(Vec::new()),
     });

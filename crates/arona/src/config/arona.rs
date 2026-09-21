@@ -68,55 +68,216 @@ pub trait ConfigSection: Send + Sync + 'static {
     fn render(&self, value: &Value) -> String;
 }
 
-/// 已登记的配置区：(归属插件 id, 渲染器)，按登记顺序写出
-static SECTIONS: RwLock<Vec<(String, Arc<dyn ConfigSection>)>> = RwLock::new(Vec::new());
-
-/// 登记一个插件配置区（install 阶段调用；键重复时保留先登记的）
-pub fn register_section(plugin: &str, section: Arc<dyn ConfigSection>) {
-    let mut sections = SECTIONS.write().unwrap();
-    if !sections.iter().any(|(_, item)| item.key() == section.key()) {
-        sections.push((plugin.to_string(), section));
+/// 插件的强类型配置（对应 mirai-console 的 `ConfigKey<T>` + `byConfigManager`）
+///
+/// 实现者只写一个 serde 结构 + 字段注释，模板渲染、默认值补齐、未知子键过滤全部由
+/// 框架完成（经 [`typed_section`] 变成 [`ConfigSection`]），插件不再手写 YAML。
+/// 读写入口见 [`super::plugin_config::ConfigEntry`]。
+pub trait PluginConfig:
+    Serialize + serde::de::DeserializeOwned + Default + Send + Sync + 'static
+{
+    /// 区块标题：写在配置区最前面的一行注释
+    const TITLE: &'static str = "";
+    /// 区块说明：跟在标题后面的若干行
+    const DOC: &'static str = "";
+    /// 字段注释。路径不含区块自身的键名，嵌套用点号，如 `override.name`
+    fn comment(_path: &str) -> Option<&'static str> {
+        None
     }
 }
 
-fn sections() -> Vec<(String, Arc<dyn ConfigSection>)> {
-    SECTIONS.read().unwrap().clone()
+/// [`PluginConfig`] 到 [`ConfigSection`] 的适配器
+pub struct TypedSection<T: PluginConfig> {
+    key: &'static str,
+    marker: std::marker::PhantomData<T>,
+}
+
+/// 把一个强类型配置登记成框架认识的配置区
+pub fn typed_section<T: PluginConfig>(key: &'static str) -> Arc<dyn ConfigSection> {
+    Arc::new(TypedSection::<T> {
+        key,
+        marker: std::marker::PhantomData,
+    })
+}
+
+impl<T: PluginConfig> ConfigSection for TypedSection<T> {
+    fn key(&self) -> &'static str {
+        self.key
+    }
+
+    fn default_value(&self) -> Value {
+        serde_yaml::to_value(T::default()).unwrap_or(Value::Null)
+    }
+
+    fn render(&self, value: &Value) -> String {
+        // 先过一遍强类型：用户手写的未知子键在这一步就被丢掉，落盘的永远是干净的默认结构
+        let config: T = serde_yaml::from_value(value.clone()).unwrap_or_default();
+        let node = serde_yaml::to_value(&config).unwrap_or(Value::Null);
+        let mut out = String::new();
+        if !T::TITLE.is_empty() {
+            out.push_str(&format!(
+                "# ==================== {} ====================\n",
+                T::TITLE
+            ));
+        }
+        for line in T::DOC.lines() {
+            out.push_str(&format!("# {line}\n"));
+        }
+        render_node(&mut out, self.key, "", &node, 0, T::comment);
+        out
+    }
+}
+
+fn write_comment(
+    out: &mut String,
+    pad: &str,
+    path: &str,
+    comment: impl Fn(&str) -> Option<&'static str>,
+) {
+    if let Some(text) = comment(path) {
+        for line in text.lines() {
+            out.push_str(&format!("{pad}# {line}\n"));
+        }
+    }
+}
+
+/// 递归写出一个 YAML 节点，注释按点分路径查。
+/// `comment` 要 `Copy`：递归时按值往下传，`&impl Fn` 的写法会让每层多套一层引用而爆类型推断。
+fn render_node(
+    out: &mut String,
+    key: &str,
+    path: &str,
+    node: &Value,
+    indent: usize,
+    comment: impl Fn(&str) -> Option<&'static str> + Copy,
+) {
+    let pad = "  ".repeat(indent);
+    match node {
+        Value::Mapping(map) if !map.is_empty() => {
+            write_comment(out, &pad, path, comment);
+            out.push_str(&format!("{pad}{key}:\n"));
+            for (child_key, child_value) in map {
+                let name = child_key.as_str().unwrap_or("?");
+                let child_path = if path.is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{path}.{name}")
+                };
+                render_node(out, name, &child_path, child_value, indent + 1, comment);
+            }
+        }
+        Value::Sequence(items) if !items.is_empty() => {
+            write_comment(out, &pad, path, comment);
+            // 元素结构由类型定义决定，注释只能给到数组本身；逐条按块式 YAML 缩进写出
+            match serde_yaml::to_string(node) {
+                Ok(text) => {
+                    out.push_str(&format!("{pad}{key}:\n"));
+                    for line in text.lines() {
+                        out.push_str(&format!("{pad}  {line}\n"));
+                    }
+                }
+                Err(_) => out.push_str(&format!("{pad}{key}: []\n")),
+            }
+        }
+        other => {
+            write_comment(out, &pad, path, comment);
+            let text = match other {
+                Value::Mapping(_) => "{}".to_string(),
+                Value::Sequence(_) => "[]".to_string(),
+                Value::Null => "null".to_string(),
+                scalar => serde_yaml::to_string(scalar)
+                    .unwrap_or_default()
+                    .trim_end_matches('\n')
+                    .to_string(),
+            };
+            out.push_str(&format!("{pad}{key}: {text}\n"));
+        }
+    }
+}
+
+/// 已登记的配置区：(归属插件 id, 渲染器)，按登记顺序写出
+#[derive(Default)]
+pub struct SectionRegistry {
+    items: RwLock<Vec<(String, Arc<dyn ConfigSection>)>>,
+}
+
+impl SectionRegistry {
+    fn snapshot(&self) -> Vec<(String, Arc<dyn ConfigSection>)> {
+        self.items.read().unwrap().clone()
+    }
+
+    /// 登记一个插件配置区（install 阶段调用；键重复时保留先登记的）
+    pub fn register(&self, plugin: &str, section: Arc<dyn ConfigSection>) {
+        let mut items = self.items.write().unwrap();
+        if !items.iter().any(|(_, item)| item.key() == section.key()) {
+            items.push((plugin.to_string(), section));
+        }
+    }
+
+    /// 某个插件登记的配置区（按登记顺序）
+    pub fn sections_of(&self, plugin: &str) -> Vec<Arc<dyn ConfigSection>> {
+        self.snapshot()
+            .into_iter()
+            .filter(|(owner, _)| owner == plugin)
+            .map(|(_, section)| section)
+            .collect()
+    }
+
+    /// 登记了配置区的插件 id（去重，按首次登记顺序）——框架据此决定要给谁生成配置文件
+    pub fn owners(&self) -> Vec<String> {
+        let mut ids: Vec<String> = Vec::new();
+        for (owner, _) in self.snapshot() {
+            if !ids.contains(&owner) {
+                ids.push(owner);
+            }
+        }
+        ids
+    }
+
+    /// 某块配置属于哪个插件
+    pub fn owner(&self, key: &str) -> Option<String> {
+        self.snapshot()
+            .into_iter()
+            .find(|(_, section)| section.key() == key)
+            .map(|(owner, _)| owner)
+    }
+
+    /// 已登记的插件配置区键名列表
+    pub fn keys(&self) -> Vec<String> {
+        self.snapshot()
+            .into_iter()
+            .map(|(_, section)| section.key().to_string())
+            .collect()
+    }
+}
+
+fn registry() -> &'static SectionRegistry {
+    crate::framework::Framework::global().sections()
+}
+
+/// 登记一个插件配置区（install 阶段调用；键重复时保留先登记的）
+pub fn register_section(plugin: &str, section: Arc<dyn ConfigSection>) {
+    registry().register(plugin, section);
 }
 
 /// 某个插件登记的配置区（按登记顺序）
 pub fn sections_of(plugin: &str) -> Vec<Arc<dyn ConfigSection>> {
-    sections()
-        .into_iter()
-        .filter(|(owner, _)| owner == plugin)
-        .map(|(_, section)| section)
-        .collect()
+    registry().sections_of(plugin)
 }
 
 /// 登记了配置区的插件 id（去重，按首次登记顺序）——框架据此决定要给谁生成配置文件
 pub fn section_owners() -> Vec<String> {
-    let mut ids: Vec<String> = Vec::new();
-    for (owner, _) in sections() {
-        if !ids.contains(&owner) {
-            ids.push(owner);
-        }
-    }
-    ids
+    registry().owners()
 }
 
 /// 某块配置属于哪个插件
 pub fn section_owner(key: &str) -> Option<String> {
-    sections()
-        .into_iter()
-        .find(|(_, section)| section.key() == key)
-        .map(|(owner, _)| owner)
+    registry().owner(key)
 }
 
 /// 已登记的插件配置区键名列表
 pub fn section_keys() -> Vec<String> {
-    sections()
-        .into_iter()
-        .map(|(_, section)| section.key().to_string())
-        .collect()
+    registry().keys()
 }
 
 fn read_text(path: &Path) -> std::io::Result<String> {
@@ -145,13 +306,24 @@ const GENERIC_TOP_KEYS: [&str; 5] = [
 const MOVED_TOP_KEYS: [&str; 1] = ["send_image_as_file"];
 
 /// 加载 arona.yml：不存在时从旧后缀/旧 onebot.yml 迁移并生成模板
+///
+/// 认哪些键、旧写法搬到哪个插件的文件，都取自**进程默认框架实例**。
+/// 要在自己的实例上跑（多实例、测试隔离）用 [`load_in`]。
 pub fn load(file: &Path) -> Result<AronaConfig, String> {
+    load_in(crate::framework::Framework::global(), file)
+}
+
+/// 在指定框架实例上加载 arona.yml：配置区归属查它的登记表，接管到的旧写法也并进它的配置文件表。
+pub fn load_in(
+    framework: &crate::framework::Framework,
+    file: &Path,
+) -> Result<AronaConfig, String> {
     if !file.exists() {
         // 1) 旧后缀 arona.yaml 已存在则迁移
         let old_arona = file.parent().map(|p| p.join("arona.yaml"));
         if let Some(old) = old_arona {
             if old.exists() {
-                if let Ok(config) = parse(&old) {
+                if let Ok(config) = parse_in(framework, &old) {
                     save(file, &config).map_err(|e| format!("写入 arona.yml 失败: {e}"))?;
                     crate::runtime::log::info(format!(
                         "[Arona] 检测到旧版 arona.yaml，已迁移到 {}",
@@ -162,7 +334,7 @@ pub fn load(file: &Path) -> Result<AronaConfig, String> {
             }
         }
         // 2) 从旧 onebot.yml/yaml 迁移 groups/managers（插件配置区同样搬进各自的文件）
-        let legacy = read_legacy_from_onebot(file);
+        let legacy = read_legacy_from_onebot(framework, file);
         let config = AronaConfig {
             groups: legacy
                 .as_ref()
@@ -177,10 +349,10 @@ pub fn load(file: &Path) -> Result<AronaConfig, String> {
         save(file, &config).map_err(|e| format!("写入 arona.yml 失败: {e}"))?;
         return Ok(config);
     }
-    parse(file)
+    parse_in(framework, file)
 }
 
-fn parse(file: &Path) -> Result<AronaConfig, String> {
+fn parse_in(framework: &crate::framework::Framework, file: &Path) -> Result<AronaConfig, String> {
     let text = read_text(file).map_err(|e| format!("读取 {} 失败: {e}", file.display()))?;
     let value: Value = serde_yaml::from_str(&text)
         .map_err(|e| format!("arona.yml 解析失败，请检查格式（参考同目录说明）: {e}"))?;
@@ -188,7 +360,8 @@ fn parse(file: &Path) -> Result<AronaConfig, String> {
         .map_err(|e| format!("arona.yml 解析失败，请检查格式（参考同目录说明）: {e}"))?;
     // 未知顶层键：serde 默认静默忽略（例如把 onebot.yml 的 connections 写进本文件），
     // 用户会以为配置生效了，这里逐个写进日志提示；已登记的插件配置区键则搬去插件自己的文件。
-    let registered = section_keys();
+    let registry = framework.sections();
+    let registered = registry.keys();
     let mut moved: Vec<String> = Vec::new();
     if let Some(map) = value.as_mapping() {
         for (key, val) in map {
@@ -199,9 +372,9 @@ fn parse(file: &Path) -> Result<AronaConfig, String> {
                 crate::runtime::log::warning(format!(
                     "arona.yml 的「{name}」已移动到 onebot.yml（本项已忽略），请在 onebot.yml 里设置，或用管理面板「OneBot 连接」页的「发送设置」勾选"
                 ));
-            } else if let Some(owner) = section_owner(name) {
+            } else if let Some(owner) = registry.owner(name) {
                 // 旧版把插件配置写在框架 arona.yml 顶层：交给插件配置模块搬进它自己的文件
-                super::plugin_config::absorb_legacy(name, val.clone(), &owner);
+                framework.configs().absorb_legacy(name, val.clone(), &owner);
                 moved.push(name.to_string());
             } else {
                 crate::runtime::log::warning(format!(
@@ -239,7 +412,10 @@ struct LegacyExtra {
 
 /// 旧版 onebot.yml 中可能存在的业务字段：迁移框架的 groups/managers；
 /// 已登记插件配置区的同名顶层键交给插件配置模块接管
-fn read_legacy_from_onebot(arona_file: &Path) -> Option<LegacyExtra> {
+fn read_legacy_from_onebot(
+    framework: &crate::framework::Framework,
+    arona_file: &Path,
+) -> Option<LegacyExtra> {
     let parent = arona_file.parent()?;
     let new_file = parent.join("onebot.yml");
     let onebot = if new_file.exists() {
@@ -266,9 +442,10 @@ fn read_legacy_from_onebot(arona_file: &Path) -> Option<LegacyExtra> {
     {
         extra.managers = managers;
     }
-    for key in section_keys() {
-        if let (Some(val), Some(owner)) = (map.get(&key), section_owner(&key)) {
-            super::plugin_config::absorb_legacy(&key, val.clone(), &owner);
+    let registry = framework.sections();
+    for key in registry.keys() {
+        if let (Some(val), Some(owner)) = (map.get(&key), registry.owner(&key)) {
+            framework.configs().absorb_legacy(&key, val.clone(), &owner);
         }
     }
     Some(extra)
@@ -379,5 +556,87 @@ mod tests {
         let config = load(&file).expect("已迁移的旧键不应导致加载失败");
         assert_eq!(config.groups, vec![10001]);
         let _ = std::fs::remove_file(&file);
+    }
+
+    #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+    #[serde(default)]
+    struct DemoAlert {
+        hour: u32,
+        text: String,
+    }
+
+    #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+    #[serde(default)]
+    struct DemoConfig {
+        enable: bool,
+        black_groups: Vec<i64>,
+        extra: BTreeMap<String, String>,
+        alert: DemoAlert,
+    }
+
+    impl PluginConfig for DemoConfig {
+        const TITLE: &'static str = "渲染契约自检";
+        const DOC: &'static str = "第一行\n第二行";
+        fn comment(path: &str) -> Option<&'static str> {
+            Some(match path {
+                "black_groups" => "空的也要渲染成 []",
+                "alert" => "嵌套块",
+                "alert.hour" => "推送小时(0-23)",
+                _ => return None,
+            })
+        }
+    }
+
+    /// 回归：空列表过去会被渲染成 `{}`，空映射才是 `{}`。
+    /// 渲染出的 YAML 必须能原样读回强类型，且注释按点分路径落在正确的缩进上。
+    #[test]
+    fn typed_section_renders_empty_collections_with_yaml_flows() {
+        let section = typed_section::<DemoConfig>("demo");
+        let text = section.render(&Value::Null);
+
+        assert!(text.starts_with("# ==================== 渲染契约自检 ====================\n# 第一行\n# 第二行\ndemo:\n"), "{text}");
+        assert!(
+            text.contains("\n  black_groups: []\n"),
+            "空列表应渲染为 []: {text}"
+        );
+        assert!(
+            text.contains("\n  extra: {}\n"),
+            "空映射应渲染为 {{}}: {text}"
+        );
+        assert!(
+            text.contains("  # 空的也要渲染成 []\n  black_groups:"),
+            "数组注释应紧贴键: {text}"
+        );
+        assert!(
+            text.contains("    # 推送小时(0-23)\n    hour: 0\n"),
+            "嵌套字段注释应按 alert.hour 命中并多缩进一层: {text}"
+        );
+
+        let file: BTreeMap<String, DemoConfig> =
+            serde_yaml::from_str(&text).expect("模板应能读回强类型");
+        assert_eq!(file["demo"].black_groups, Vec::<i64>::new());
+        assert!(file["demo"].extra.is_empty());
+        assert!(!file["demo"].enable);
+
+        let filled = serde_yaml::to_value(DemoConfig {
+            enable: true,
+            black_groups: vec![999, 1001],
+            extra: BTreeMap::from([("a".to_string(), "b".to_string())]),
+            alert: DemoAlert {
+                hour: 8,
+                text: "预警".to_string(),
+            },
+        })
+        .unwrap();
+        let text = section.render(&filled);
+        assert!(
+            text.contains("  black_groups:\n    - 999\n    - 1001\n"),
+            "非空列表应块式缩进: {text}"
+        );
+        let file: BTreeMap<String, DemoConfig> =
+            serde_yaml::from_str(&text).expect("有值模板应能读回强类型");
+        assert_eq!(file["demo"].black_groups, vec![999, 1001]);
+        assert_eq!(file["demo"].alert.text, "预警");
+        assert_eq!(file["demo"].extra["a"], "b");
     }
 }

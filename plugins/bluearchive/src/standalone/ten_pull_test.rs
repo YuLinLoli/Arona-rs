@@ -40,14 +40,15 @@ async fn ten_pull_outputs_image_into_standalone() {
     arona::runtime::config::set_end_with_sensei("老师".to_string());
     assert!(crate::db::start(), "数据库初始化失败");
 
-    // 命令分发器（build 内部会注册全部服务）
+    // 命令登记（registrations 内部会注册全部服务），再由框架的命令表按名分发
     let config = arona::config::onebot::OneBotConfig {
         self_id: 10000,
         nickname: "Arona".to_string(),
         send_image_as_file: false,
         connections: std::collections::BTreeMap::new(),
     };
-    let dispatcher = crate::standalone::dispatcher::build(config);
+    crate::standalone::dispatcher::register_into_table(config);
+    let dispatcher = Arc::new(arona::runtime::dispatcher::CommandDispatcher::new());
 
     let sender = Arc::new(CaptureSender {
         sent: Mutex::new(Vec::new()),

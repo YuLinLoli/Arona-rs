@@ -20,9 +20,10 @@ mod runtime;
 mod standalone;
 mod util;
 
-use arona::plugin::{AronaPlugin, PluginContext, PluginMeta};
+use arona::plugin::{AronaPlugin, PluginContext, PluginMeta, PluginRegistrar};
 use arona::runtime::config::Feature;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
 
 /// 本插件的稳定 id：框架按它规定落盘位置（`plugins/bluearchive/`、`config/bluearchive/arona.yml`、
@@ -147,47 +148,45 @@ const FEATURES: [Feature; 10] = [
 /// 每日活动推送任务名（与 activity::notify::enable_daily_job 保持一致）
 const DAILY_NOTIFY_JOB: &str = "StandaloneActivityNotify";
 
-/// 启动 20 秒后的首次预警任务名（create_delay 固定归在 "Delay" 组，只能按名字取消）
-const DAILY_NOTIFY_INIT_JOB: &str = "StandaloneActivityNotifyInit";
-
 /// 上一次生效的推送小时（-1 = 尚未初始化）：arona.yml 热重载后据此判断是否需要重建每日任务
 static LAST_NOTIFY_HOUR: AtomicI32 = AtomicI32::new(-1);
 
 impl AronaPlugin for BluearchivePlugin {
     fn meta(&self) -> PluginMeta {
-        PluginMeta {
-            id: PLUGIN_ID,
-            name: "BluearchivePlugin",
-            version: env!("CARGO_PKG_VERSION"),
-            description: "碧蓝档案功能插件（抽卡/活动/攻略/塔罗/名字记录/备份恢复）",
-        }
+        PluginMeta::new(
+            PLUGIN_ID,
+            "BluearchivePlugin",
+            env!("CARGO_PKG_VERSION"),
+            "碧蓝档案功能插件（抽卡/活动/攻略/塔罗/名字记录/备份恢复）",
+        )
+        .with_author("Arona-rs")
     }
 
-    fn install(&self) -> Result<(), String> {
+    fn install(&self, reg: &PluginRegistrar) -> Result<(), String> {
         // 先把旧目录里的数据补迁到统一位置，后面的建库/读图才找得到东西
         migrate_legacy_dirs();
         // 登记功能开关：框架 GUI 的「功能开关」页与配置模板注释据此生成
         for feature in FEATURES {
-            arona::admin::register_feature(feature, PLUGIN_ID);
+            reg.feature(feature);
         }
         // 登记本插件自持有的配置区（notify / trainer）：必须早于框架加载配置，
         // 否则 config/bluearchive/arona.yml 生成不出它们的带注释模板。
-        config::register_sections();
+        config::register_sections(reg.framework());
         Ok(())
     }
 
     fn configure(&self, ctx: &PluginContext) -> Result<(), String> {
-        // 构建本插件的命令分发器（内部会注册全部服务），交给框架装配业务处理器
-        let dispatcher = standalone::dispatcher::build(ctx.onebot_config.clone());
-        ctx.set_dispatcher(dispatcher);
+        // 把本插件的全部命令与兜底登记进框架的命令表（内部会注册全部服务）
+        standalone::dispatcher::register(ctx, ctx.onebot_config.clone());
 
         // --test-notify：20 秒后完整跑一次每日推送，便于联调验证
         if ctx.test_notify {
-            arona::quartz::create_delay(
+            let context = ctx.clone();
+            ctx.delay_job(
                 20,
                 "TestNotify",
-                std::sync::Arc::new(|| {
-                    tokio::spawn(async move {
+                Arc::new(move || {
+                    context.spawn(async {
                         activity::notify::push(false).await;
                     });
                 }),
@@ -197,32 +196,36 @@ impl AronaPlugin for BluearchivePlugin {
         Ok(())
     }
 
-    fn start(&self) {
+    fn start(&self, ctx: &PluginContext) -> Result<(), String> {
         arona::runtime::log::info("initializing database...");
         if !db::start() {
+            // 库起不来只影响抽卡/名字记录这类要落库的功能，活动与攻略查询照常，
+            // 所以记错误但不下线整个插件。
             arona::runtime::log::error("database init failed");
         }
         util::tarot::ensure_initialized();
 
-        // 后台预热：kivo 学生数据 + 启动刷新本地资源图片（活动日历图 / 塔罗图）
-        tokio::spawn(async move {
+        // 后台预热：kivo 学生数据 + 启动刷新本地资源图片（活动日历图 / 塔罗图）。
+        // 走 ctx.spawn 而不是裸 tokio::spawn：插件被停用时框架要能取消它们。
+        ctx.spawn(async move {
             data::kivo::init().await;
         });
-        tokio::spawn(async move {
+        ctx.spawn(async move {
             standalone::commands::activity::refresh_all_images().await;
             standalone::commands::tarot::download_all_images().await;
         });
 
         // 每日活动推送（含启动 20 秒后的预警初始化）+ 每天 0 点的本地资源图片刷新
-        activity::notify::enable_service();
+        activity::notify::enable_service(ctx);
         LAST_NOTIFY_HOUR.store(
             config::notify().every_day_hour.clamp(0, 23),
             Ordering::SeqCst,
         );
         standalone::commands::activity::enable_image_refresh_job();
+        Ok(())
     }
 
-    fn on_config_reload(&self) {
+    fn on_config_reload(&self, _ctx: &PluginContext) {
         // 框架在每次热重载/写入后都会回调这里；只有推送小时真的变了才重建每日任务。
         let hour = config::notify().every_day_hour.clamp(0, 23);
         let previous = LAST_NOTIFY_HOUR.swap(hour, Ordering::SeqCst);
@@ -238,17 +241,9 @@ impl AronaPlugin for BluearchivePlugin {
         arona::runtime::log::info(format!("推送小时变更，重建每日任务: 每天 {hour} 点"));
     }
 
-    fn stop(&self) {
-        // 进程退出与「被禁用」都走这里：先取消本插件的全部定时任务，
-        // 不然禁用了还照点在群里推日历/预警。
-        for group in [
-            DAILY_NOTIFY_JOB,
-            "StandaloneActivityNotifyOneHour",
-            "AronaActivityImageRefresh",
-        ] {
-            arona::quartz::remove_group(group);
-        }
-        arona::quartz::remove(DAILY_NOTIFY_INIT_JOB);
+    fn stop(&self, _ctx: &PluginContext) {
+        // 定时任务与后台命令不用在这里逐个取消：框架在 stop 之后按插件归属整组回收
+        // （见 arona::plugin::manager::revoke_resources）。这里只关自己打开的库。
         db::close();
     }
 }

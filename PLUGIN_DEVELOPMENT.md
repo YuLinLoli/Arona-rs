@@ -1,6 +1,8 @@
 # Arona 插件开发指南
 
-本项目已拆成「框架 + 插件」两部分。框架只提供 **OneBot 连接（含 v11 全量动作接口与事件钩子）、管理面板(GUI)、群授权/黑名单、插件与功能的启停门控、命令分发骨架** 与启动/关闭的生命周期编排；具体功能（抽卡、活动日历、攻略、塔罗……）一律以**插件**形式实现并插入框架。
+本项目拆成「框架 + 功能插件」两层。框架只提供 **OneBot 连接（含 v11 全量动作接口与事件钩子）、管理面板(GUI)、群授权/黑名单、插件与功能的启停门控、命令分发骨架** 与生命周期编排；具体功能（抽卡、活动日历、攻略、塔罗……）一律以**插件**形式实现并插入框架。
+
+插件契约对齐 [mirai](https://docs.mirai.com) 的插件模型（`PluginManager` / `plugin.yml` / `ApiVersion` / `EventPriority` / `CommandManager` / `CoroutineScope` / `DiContainer` / `ConfigKey`），只是把 Kotlin 的挂起函数与 JVM 类加载换成 Rust 的 `async` 与静态注册。§3 给出逐项对照。
 
 ## 1. 目录与版本
 
@@ -13,8 +15,9 @@ plugins/bluearchive/       # 碧蓝档案功能插件：name=bluearchive-plugin,
 ```
 
 版本约定：框架与 host 同为 `1.0.0`；功能插件 `BluearchivePlugin` 的版本号（`0.3.4`）接替拆分前本项目的版本号，随插件功能演进单独递增。
+**插件接口的破坏性改动抬 `arona::plugin::FRAMEWORK_API_VERSION`**（与 crate 版本号无关），见 §6。
 
-运行期的落盘目录由框架统一规定（见 §5），插件不自己挑地方：
+运行期的落盘目录由框架统一规定（见 §7），插件不自己挑地方：
 
 ```
 <运行目录>/
@@ -38,61 +41,138 @@ arona-host  ──depends──▶  arona (框架)
                             └──depends──▶ arona (框架)
 ```
 
-框架反向调用插件只能通过 `arona::plugin` 提供的一套接口（注册表 + 生命周期编排 + 分发器槽位 + 功能开关/配置区登记），加上 `arona::onebot::hooks`（事件订阅）与 `arona::onebot::api`（动作出口）。任何“框架里 `use bluearchive_plugin::…`”都是设计违规。
+框架反向调用插件只能通过 `arona::plugin`（契约层：注册表 + 生命周期编排 + 目录/登记交接面），加上
+`arona::onebot::hooks`（事件订阅）、`arona::runtime::dispatcher`（命令表）、`arona::container`（服务）、
+`arona::config`（配置）与 `arona::quartz`（定时任务）。任何"框架里 `use bluearchive_plugin::…`"都是设计违规。
 
-## 3. 生命周期（框架 `arona::run` → `run_bot` 的真实顺序）
+### 注册表挂在哪：`Framework` 实例
+
+上面那些表不是各模块各自抱一个 `static`，而是统一由 `arona::framework::Framework` 持有（对应 mirai 的 `MiraiInstance`）：
+
+| 访问器 | 表 | mirai 里的对应物 |
+| --- | --- | --- |
+| `gating()` | 功能清单 + 停用/黑名单门控 | 插件启停判定 |
+| `commands()` | 命令表（含兜底处理器） | `CommandManager` |
+| `hooks()` | 事件钩子表 | `Listener` 注册表 |
+| `container()` | 服务容器（按类型共享能力） | `DiContainer` |
+| `services()` | 服务开关表（可单独关停的功能单元，GUI「服务管理」页读它） | — |
+| `sections()` | 插件配置区登记表 | `ConfigKey` 声明 |
+| `configs()` | 插件配置文件的加载/待补状态 | `ConfigManager` |
+| `jobs()` | 定时任务表 | — |
+| `loaders()` / `plugins()` | 装载器登记表与插件表 | `PluginManager` |
+
+两轨入口：
+
+- `Framework::global()` —— 进程默认实例。`arona::container::instance`、`arona::runtime::dispatcher::register`、
+  GUI 用的 `runtime::config::*` 等自由函数统统转发到它，所以既有调用方（含 GUI）一行都不用改。
+- `Framework::new()` —— 一套全空的隔离实例，返回 `Arc<Framework>`。测试与将来的多实例宿主用它；
+  `PluginManager` / `PluginContext` 拿的是实例引用，不碰进程级状态。
+
+`PluginRegistrar::framework()` 与 `PluginContext::framework()` 把实例交给插件，插件登记出去的每一样东西
+因此天然知道自己属于哪张表、归属哪家插件——按归属回收才有依据（§13）。
+
+**刻意留在进程级的**：日志（`runtime::log`）、目录约定（`runtime::paths`）、OneBot 连接
+（`onebot::application` / `onebot::connection`）、控制台（`runtime::console`）、运行期服务引用
+（`runtime::services`：data root 与消息发送器）、框架自身 `config/arona.yml` 的持有者
+（`config::standalone`）、软渲染兜底（`runtime::softgl`）。它们是「一个进程只有一份」的宿主资源，
+不是插件契约的注册表；拆成实例只会让 GUI 和连接层多出一堆无意义的参数。
+
+## 3. 与 mirai 的对应关系
+
+| mirai | Arona | 落在哪 |
+| --- | --- | --- |
+| `MiraiInstance.reference()` 拿到的那套全局注册表 | `arona::framework::Framework::global()`（进程默认实例）/ `Framework::new()`（隔离实例），持有下面所有表 | `framework.rs` |
+| `PluginManager.loadPlugin / enablePlugin / disablePlugin` | `arona::plugin::PluginManager` + `install_all` / `configure_all` / `start_all` / `disable` / `stop_all` | `crates/arona/src/plugin/manager.rs` |
+| jar 内 `plugin.yml`（`PluginDescriptor`） | `PluginMeta` → 框架渲染成 `plugins/<id>/plugin.yml` | `plugin/description.rs` |
+| `ApiVersion.isCompatibleWith`（主版本相等 + 框架次版本不低于要求） | `ApiVersion::satisfies` + `check_api` 握手 | 同上 + `manager.rs` |
+| `plugin.depend` / `softDepend` | `PluginMeta::depends` / `soft_depends`，`PluginManager::ordered()` 拓扑排序 | `manager.rs` |
+| `CommandManager.registerCommand` | `ctx.command(..)` / `ctx.commands(..)`，按框架实例持有、条目带插件归属 | `runtime/dispatcher.rs` |
+| `EventPriority`（Monitor→Normal→High→Low→Lowest） | `ListenerPriority` / `CommandPriority`（同一份 `runtime::priority::Priority`） | `runtime/priority.rs` |
+| `event.intercept()` | `HookFlow::Handled` | `onebot/hooks.rs` |
+| `plugin.instance.coroutineScope.launch` | `ctx.spawn(..)` / `PluginScope` | `plugin/scope.rs` |
+| `DiContainer.declare` / `instance<T>()` | `ctx.declare_service::<T>(..)` / `ctx.service::<T>()` | `container.rs` |
+| —（原版 Arona 的 `StandaloneServiceInfo` 表） | `arona::services::ServiceManager`：`ctx.register_service(..)`，条目带归属、插件停用时一并撤销 | `services/mod.rs` |
+| `ConfigKey<T>` + `configManager[key]` | `PluginConfig` + `ctx.config::<T>(key)` → `ConfigEntry::<T>::get/set/update` | `config/arona.rs`、`config/plugin_config.rs` |
+
+**没做的一件事**：动态装载（`JvmPluginManager` 那套从目录扫 jar）。装载形态被抽象成 `PluginLoader` trait，
+当前只有 `BUILTIN_LOADER`（编译期静态注册）。将来要加动态装载只需再实现一个 `PluginLoader`，
+插件作者写的代码一行都不用改。
+
+## 4. 生命周期（`arona::run` → `run_bot` 的真实顺序）
 
 宿主在调用 `arona::run(args)` **之前**注册插件（`register_plugins()` 由 `crates/arona-host/build.rs`
-依据 `plugins.toml` 生成，见 §11）；`run` 内部按序驱动各阶段：
+依据 `plugins.toml` 生成，见 §15）；`run` 内部按序驱动四阶段：
 
-1. `plugin::install_all()` —— **早于 `arona.yml` 加载**。逐个插件建好 `plugins/<id>/`、`config/<id>/`、`data/<id>/`
-   并写 `plugins/<id>/plugin.yml`，然后调 `install()`：插件在此登记功能开关（`register_feature`）
-   与自持有的配置区（`register_section`），使生成的配置模板认得这些键并带完整功能清单。
+1. `plugin::install_all()` —— **早于 `arona.yml` 加载**。先消化额外 `PluginLoader`，再按依赖拓扑序逐个插件：
+   建好 `plugins/<id>/`、`config/<id>/`、`data/<id>/` 并写 `plugins/<id>/plugin.yml` → **契约版本握手**
+   （不兼容即标 `Failed`，不跑 install）→ 调 `install(&PluginRegistrar)`：插件在此登记功能开关与配置区，
+   使生成的配置模板认得这些键、注释里带完整功能清单。
    **install 阶段不过滤被禁用的插件**——否则 GUI 列不出它、模板也会丢掉它的配置块。
 2. 加载 `config/arona.yml`（框架业务配置，含热更新）与 `config/onebot.yml`（协议配置）。
    旧版把插件配置键写在框架文件顶层的，这一步会被接管（`plugin_config::absorb_legacy`）。
 3. `config::plugin_config::init()` —— 为每个登记了配置区的插件备好 `config/<id>/arona.yml`
-   （缺文件就生成带注释模板）并加载成原样 YAML 片段。
-4. `plugin::configure_all(&PluginContext)` —— **只对启用的插件调用**。插件构建自己的
-   `SimpleCommandDispatcher` 并 `ctx.set_dispatcher(..)`（框架记下归属插件 id，禁用时整体停路由）。
-5. `plugin::start_all()` —— 只拉起已装配插件的后台任务（数据库、数据预热、定时推送）。
-6. 框架用 `plugin::dispatcher()`（缺省空表兜底）装配 `StandaloneBusinessHandler` 并启动 OneBot 连接。
+   （缺文件就生成带注释模板，升级新增的配置区按默认值补进已有文件）并加载。
+4. `plugin::configure_all(onebot_config, test_notify)` —— **只对生效启用的插件调用**（全局停用名单 +
+   硬依赖可用性，见 §6）。跑 `configure(&PluginContext)`：登记命令与事件订阅、公布服务。
+   状态走 `Installed → Ready`；被停用的停在 `Disabled`。
+5. `plugin::start_all()` —— 对 `Ready` 的插件跑 `start(&PluginContext)`：开数据库、拉预热与定时任务。成功置 `Active`。
+6. 框架装配 `StandaloneBusinessHandler`（持无状态的 `CommandDispatcher` 句柄，真正的命令表挂在
+   `Framework::global()` 上）并启动 OneBot 连接。
 7. 运行中：
-   - `config/arona.yml` 或某个 `config/<插件>/arona.yml` 变更 → 热重载后回调 `plugin::notify_config_reloaded()`
-     （插件文件变更时只回调该插件的 `on_config_reload`）。首次加载不通知（那时 `start()` 已按配置建任务）。
-   - 禁用名单变化 → `plugin::sync_enabled_state()`：新禁用的调 `stop()`，新启用的补跑 `configure()` + `start()`。
-     GUI 开关与手改 `arona.yml` 都走这条路，**不需要重启**。
-   - 收到事件 → 先投给 `arona::onebot::hooks`（§10），无人消费才走命令分发。
-8. 退出（Ctrl+C / GUI 关窗）：`application.stop()` → `plugin::stop_all()` → `quartz::pause_all()`。
+   - `config/arona.yml` 或某个 `config/<插件>/arona.yml` 变更 → 热重载后 `plugin::notify_config_reloaded()`
+     （插件文件变更只回调该插件的 `on_config_reload`）。框架 arona.yml 重载还会先跑 `sync_enabled_state()`。首次加载不通知（那时 `start()` 已按配置建好任务）。
+   - 停用名单变化 → `plugin::sync_enabled_state()`：先按反依赖序停用（被依赖者最后走），再按依赖序补装配
+     （新启用的重跑 `configure()` + `start()`），最后再收一轮"依赖被停掉"的下游。GUI 开关与手改 `arona.yml` 都走这条路，**不需要重启**。
+   - 收到事件 → 先过门控，再按优先级投给 `arona::onebot::hooks`（§9），无人 `Handled` 才走命令分发。
+8. 退出（Ctrl+C / GUI 关窗）：`application.stop()` → `plugin::stop_all()`（反依赖序 `stop()` + 回收）→ `quartz::pause_all()`。
 
-## 4. 插件接口
+## 5. 插件接口
 
 实现 `arona::plugin::AronaPlugin`，方法都有默认实现，只需覆写关心的阶段：
 
 ```rust
 pub trait AronaPlugin: Send + Sync + 'static {
-    fn meta(&self) -> PluginMeta;                                   // 必填
-    fn install(&self) -> Result<(), String> { .. }                  // 登记功能开关/配置区/服务
-    fn configure(&self, ctx: &PluginContext) -> Result<(), String>  // 构建并 ctx.set_dispatcher
-    fn start(&self) { .. }                                          // DB/预热/定时任务
-    fn on_config_reload(&self) { .. }                               // 配置热重载回调
-    fn stop(&self) { .. }                                           // 关 DB/取消定时任务/注销钩子
+    fn meta(&self) -> PluginMeta;                                              // 必填
+    fn install(&self, reg: &PluginRegistrar) -> Result<(), String> { Ok(()) }  // 登记功能开关/配置区
+    fn configure(&self, ctx: &PluginContext) -> Result<(), String> { Ok(()) }  // 登记命令/事件/服务
+    fn start(&self, ctx: &PluginContext) -> Result<(), String> { Ok(()) }      // DB/预热/定时任务
+    fn on_config_reload(&self, ctx: &PluginContext) {}                         // 本插件配置热重载后
+    fn stop(&self, ctx: &PluginContext) {}                                     // 关自己打开的句柄
 }
 ```
 
+`install`/`configure`/`start` 返回 `Err(reason)` 只影响本插件（标 `Failed` 并记日志），**不会拖累其他插件**。
+每个阶段都可能被框架整个跳过（插件被停用、依赖不可用），所以实现里不要放"必须执行一次"的全局初始化；
+那种事交给 `install` 阶段登记，由框架兜住顺序。
+
+交接面分工（把接口用错阶段是最常见的踩坑）：
+
+| 交接面 | 何时拿到 | 能做什么 |
+| --- | --- | --- |
+| `PluginRegistrar` | `install` | 登记 `Feature`、登记 `PluginConfig` 区、取目录路径。**此时框架配置还没加载**，读不到任何配置值 |
+| `PluginContext` | `configure` / `start` / `on_config_reload` / `stop` | 命令、事件、任务、服务、配置读写、OneBot `api()`、目录路径。它 `Clone + Send + Sync`，可以搬进 `async` 闭包 |
+
+## 6. 元数据：id、版本握手与依赖
+
 ### 硬性规范：插件必须有 id、name 与 version
 
-`meta()` 返回的 `PluginMeta { id, name, version, description }` 里 **`id`/`name`/`version` 为强制项**
-（`description` 可留空串）。建议 `version` 直接取 `env!("CARGO_PKG_VERSION")`，与 crate 版本保持一致：
+`meta()` 返回的 `PluginMeta` 里 **`id`/`name`/`version` 为强制项**（`description`/`author` 可留空串）。
+`version` 建议直接取 `env!("CARGO_PKG_VERSION")`，与 crate 版本保持一致：
 
 ```rust
+use arona::plugin::{ApiVersion, PluginMeta};
+
 fn meta(&self) -> PluginMeta {
-    PluginMeta {
-        id: "bluearchive",                 // 目录名与配置里的键都用它
-        name: "BluearchivePlugin",         // GUI/日志展示名
-        version: env!("CARGO_PKG_VERSION"),
-        description: "碧蓝档案功能插件",
-    }
+    PluginMeta::new(
+        "bluearchive",                                  // 目录名与配置里的键都用它
+        "BluearchivePlugin",                            // GUI/日志展示名
+        env!("CARGO_PKG_VERSION"),
+        "碧蓝档案功能插件（抽卡/活动/攻略/塔罗）",
+    )
+    .with_author("Arona-rs")
+    // .requires_api(ApiVersion::new(1, 1, 0))          // 用到比当前框架新的接口时才抬
+    // .depends_on(&["core-data"])                      // 硬依赖：任一缺失/停用则本插件不装配
+    // .soft_depends_on(&["gacha"])                     // 软依赖：只决定装配先后，缺了照样跑
 }
 ```
 
@@ -101,27 +181,39 @@ fn meta(&self) -> PluginMeta {
 `group_settings.<群号>.disabled_plugins` 全都用它。**改名等于换一份用户数据，定下来就别动。**
 匹配时大小写不敏感。
 
-框架用 `plugin::metas()` / `plugin::meta_of(id)` 汇总元信息（GUI「插件管理」页 / 诊断）。
+**契约版本握手**（mirai 的 `ApiVerification`）：框架启动时对每个插件比一次
+`FRAMEWORK_API_VERSION.satisfies(&meta.api_version)`，规则是**主版本号必须相等、框架次版本不低于要求**
+（框架只加能力不删能力，所以要求低版本的插件在新框架上照常跑）。不通过的插件标 `Failed`、不跑 `install`，
+日志写清"要求 api x.y.z，本程序提供 api a.b.c"。默认要求的正是当前契约版本，所以绝大多数插件不用管。
+握手失败的插件**不会被运行期的开关重新拉起**（它恒为"不生效"），只能靠改代码/升框架解决。
 
-## 5. 目录接口：config 与 data 统一由框架分配
+**依赖解析**：`PluginManager::ordered()` 对 `depends + soft_depends` 做拓扑排序（依赖在前，同层保持清单顺序，
+结果稳定）。成环的插件全部标 `Failed("插件依赖成环…")`。`depends` 是硬约束：被依赖者没编译进来、
+被用户停用、或还没 `Installed`，本插件就不装配；用户停掉一个被依赖的插件时，框架会连锁停掉它的下游。
+`soft_depends` 只排顺序。跨插件取能力还要靠服务容器（§11），依赖声明负责保证"取的时候对方已经就位"。
 
-插件**不要自己拼路径**。`PluginContext` 给出本插件的全部目录（框架按 §1 的约定拼）：
+框架用 `plugin::metas()` / `meta_of(id)` / `state_of(id)` 汇总元信息，GUI「插件管理」页与诊断据此展示
+（`manager::summary()` 给总数/运行数）。
+
+## 7. 目录接口：config 与 data 统一由框架分配
+
+插件**不要自己拼路径**。两个交接面都给出本插件的全部目录（框架按 §1 的约定拼）：
 
 | 接口 | 返回 |
 | --- | --- |
-| `ctx.plugin_id()` | 本插件 id（= `meta().id`） |
-| `ctx.plugin_dir()` | `plugins/<id>/` —— 随包资源；`plugin.yml` 由框架维护 |
-| `ctx.config_dir()` | `config/<id>/` —— 插件自己的其它配置文件也放这里 |
+| `ctx.plugin_id()` / `reg.plugin_id()` | 本插件 id（= `meta().id`） |
+| `ctx.plugin_dir()` / `reg.plugin_dir()` | `plugins/<id>/` —— 随包资源；`plugin.yml` 由框架维护 |
+| `ctx.config_dir()` / `reg.config_dir()` | `config/<id>/` —— 插件自己的其它配置文件也放这里 |
 | `ctx.config_file()` | `config/<id>/arona.yml` —— 框架负责生成模板与热重载 |
-| `ctx.data_dir()` | `data/<id>/` —— 数据库、备份等 |
-| `ctx.image_dir()` | `data/<id>/image/` —— 生成的图片、下载的缓存 |
+| `ctx.data_dir()` / `reg.data_dir()` | `data/<id>/` —— 数据库、备份等 |
+| `ctx.image_dir()` / `reg.image_dir()` | `data/<id>/image/` —— 生成的图片、下载的缓存 |
 
-这些接口都顺手 `create_dir_all`（`install_all()` 阶段已先建好 `plugins/<id>/`、`config/<id>/`、`data/<id>/`），
-所以插件取到路径就能直接写，不用自己建目录。
-`plugins/<id>/plugin.yml` 是框架自动生成的清单（id/name/version/description + 配置与数据位置），
-静态编译模式下插件不单独出包，这个目录就是它在磁盘上的“存在证明”。
+这些接口都顺手 `create_dir_all`（`install_all()` 阶段已先建好三件套），插件取到路径就能直接写。
+`plugins/<id>/plugin.yml` 是框架自动生成的 mirai 风格清单
+（`id/name/version/author/description/apiVersion/loader/depends/softDepends/config/data/image`），
+静态编译模式下插件不单独出包，这个目录就是它在磁盘上的"存在证明"。
 
-id 目录名在 `install()`/`configure()` 之外也要用时（比如模块级函数），直接用
+id 目录名在阶段之外也要用时（比如模块级函数），直接用
 `arona::runtime::paths::plugin_data_dir(PLUGIN_ID)` / `plugin_image_dir` / `plugin_config_dir`，
 把 `PLUGIN_ID` 作为 `pub(crate) const` 与 `meta().id` 共用一个来源（见 `plugins/bluearchive/src/lib.rs`）。
 
@@ -130,20 +222,270 @@ id 目录名在 `install()`/`configure()` 之外也要用时（比如模块级�
 插件独有的旧文件（图片、数据库、备份）由插件自己在 `install()` 里用
 `paths::migrate_file` / `paths::migrate_dir` 搬（只补缺、保留旧文件，旧目录不删）。
 
-## 6. 群授权、功能开关与插件开关
+## 8. 登记功能与命令
 
-权限骨架留在框架，插件通过下面几个接口接入：
+### 功能开关（install 阶段）
 
-- **功能清单**：`arona::admin::register_feature(Feature { key, name, description }, PLUGIN_ID)`
-  （等价于 `arona::runtime::config::register_feature`）。GUI「群管理 → 功能开关」与配置模板注释据此生成。
-  在 `install()` 阶段调用。
-- **命令归属**：注册命令时 `CommandRegistration::new(..).with_feature("gacha")` 绑定某功能 key；
-  某群关闭该功能时，分发器把该命令视为“未匹配”，交给兜底逻辑。功能 key 用 `&'static str`，
-  与 `register_feature` 的 `key` 对齐。
-- **管理员/黑名单**：命令上下文 `CommandContext.is_admin`，以及 `runtime::config::is_manager/is_blacklisted`
-  由框架在分发前统一判定，插件无需自己实现群授权。
+```rust
+use arona::runtime::config::Feature;
 
-### 停用是三层门控，插件不用配合就能被停掉
+fn install(&self, reg: &PluginRegistrar) -> Result<(), String> {
+    reg.feature(Feature {
+        key: "gacha",                                   // 与命令的 with_feature 对齐
+        name: "抽卡",
+        description: "单抽/十连/抽卡服务器/狗叫/历史",
+    });
+    reg.config::<NotifyConfig>("notify");                // §12
+    Ok(())
+}
+```
+
+GUI「群管理 → 功能开关」与配置模板注释都据此生成。拿不到 `reg` 的地方（如自由函数）可用等价的
+`arona::admin::register_feature(feature, PLUGIN_ID)`。
+
+### 命令（configure 阶段）
+
+命令表挂在**框架实例**上（`ctx.framework().commands()`）、条目**按插件归属**（mirai 的 `CommandManager`）。
+不再存在"插件各自一个分发器、框架只认一个槽位"
+的写法——那正是"框架只能挂一个功能插件"的老根因。
+
+```rust
+use arona::runtime::dispatcher::{CommandRegistration, fallback, handler};
+use arona::runtime::priority::CommandPriority;
+
+fn configure(&self, ctx: &PluginContext) -> Result<(), String> {
+    ctx.commands(vec![
+        CommandRegistration::new(
+            vec!["/单抽".into(), "gacha_one".into()],
+            "单抽一次, 可选服务器",
+            handler(|context, arguments| async move { /* Some(OutgoingMessage) 或 None */ }),
+        )
+        .with_feature("gacha")             // 绑分群功能开关；该群关掉时视为未匹配
+        .with_usage("/单抽 [jp|global|cn]") // 帮助页展示
+        .with_priority(CommandPriority::High), // 命令名撞车时的胜出方，默认 Normal
+    ]);
+
+    // 未命中任何命令时的兜底（同优先级下按登记顺序依次调用）
+    ctx.fallback(fallback(|context| async move { /* 例如把纯数字回复解析成上次的选项 */ }));
+    // 想让别人先接：ctx.fallback_at(handler, CommandPriority::Lowest)
+    Ok(())
+}
+```
+
+要点：
+- **不用（也没机会）填插件 id**：`ctx` 自带归属，框架按它做停用与回收。
+- 命令名撞上别家插件时框架只记告警、按 `priority` 定胜出方（同优先级先到先得），**其余命令照常登记**，
+  不会因为一家冲突就整批失败。分发时同名命令只调用排在最前的那一家，别家不会跟着响应一遍。
+- `ctx.own_commands()` 拿本插件名下的命令概览（自绘帮助页用）；全表看 `arona::runtime::dispatcher::commands()`
+  （默认实例那份，等价于 `Framework::global().commands()`）。
+- `configure()` 里可拿到 `ctx.onebot_config`（协议配置快照，需要 self_id / nickname 时用）与 `ctx.test_notify`
+  （命令行是否带 `--test-notify`）。
+
+## 9. 事件钩子：听到 OneBot 的全部事件
+
+插件入口不止"注册命令"——命令只在文本命中 `/抽卡` 这类前缀时才进插件。成员进群打招呼、被踢后清理数据、
+有人申请加群、群名被改、别人引用了机器人的消息，这些属于 notice/request/meta 事件，
+或者属于"命中命令之前先被看一眼"的消息事件。统一入口是 `ctx.listen(..)`（底层是 `arona::onebot::hooks`）：
+
+```rust
+use arona::onebot::{EventContext, EventKind, HookFlow};
+use arona::onebot::hooks::{event_handler, ListenerPriority};
+
+fn configure(&self, ctx: &PluginContext) -> Result<(), String> {
+    ctx.on_notice(event_handler(|e: std::sync::Arc<EventContext>| {
+        Box::pin(async move {
+            if e.field_str("notice_type") == Some("group_increase") {
+                let _ = e.reply("老师好！").await;
+            }
+            HookFlow::Pass                 // 通知事件一般继续往下走
+        })
+    }));
+
+    ctx.listen(
+        &[EventKind::Message],
+        ListenerPriority::Monitor,         // 审计/风控类先看一眼
+        event_handler(|e| Box::pin(async move {
+            if e.text.contains("早安") {
+                let _ = e.reply("老师早安！").await;
+                return HookFlow::Handled;  // = mirai 的 event.intercept()：后续钩子与命令分发都不再跑
+            }
+            HookFlow::Pass
+        })),
+    );
+    Ok(())
+}
+```
+
+`EventContext` 提供：`kind`、原始 `event`、`text`、`segments`、`api: OneBotApi`（§14），
+以及 `user_id()/group_id()/is_group()/is_private()/message_id()/field(key)/field_str(key)`、
+`target()`、`reply(text)`、`reply_message(OutgoingMessage)`、`recall(message_id)`。
+
+优先级序（`arona::runtime::priority::Priority`，数值越小越先执行）：
+`Monitor → Normal（默认） → High → Low → Lowest`，同档按登记顺序。注意 `High` 排在 `Normal` 之前、
+`Lowest` 是给兜底实现留的最后一档——这套序与 mirai 的 `EventPriority` 一致，别按英文字面意思猜。
+
+门控语义（框架负责，插件不用自己判断）：
+- `message`：先过「群授权 + 全局/群内黑名单」，再进钩子，最后才是命令分发；
+- `notice` / `request` / `meta`：无条件投递（机器人被踢、黑名单用户申请加群这类事也会触发，插件自己要清楚）；
+- 任何一条返回 `HookFlow::Handled` 即停止后续钩子并跳过命令分发；
+- **所属插件被禁用（全局或该群）时，它的钩子一律跳过**。
+
+`arona::onebot::hooks::{on_message, on_notice, on_request, on_meta, on_all, subscribe, subscribe_at}`
+这些自由函数仍在（第一个参数是插件 id），供框架自身与拿不到 `ctx` 的场景用；插件正常都走 `ctx`。
+
+## 10. 后台任务与定时任务：作用域自动回收
+
+mirai 靠 `plugin.coroutineScope` 消失来保证"停用即无残留"。Arona 的等价物是 `PluginScope`：
+**每个插件一个，由框架持有并在线程间共享，停用时框架 `cancel_all()`**。
+
+```rust
+use arona::quartz::JobFn;   // = Arc<dyn Fn() + Send + Sync + 'static>
+
+fn start(&self, ctx: &PluginContext) -> Result<(), String> {
+    ctx.spawn(async { /* 长任务：插件停用即被 abort */ });        // = coroutineScope.launch
+
+    let job: JobFn = Arc::new(|| { /* 同步的活计；要 await 就 ctx.spawn(async { .. }) */ });
+    ctx.daily_job(8, "DailyNotify", job.clone());               // 每天 8 点
+    ctx.repeat_job(3600, "HourlyWarm", job.clone());            // 固定间隔，首次立即
+    ctx.single_job(ts_ms, "OnceAt", job.clone());               // 单次
+    ctx.delay_job(20, "TestNotify", job);                       // 延迟 N 秒
+    ctx.remove_job("TestNotify");                               // 撤掉自己的一个任务
+    Ok(())
+}
+```
+
+这些 helper 内部把 `quartz` 的**任务组**填成插件 id，所以 `revoke_resources` 一次就能整组取消。
+硬约束：**不要用裸 `tokio::spawn` 起长命任务、不要把 `PLUGIN_ID` 之外的字符串传给 `quartz` 的 group 参数**，
+否则框架收不到，用户把插件停掉后日历照样每天往群里发。
+（`quartz::remove_group` 现在只由框架调用，插件不再需要自己记任务名。）
+
+## 11. 服务容器：插件之间共享能力
+
+对应 mirai 的 `DiContainer`。插件之间不靠全局 `static` 互相摸，而是各自 `declare`，别人按类型取用：
+
+```rust
+// 提供方（configure 阶段）
+#[derive(Default)]
+pub struct DiceRoller;
+impl DiceRoller { pub fn roll(&self, sides: u64) -> u64 { .. } }
+ctx.declare_service::<DiceRoller>(Arc::new(DiceRoller::default()));
+
+// 使用方（自己的 meta 里声明 soft_depends = ["dice"]，保证装配先后）
+match ctx.service::<DiceRoller>() {                 // 或 arona::container::instance::<T>()
+    Some(dice) => { dice.roll(6); }
+    None => { /* 提供方没装或被停用：走降级路径 */ }
+}
+```
+
+服务按 `TypeId` 寻址，**键类型必须 `Sized`**（`Arc::downcast` 的限制）。要暴露的是接口而不是具体结构时，
+用 `Arc<dyn Trait>` 当键类型——它本身是 `Sized` 的：
+
+```rust
+pub trait DiceRoller: Send + Sync { fn roll(&self, sides: u64) -> u64; }
+pub type Dice = Arc<dyn DiceRoller>;
+
+ctx.declare_service::<Dice>(Arc::new(Arc::new(MyDice) as Dice));
+if let Some(dice) = ctx.service::<Dice>() { dice.roll(6); }
+```
+
+每个服务都记住登记它的插件 id：`revoke_resources` 会撤销停用插件名下的全部服务，所以取到的来自还在工作的插件
+（`container::instance` 另外还会查 `plugin_enabled`）。`arona::container::{provider_of, list}` 供诊断/GUI 用。
+
+### 别和「服务开关表」混为一谈
+
+容器（`container()`）按**类型**共享能力实例，是给插件之间互相调用的；服务开关表（`services()`，
+`arona::services::ServiceManager`）存的是**面向用户的功能单元**：一条 id + 名字 + `groupOnly`/`adminOnly`，
+带一个可单独关停的 `AtomicBool`，GUI「服务管理」页与 `/服务`、`/紧急停止` 指令操作的是它。
+
+```rust
+// configure 阶段登记，条目自动记在本插件名下
+ctx.register_service(arona::services::service_info(12, "活动推送", false, false));
+
+// 拿不到 ctx 的地方（命令实现里）按实例取表，别自己 new 一张
+let board = ctx.service_board();                 // 等价于 ctx.framework().services()
+if let Some(service) = board.find_by_name("活动推送") {
+    service.enable.store(false, std::sync::atomic::Ordering::SeqCst);
+}
+```
+
+`ServiceManager` 的读法：`all()`（按 id 升序）、`find_by_name`、`owner_of`、`enable(name)` / `disable(name)`；
+`register` 按名字覆盖，所以插件被重复 `configure` 不会多出一行。插件停用时框架 `revoke(plugin)` 撤掉它名下
+全部条目——`/紧急停止` 那种遍历 `all()` 的逻辑因此不会看到僵尸服务。
+
+## 12. 类型化配置 `config/<插件>/arona.yml`
+
+框架的 `config/arona.yml` 只认 `groups` / `managers` / `global_blacklist` / `group_settings` / `disabled_plugins`。
+插件的业务配置各住各的文件。对应 mirai-console 的 `ConfigKey<T>` + `configManager`：**插件只写一个 serde 结构 + 字段注释**，
+模板渲染、默认值补齐、未知子键过滤全部由框架完成，不再手写 YAML。
+
+```rust
+use arona::config::arona::PluginConfig;
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NotifyConfig {
+    pub enable: bool,
+    pub every_day_hour: u32,
+    pub black_groups: Vec<i64>,
+    pub notify_text: String,
+}
+
+impl PluginConfig for NotifyConfig {
+    const TITLE: &'static str = "每日活动推送";
+    const DOC: &'static str = "每天 every_day_hour 点向已授权的群推送当期活动";
+    /// 字段注释：路径不含区块自身键名，嵌套用点号，如 override.name
+    fn comment(path: &str) -> Option<&'static str> {
+        Some(match path {
+            "enable" => "是否启用每日推送",
+            "every_day_hour" => "每日推送的小时(0-23)",
+            "black_groups" => "不接收推送的群",
+            _ => return None,
+        })
+    }
+}
+```
+
+登记（install 阶段）与读写：
+
+```rust
+reg.config::<NotifyConfig>("notify");            // "notify" 是文件里的顶层键
+
+let notify = ctx.config::<NotifyConfig>("notify");   // configure/start/on_config_reload 里
+let hour = notify.get().every_day_hour;
+notify.update(|c| c.every_day_hour = 20)?;           // 读—改—写：落盘 + 回调本插件 on_config_reload
+```
+
+拿不到 `ctx` 的地方（模块级自由函数、命令实现）用同一个类型换个入口：
+`arona::config::plugin_config::ConfigEntry::<NotifyConfig>::new(crate::PLUGIN_ID, "notify")`，
+`plugin` 就填自己的 `meta().id`。读写方法：`get()`（静默回退默认值）、`try_get()`（解析失败给原因，
+命令回显用户改坏的配置时用）、`set(&T)`、`update(closure)`、`file()`。
+要指向某一套框架实例（隔离测试就该这样）用 `ConfigEntry::<T>::in_store(&framework.configs(), plugin, key)`；
+`ctx.config::<T>(key)` 内部就是它。
+
+登记入口也按实例走：插件的 `install` 阶段用 `reg.config::<T>("notify")`（即
+`reg.framework().sections().register(..)`），在装配代码之外给某个实例补登记时用
+`framework.sections().register(plugin, arona::config::arona::typed_section::<T>("notify"))`。
+框架自己的 `config/arona.yml` 同理有两个入口：`arona::config::arona::load(file)` 走默认实例，
+`load_in(&framework, file)` 走指定实例（认键、接管旧顶层插件配置键都按那套实例的表来）。
+
+约束与行为：
+- 键名要和插件功能对得上，且**不同插件之间不能撞 key**（撞名时保留先登记的；想区分就用带语义的前缀，如 `bluearchive_notify`）。
+- 空列表渲染成 `key: []`、空映射渲染成 `key: {}`；非空列表按块式缩进写出；字段注释按点分路径落在正确缩进上。
+- 缺文件时框架在 `plugin_config::init()` 生成带注释模板；插件升级**新登记的顶层键**会在下次启动按默认值补进
+  用户已有的文件（用户改过的值一律不动）；已有键里新增的**子字段**由强类型默认值兜着，下次写回时一起落盘。
+- 用户手改 `config/<插件>/arona.yml` 也会被看到：框架的轮询任务发现 mtime 变了就重载该文件，
+  并只回调该插件的 `on_config_reload`。`set/update` 之后必定回调，需要即时生效的定时任务在那里重建
+  （判"真的变了才重建"，别每次热重载都重建一遍）。
+- 旧写法兼容：把 `notify:` 直接写在框架 `arona.yml` 顶层的，加载时会被接管并搬进 `config/bluearchive/arona.yml`，
+  框架那份文件同步清掉该键，用户不用手改。
+- GUI/`/config` 指令编辑框架自己的那几个键；插件配置区由插件的指令或手改 YAML 维护。
+  GUI「插件管理」页会列出每个插件的配置文件与数据目录，并给「打开」按钮。
+
+底层的 `ConfigSection` trait 与 `register_section(plugin, Arc<dyn ConfigSection>)` 仍然公开
+（`TypedSection<T>` 就是它的适配器），只在你需要完全自定义渲染时才手写。
+
+## 13. 停用是三层门控，且回收是框架的事
 
 | 层级 | 开关来源 | 生效点 |
 | --- | --- | --- |
@@ -154,61 +496,25 @@ id 目录名在 `install()`/`configure()` 之外也要用时（比如模块级�
 `feature_enabled` 先看功能归属插件是否启用（`feature_owner` → `plugin_enabled`），再看该群的功能/插件名单，
 所以「整体停用插件」自动覆盖它名下所有功能。命令路由的最后一道兜底是
 `plugin::dispatcher_active_in_group(group_id)`：插件被停用时，**没绑定功能 key 的命令也进不去**。
-事件钩子同理，见 §10。
 
-GUI 入口：「插件管理」页 = 全局开关；「群管理 → 插件开关」= 分群开关（已在插件管理页整体停用的插件在这里显示为灰色）。
-
-### 硬性规范：取消定时任务要写在 `stop()` 里
-
-`stop()` 同时在**进程退出**和**运行中被禁用**两条路径上被调用。定时推送若不在这里取消，
-用户把插件停掉了，日历照样每天往群里发。注销事件钩子（`hooks::unsubscribe(ctx.plugin_id())`）也一样要在这里做。
+**`stop()` 只需关掉自己持有的句柄**（数据库连接、文件句柄）。后台任务、定时任务、事件订阅、命令、
+共享能力（容器）、服务开关条目
+由框架在 `stop()` 之后按归属统一回收（`manager::revoke_resources`），日志会写明各收了多少：
 
 ```rust
-fn stop(&self) {
-    for group in ["StandaloneActivityNotify", "AronaActivityImageRefresh"] {
-        arona::quartz::remove_group(group);   // create_daily/create_repeat/create_single_at 的 group 参数
-    }
-    arona::quartz::remove("StandaloneActivityNotifyInit");   // create_delay 没有 group（固定 "Delay"），只能按名字删
-    arona::onebot::hooks::unsubscribe("bluearchive");
-    db::close();
+fn stop(&self, _ctx: &PluginContext) {
+    db::close();      // 仅此而已；任务/钩子/命令/容器/服务开关框架会收
 }
 ```
 
-## 7. 注册命令（插件的典型做法）
+回收的正是装配的镜像，所以**运行中被停用与进程退出走同一条路**，不存在"退出时才清理"的特例。
 
-在 `configure()` 里构造分发器，把命令表交给框架：
-
-```rust
-use arona::runtime::dispatcher::{
-    CommandRegistration, SimpleCommandDispatcher, fallback, handler,
-};
-
-fn configure(&self, ctx: &PluginContext) -> Result<(), String> {
-    let registrations = vec![
-        CommandRegistration::new(
-            vec!["/单抽".into(), "gacha_one".into()],
-            "单抽一次, 可选服务器",
-            handler(|context, arguments| async move { /* 返回 Some(OutgoingMessage) 或 None */ }),
-        )
-        .with_feature("gacha"),
-    ];
-    // 未匹配任何命令时的兜底（例如把纯数字回复解析成上一次模糊建议的选项）
-    let fb = fallback(|context| async move { /* .. */ });
-    let dispatcher = std::sync::Arc::new(SimpleCommandDispatcher::new(registrations, Some(fb)));
-    ctx.set_dispatcher(dispatcher);   // 框架据此记下归属插件 id，停用即停路由
-    Ok(())
-}
-```
-
-`configure()` 里可拿到 `ctx.onebot_config`（协议配置快照，构建分发器/需要 self_id 时用）、`ctx.test_notify`
-（命令行是否带 `--test-notify`）与 §5 的目录接口。
-
-## 8. OneBot 动作接口（发/撤/查/管，全量强类型）
+## 14. OneBot 动作接口（发/撤/查/管，全量强类型）
 
 框架把 OneBot v11 的动作封成 `arona::onebot::api::OneBotApi`，插件与 GUI 用同一份能力：
 
 ```rust
-let api = arona::onebot::api();                 // = OneBotApi::global()，每次现取首个可用连接
+let api = ctx.api();                              // = OneBotApi::global()，每次现取首个可用连接
 let members = api.get_group_member_list(group_id).await?;
 api.send(MessageTarget::Group(group_id), OutgoingMessage::text("老师")).await?;
 api.delete_msg(message_id).await?;
@@ -237,134 +543,7 @@ api.delete_msg(message_id).await?;
 返回值结构体都用 `serde(default)` + `rest` 收未知字段：实现端少回某字段不会失败，多回的字段也拿得到。
 `Option` 入参传 `None` 时**不会**塞进 JSON，免得实现端把 `null` 当成有效值。
 
-## 9. 插件自己的配置文件 `config/<插件>/arona.yml`
-
-框架的 `config/arona.yml` 只认 `groups` / `managers` / `global_blacklist` / `group_settings` /
-`disabled_plugins`。插件的业务配置各住各的文件，以**原样 YAML 片段**存在
-`arona::config::plugin_config` 里，框架不理解内容，靠插件登记的 `ConfigSection` 渲染器完成
-“认键 + 生成带注释模板”。
-
-```rust
-use arona::config::arona::ConfigSection;
-use serde_yaml::Value;
-
-/// notify 配置区渲染器：一个 unit struct 即可，无状态
-struct NotifySection;
-
-impl ConfigSection for NotifySection {
-    fn key(&self) -> &'static str {
-        "notify"                                   // 本插件文件里的顶层键名
-    }
-    fn default_value(&self) -> Value {
-        // 文件里缺这个键时，模板用这里渲染
-        serde_yaml::to_value(NotifyConfig::default()).unwrap_or(Value::Null)
-    }
-    fn render(&self, value: &Value) -> String {
-        // 通常先把 value 反序列化成自己的强类型配置（顺带过滤未知子键），再手写带注释片段
-        let config = serde_yaml::from_value::<NotifyConfig>(value.clone()).unwrap_or_default();
-        let mut out = String::new();
-        out.push_str("# ==================== 每日推送 ====================\n");
-        out.push_str("notify:\n");
-        out.push_str(&format!("  # 是否启用每日推送\n  enable: {}\n", config.enable));
-        out
-        // 片段以 "key:" 开头、末尾不留空行
-    }
-}
-```
-
-`install()` 阶段登记（第一个参数是**你自己的插件 id**）：
-
-```rust
-fn install(&self) -> Result<(), String> {
-    arona::config::arona::register_section(
-        "bluearchive",
-        std::sync::Arc::new(NotifySection),
-    );
-    Ok(())
-}
-```
-
-读写自己的配置：
-
-```rust
-/// 读：拿到原样 YAML 值，反序列化成强类型，缺失/格式错回退默认值
-pub fn notify() -> NotifyConfig {
-    arona::config::plugin_config::section_value("notify")
-        .and_then(|value| serde_yaml::from_value::<NotifyConfig>(value).ok())
-        .unwrap_or_default()
-}
-
-/// 写：序列化后写回，框架负责落盘 config/bluearchive/arona.yml 并回调本插件的 on_config_reload
-pub fn set_notify(config: &NotifyConfig) -> Result<(), String> {
-    let value = serde_yaml::to_value(config).map_err(|err| err.to_string())?;
-    arona::config::plugin_config::set_section("notify", value)
-}
-```
-
-约束与行为：
-- 键名要和插件功能对得上，且**不同插件之间不能撞 key**（`register_section` 撞名时保留先登记的；
-  想区分就用带语义的前缀，如 `bluearchive_notify`）。
-- `section_value` / `set_section` 按顶层键寻址，框架自己查归属插件（`arona::config::arona::section_owner`），
-  插件不用重复传 id。
-- 缺文件时框架在 `plugin_config::init()` 生成带注释模板；插件升级**新登记的顶层键**会在下次启动
-  按 `default_value()` 补进用户已有的文件（用户改过的值一律不动）；已有键里新增的**子字段**
-  由插件的强类型默认值兜着，下次写回时一起落盘。
-- 用户手改 `config/<插件>/arona.yml` 也会被看到：框架的轮询任务发现 mtime 变了就重新加载该文件，
-  并只回调该插件的 `on_config_reload`。
-- `set_section` 之后必定回调 `on_config_reload`，需要即时生效的定时任务在那里重建（判“真的变了才重建”，
-  别每次热重载都重建一遍）。
-- GUI/`/config` 指令编辑框架自己的那几个键；插件配置区由插件的指令或手改 YAML 维护。
-  GUI「插件管理」页会列出每个插件的配置文件与数据目录，并给「打开」按钮。
-
-## 10. 事件钩子：听到 OneBot 的全部事件
-
-插件入口不止“注册命令”——命令只在文本命中 `/抽卡` 这类前缀时才进插件。成员进群打招呼、被踢后清理数据、
-有人申请加群、群名被改、别人引用了机器人的消息，这些属于 notice/request/meta 事件，
-或者属于“命中命令之前先被看一眼”的消息事件。统一入口是 `arona::onebot::hooks`：
-
-```rust
-use arona::onebot::{EventContext, HookFlow, event_handler, on_message, on_notice};
-
-fn configure(&self, ctx: &PluginContext) -> Result<(), String> {
-    let id = ctx.plugin_id().to_string();
-
-    on_notice(&id, event_handler(|ctx: std::sync::Arc<EventContext>| {
-        Box::pin(async move {
-            if ctx.field_str("notice_type") == Some("group_increase") {
-                let _ = ctx.reply("老师好！").await;
-            }
-            HookFlow::Pass          // 通知事件一般继续往下走
-        })
-    }));
-
-    on_message(&id, event_handler(|ctx| Box::pin(async move {
-        if ctx.text.contains("早安") {
-            let _ = ctx.reply("老师早安！").await;
-            return HookFlow::Handled;   // 已处理，别再走命令分发
-        }
-        HookFlow::Pass
-    })));
-    Ok(())
-}
-```
-
-`EventContext` 提供：`kind`、原始 `event`、`text`、`segments`、`api: OneBotApi`（§8），
-以及 `user_id()/group_id()/is_group()/is_private()/message_id()/field(key)/field_str(key)`、
-`target()`、`reply(text)`、`reply_message(OutgoingMessage)`、`recall(message_id)`。
-
-订阅入口：`subscribe(plugin, &[EventKind::..], handler)`，或 `on_message` / `on_notice` / `on_request` /
-`on_meta` / `on_all`（第一个参数都是插件 id）。注册顺序即执行顺序。
-
-门控语义（框架负责，插件不用自己判断）：
-- `message`：先过「群授权 + 全局/群内黑名单」，再进钩子，最后才是命令分发；
-- `notice` / `request` / `meta`：无条件投递（机器人被踢、黑名单用户申请加群这类事也会触发，
-  插件自己要清楚这一点）；
-- 任何一条钩子返回 `HookFlow::Handled` 就停止后续钩子，并且不再走命令分发；
-- **所属插件被禁用（全局或该群）时，它的钩子一律跳过**。
-
-`stop()` 里记得 `arona::onebot::hooks::unsubscribe(PLUGIN_ID)`（§6）。
-
-## 11. 新增一个插件
+## 15. 新增一个插件
 
 1. 在 workspace 里建 crate，`Cargo.toml` 依赖框架（**务必 `default-features = false`**，见下节）：
    ```toml
@@ -384,19 +563,20 @@ fn configure(&self, ctx: &PluginContext) -> Result<(), String> {
 5. 把新 crate 加进根 `Cargo.toml` 的 `members`。
 
 `crates/arona-host/build.rs` 读 `plugins.toml` 生成 `OUT_DIR/plugins.rs`（一个
-`register_plugins()`，按清单顺序 `arona::plugin::register(..)`），`main.rs` 用 `include!`
+`register_plugins()`，按清单顺序 `arona::plugin::register(Arc::new(<path>::new()))`），`main.rs` 用 `include!`
 引回并在 `arona::run(..)` 之前调用它 —— **不要再去 main.rs 里硬编码注册**。改了 `plugins.toml`
-无需改任何 Rust 代码，build.rs 已 `rerun-if-changed` 该文件。
+无需改任何 Rust 代码，build.rs 已 `rerun-if-changed` 该文件。清单顺序只影响同层插件的展示/装配先后，
+跨层顺序由 `depends`/`soft_depends` 决定。
 
-首次启动后 `plugins/<id>/`、`config/<id>/arona.yml` 会自动出现，GUI「插件管理」页立刻能开关它。
+首次启动后 `plugins/<id>/`（含 `plugin.yml`）、`config/<id>/arona.yml` 会自动出现，GUI「插件管理」页立刻能开关它。
 
-## 12. feature 统一陷阱：GUI 只在 host 打开
+## 16. feature 统一陷阱：GUI 只在 host 打开
 
 `arona` 的 `default = ["gui"]` 会拉进 `eframe`/`wgpu`。插件与 host 都以 `default-features = false` 依赖 `arona`，
 **只有 host 通过自身的 `gui = ["arona/gui"]` feature 打开 GUI**。这样插件不参与 GUI 编译、也不改变框架 GUI 开关的归属，
 避免 Cargo feature 统一把 `gui` 意外扩散。host 的 `default = ["gui"]` 决定了产物是否含管理面板。
 
-## 13. 开发与调试
+## 17. 开发与调试
 
 ```bash
 cargo run -p arona-host                  # 默认打开管理面板 GUI
@@ -405,11 +585,13 @@ cargo run -p arona-host -- --test-notify # 20 秒后跑一次每日推送，便�
 cargo build -p arona-host --no-default-features   # 精简命令行版
 ```
 
-改动后的验证口径（本地 GUI 构建需要 ATL，见下节“零依赖”约束；纯逻辑改动用 `--no-default-features` 更快）：
+改动后的验证口径（本地 GUI 构建需要 ATL，见下节"零依赖"约束；纯逻辑改动用 `--no-default-features` 更快）：
 
 ```bash
 cargo check -p arona --features gui --all-targets   # 含 GUI 代码与测试
-cargo test --workspace --no-default-features        # 单测（生命周期门控/配置迁移/钩子）
+cargo test --workspace                              # 单测（生命周期门控/配置迁移/钩子/隔离实例）
+cargo test --release --workspace                    # CI 口径：AutoUploadReleaseBuild.yml 跑的是 release
+cargo clippy --workspace --all-targets              # 框架侧 error 级必须清零
 cargo fmt --all
 ```
 
@@ -439,12 +621,32 @@ GUI 相关的落地细节（改动前务必先读）：
 - 窗口尺寸是「逻辑点」，由 winit 按屏幕缩放比换算；前提是 `assets/arona.manifest` 声明了
   PerMonitorV2 DPI 感知，别删那几行。
 
-## 14. 写插件代码时的注意事项
+## 18. 写插件代码时的注意事项
 
 - **不要给死代码加 `#[allow]`**：插件里保留了不少尚未接线的功能模块，`cargo` 报的
-  `never used` 警告是预期的，不要为了“零警告”去删或压制。
-- 涉及进程级全局（分发器槽位、钩子表、配置缓存）的测试必须串行：用
-  `static LOCK: Mutex<()> = Mutex::new(());` + `let _serial = LOCK.lock().unwrap_or_else(|p| p.into_inner());`
-  的写法，测试里改过全局状态要在结尾还原。异步的用 `#[tokio::test(flavor = "current_thread")]`。
-- 插件代码里不要 `std::process::exit`，也不要长阻塞主线程；耗时活计 `tokio::spawn` 或用 `arona::quartz` 定时任务。
+  `never used` 警告是预期的，不要为了"零警告"去删或压制。
+- 契约面的九张表（命令、钩子、服务容器、服务开关、功能与停用名单、配置区登记、配置文件缓存、
+  定时任务、插件表）都由 `Framework` 实例持有（§2 末），**不再是进程级全局**。
+  所以测试的隔离手法是**造实例**而不是抢串行锁：
+
+  ```rust
+  let framework = arona::framework::Framework::new();      // 一套全空的注册表
+  let manager = framework.plugins().clone();               // 或 PluginManager::new()，等价
+  manager.register(MyPlugin);
+  assert!(manager.install_all().is_empty());
+  // 停用名单/命令表按实例读写：framework.gating() / framework.commands()
+  ```
+
+  涉及落盘配置的用例再给每条一个**唯一 plugin id**——路径是 `config/<id>/arona.yml`，
+  id 撞了才会互相删对方的文件；入口也指到隔离实例上：
+  `ConfigEntry::<T>::in_store(&framework.configs(), id, key)`、`arona::config::arona::load_in(&framework, file)`、
+  `framework.sections().register(..)`。这样用例之间真并行，`#[test]` 就够，不必 async。
+- 只有**确实要测进程默认实例**的用例才需要串行锁（框架里 `runtime::log`、`runtime::console`，
+  bluearchive 的每日推送链路各留了一把，锁的注释写明了守的是什么）。往默认实例里塞测试插件是错的写法。
+  异步用例统一 `#[tokio::test(flavor = "current_thread")]`。
+- 插件代码里取注册表走 `ctx`（`ctx.framework()` / `ctx.service_board()`），不要用 `X::global()` 那套
+  自由函数——它们只转发到进程默认实例，用了就等于绕开了隔离。
+- 生命周期里的闭包要 `'static`：需要 `ctx` 时先 `let context = ctx.clone();` 再 `move` 进去
+  （`PluginContext` 是 `Arc` 包装的廉价克隆）。
+- 插件代码里不要 `std::process::exit`，也不要长阻塞主线程；耗时活计用 `ctx.spawn(..)`（§10）或 `arona::quartz`。
 - 日志走 `arona::runtime::log::{info, warning, error}`，不要用 `println!`（GUI 模式没有控制台）。

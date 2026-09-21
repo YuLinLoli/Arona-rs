@@ -80,10 +80,10 @@ async fn group_message_is_logged_immediately_over_ws_forward() {
         conn.token = String::new();
     }
     let registry = Arc::new(ConnectionRegistry::new());
-    let dispatcher = crate::standalone::dispatcher::build(config.clone());
+    // 这条用例只关心「收到消息先打印」的时序，不需要任何命令
     let business = Arc::new(StandaloneBusinessHandler::new(
         config.clone(),
-        dispatcher,
+        Arc::new(arona::runtime::dispatcher::CommandDispatcher::new()),
         registry.clone(),
     ));
     let app = Arc::new(OneBotApplication::new(config.clone(), business, registry));

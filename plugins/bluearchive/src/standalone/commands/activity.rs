@@ -158,12 +158,13 @@ pub async fn refresh_all_images() {
     }
 }
 
-/// 注册每日 0 点刷新本地活动图片的定时任务(独立启动时调用)
+/// 注册每日 0 点刷新本地活动图片的定时任务(独立启动时调用)。
+/// 任务组用插件 id：插件被停用时由框架整组回收。
 pub fn enable_image_refresh_job() {
     quartz::create_daily(
         0,
         "AronaActivityImageRefreshDaily",
-        "AronaActivityImageRefresh",
+        crate::PLUGIN_ID,
         Arc::new(|| {
             tokio::spawn(async move {
                 refresh_all_images().await;

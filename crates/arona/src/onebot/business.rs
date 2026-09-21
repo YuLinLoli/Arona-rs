@@ -6,7 +6,7 @@ use crate::onebot::console;
 use crate::onebot::message_sender::OneBotMessageSender;
 use crate::onebot::model::{OneBotAction, OneBotEvent};
 use crate::onebot::protocol;
-use crate::runtime::dispatcher::{CommandContext, SimpleCommandDispatcher};
+use crate::runtime::dispatcher::{CommandContext, CommandDispatcher};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
@@ -29,7 +29,8 @@ impl HandlerState {
 
 pub struct StandaloneBusinessHandler {
     config: RwLock<OneBotConfig>,
-    pub dispatcher: Arc<SimpleCommandDispatcher>,
+    /// 无状态分发句柄：真正的命令表是进程级的，由各插件在 configure 阶段按归属登记
+    pub dispatcher: Arc<CommandDispatcher>,
     pub registry: Arc<ConnectionRegistry>,
     pub state: Arc<HandlerState>,
 }
@@ -37,7 +38,7 @@ pub struct StandaloneBusinessHandler {
 impl StandaloneBusinessHandler {
     pub fn new(
         config: OneBotConfig,
-        dispatcher: Arc<SimpleCommandDispatcher>,
+        dispatcher: Arc<CommandDispatcher>,
         registry: Arc<ConnectionRegistry>,
     ) -> StandaloneBusinessHandler {
         StandaloneBusinessHandler {
@@ -122,8 +123,8 @@ impl StandaloneBusinessHandler {
         let dispatcher = self.dispatcher.clone();
         tokio::spawn(async move {
             // 消息钩子先于命令分发：插件有机会整条接管（返回 Handled 时不再走命令）。
-            // 未匹配命令时的兜底（如 /攻略 模糊建议的数字回复）由分发器的 FallbackHandler 负责，
-            // 由插件在构建分发器时注册，框架这里不感知具体功能。
+            // 未命中任何命令时的兜底（如 /攻略 模糊建议的数字回复）由各插件自己登记的
+            // FallbackHandler 按优先级依次尝试，框架这里不感知具体功能。
             if crate::onebot::hooks::dispatch(&event).await {
                 return;
             }
@@ -347,12 +348,9 @@ mod tests {
         let registry = Arc::new(ConnectionRegistry::new());
         let handler = StandaloneBusinessHandler::new(
             OneBotConfig::default(),
-            // 这里只需要一个能构造业务处理器的分发器实例，具体命令由插件注册；
-            // 框架测试用空分发表即可验证「收到消息先打印」的时序。
-            Arc::new(crate::runtime::dispatcher::SimpleCommandDispatcher::new(
-                vec![],
-                None,
-            )),
+            // 分发句柄是无状态的，命令由插件按归属登记在全局表里；
+            // 框架测试只验证「收到消息先打印」的时序，不需要任何命令。
+            Arc::new(crate::runtime::dispatcher::CommandDispatcher::new()),
             registry,
         );
 

@@ -11,6 +11,10 @@ pub mod gui;
 
 pub mod admin;
 pub mod config;
+/// 插件间能力共享容器（对应 mirai 的 `DiContainer`）
+pub mod container;
+/// 框架实例：插件契约面的注册表按实例持有（对应 mirai 的 `MiraiInstance`）
+pub mod framework;
 pub mod onebot;
 pub mod plugin;
 pub mod quartz;
@@ -215,23 +219,16 @@ pub(crate) async fn run_bot(
     // 插件配置：每个插件一份 config/<插件>/arona.yml（旧写法已在上面被接管，这里落盘并加载）
     config::plugin_config::init();
 
-    // 装配阶段：插件构建命令分发器
-    let ctx = plugin::PluginContext::new(onebot_config.clone(), test_notify);
-    plugin::configure_all(&ctx)?;
+    // 装配阶段：插件登记命令、事件订阅与服务
+    plugin::configure_all(onebot_config.clone(), test_notify)?;
 
     // 启动阶段：数据库、数据预热、定时推送等由插件负责
-    plugin::start_all();
+    plugin::start_all()?;
 
     let registry = Arc::new(ConnectionRegistry::new());
-    let dispatcher = plugin::dispatcher().unwrap_or_else(|| {
-        Arc::new(runtime::dispatcher::SimpleCommandDispatcher::new(
-            vec![],
-            None,
-        ))
-    });
     let business = Arc::new(StandaloneBusinessHandler::new(
         onebot_config.clone(),
-        dispatcher,
+        Arc::new(runtime::dispatcher::CommandDispatcher::new()),
         registry.clone(),
     ));
     let application = Arc::new(OneBotApplication::new(

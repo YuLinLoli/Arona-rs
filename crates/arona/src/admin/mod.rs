@@ -470,40 +470,39 @@ mod tests {
         assert!(!remove_connection(&mut config, &second));
     }
 
-    /// 功能开关与黑名单共用全局 group_settings，两个场景必须串行在同一个测试里，
-    /// 否则并行测试互相重置全局状态会随机挂
+    /// 分群功能开关：只关掉那一组的那个功能，别群与私聊不受影响
     #[test]
-    fn group_settings_gate_feature_and_blacklist() {
-        crate::runtime::config::set_group_settings(Default::default());
-        // 场景一：分群功能开关
-        assert!(runtime_config::feature_enabled(Some(1), "tarot"));
+    fn group_switch_gates_feature() {
+        let gating = crate::runtime::config::Gating::default();
+        assert!(gating.feature_enabled(Some(1), "tarot"));
         let mut setting = crate::config::arona::GroupSetting::default();
         setting.disabled_features.push("tarot".to_string());
         let mut map = std::collections::BTreeMap::new();
         map.insert("1".to_string(), setting);
-        crate::runtime::config::set_group_settings(map);
-        assert!(!runtime_config::feature_enabled(Some(1), "tarot"));
+        gating.set_group_settings(map);
+        assert!(!gating.feature_enabled(Some(1), "tarot"));
+        assert!(gating.feature_enabled(Some(2), "tarot"), "其它群不受影响");
         assert!(
-            runtime_config::feature_enabled(Some(2), "tarot"),
-            "其它群不受影响"
-        );
-        assert!(
-            runtime_config::feature_enabled(None, "tarot"),
+            gating.feature_enabled(None, "tarot"),
             "私聊不受分群开关限制"
         );
-        // 场景二：群内黑名单与全局黑名单
-        crate::runtime::config::set_global_blacklist(vec![10001]);
-        assert!(runtime_config::is_blacklisted(10001, Some(1)));
-        crate::runtime::config::set_global_blacklist(Vec::new());
+    }
+
+    /// 黑名单：全局名单命中所有会话，群内名单只管那个群
+    #[test]
+    fn blacklist_gates_global_and_per_group() {
+        let gating = crate::runtime::config::Gating::default();
+        gating.set_global_blacklist(vec![10001]);
+        assert!(gating.is_blacklisted(10001, Some(1)));
+        gating.set_global_blacklist(Vec::new());
         let mut setting = crate::config::arona::GroupSetting::default();
         setting.blacklist.push(10002);
         let mut map = std::collections::BTreeMap::new();
         map.insert("1".to_string(), setting);
-        crate::runtime::config::set_group_settings(map);
-        assert!(runtime_config::is_blacklisted(10002, Some(1)));
-        assert!(!runtime_config::is_blacklisted(10002, Some(2)));
-        assert!(!runtime_config::is_blacklisted(10002, None));
-        crate::runtime::config::set_group_settings(Default::default());
+        gating.set_group_settings(map);
+        assert!(gating.is_blacklisted(10002, Some(1)));
+        assert!(!gating.is_blacklisted(10002, Some(2)));
+        assert!(!gating.is_blacklisted(10002, None));
     }
 
     /// 等待端口处于期望状态（最多 2 秒）
@@ -531,11 +530,8 @@ mod tests {
         crate::runtime::config::set_bot_id(10000);
         let base = 30000 + (std::process::id() % 1000) as u16 * 2;
         let registry = Arc::new(ConnectionRegistry::new());
-        // 框架自测：连接热重载与命令无关，用空分发表的业务处理器即可
-        let dispatcher = Arc::new(crate::runtime::dispatcher::SimpleCommandDispatcher::new(
-            vec![],
-            None,
-        ));
+        // 框架自测：连接热重载与命令无关，命令表按归属登记在进程级，这里给个空句柄即可
+        let dispatcher = Arc::new(crate::runtime::dispatcher::CommandDispatcher::new());
         let business = Arc::new(StandaloneBusinessHandler::new(
             OneBotConfig::default(),
             dispatcher,

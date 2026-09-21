@@ -9,7 +9,7 @@ use crate::data;
 use crate::entity::{Activity, ActivityType, ServerLocale};
 use arona::quartz;
 use arona::runtime::message::{MessageTarget, OutgoingMessage};
-use arona::services::{self, ServiceInfo};
+use arona::services;
 use std::sync::Arc;
 
 const NORMAL_ACTIVITY_NOTIFY_BEFORE_HOURS: i64 = 1;
@@ -19,26 +19,21 @@ const ALERT_IMMEDIATE_WINDOW_MILLIS: i64 = 10 * 60 * 1000;
 /// 活动到期后刷新本地资源图片的延迟: 1 小时预警 + 1 小时 5 分钟
 const IMAGE_REFRESH_AFTER_END_MILLIS: i64 = 5 * 60 * 1000;
 
-/// 服务注册（对应原版 init/registerService）
-pub fn register_service() {
-    let service: Arc<ServiceInfo> = services::service_info(12, "活动推送", false, false);
-    services::manager().register(&service);
-}
-
-/// 从配置读取推送小时并启用每日推送任务（独立模式启动时调用）
-pub fn enable_service() {
-    register_service();
+/// 启用每日推送：登记可开关的服务 + 建每日任务与启动初始化任务（start 阶段调用）
+pub fn enable_service(ctx: &arona::plugin::PluginContext) {
+    ctx.register_service(services::service_info(12, "活动推送", false, false));
     let hour = config::notify().every_day_hour.clamp(0, 23) as u32;
     enable_daily_job(hour);
     arona::runtime::log::info(format!("活动推送已启用, 每天 {hour} 点推送"));
 }
 
-/// 创建每天固定小时的活动推送任务（小时变更时由 quartz::reschedule_daily_notify 调用）
+/// 创建每天固定小时的活动推送任务（推送小时变更时由 `BluearchivePlugin::on_config_reload` 重建）。
+/// 任务组一律填本插件的 id：插件被停用时框架按组一次收干净，不必逐个记名字。
 pub fn enable_daily_job(hour: u32) {
     quartz::create_daily(
         hour,
         "StandaloneActivityNotify",
-        "StandaloneActivityNotify",
+        crate::PLUGIN_ID,
         Arc::new(|| {
             tokio::spawn(async move {
                 push(false).await;
@@ -50,6 +45,7 @@ pub fn enable_daily_job(hour: u32) {
         quartz::create_delay(
             20,
             "StandaloneActivityNotifyInit",
+            crate::PLUGIN_ID,
             Arc::new(|| {
                 tokio::spawn(async move {
                     push(true).await;
@@ -246,7 +242,7 @@ fn insert_alert(
     quartz::create_single_at(
         expected_ms,
         &key,
-        "StandaloneActivityNotifyOneHour",
+        crate::PLUGIN_ID,
         Arc::new(move || {
             let activities = group.clone();
             tokio::spawn(async move {
@@ -286,7 +282,7 @@ fn insert_image_refresh(expected_ms: i64, locale: ServerLocale) {
     quartz::create_single_at(
         expected_ms,
         &key,
-        "AronaActivityImageRefresh",
+        crate::PLUGIN_ID,
         Arc::new(move || {
             tokio::spawn(async move {
                 crate::standalone::commands::activity::refresh_image(locale).await;
@@ -362,6 +358,13 @@ mod tests {
     use chrono::{Local, Timelike};
     use std::sync::Mutex;
     use std::time::Duration;
+
+    /// 下面两条端到端用例驱动的是**进程默认框架实例**：消息发送器、定时任务、
+    /// `config/arona.yml` 持有者都挂在它身上（插件的运行期代码就是走这套全局入口），
+    /// 并行会互相顶掉，所以串行。
+    /// 契约面那层状态（配置区登记表、插件配置文件表、命令表、钩子表、服务表、停用名单）
+    /// 已经拆成可持有的实例，相关用例各自 `Framework::new()`，不再受这把锁约束。
+    static GLOBAL_RUNTIME_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     struct CaptureSender {
         sent: Mutex<Vec<(MessageTarget, OutgoingMessage)>>,
@@ -443,11 +446,11 @@ mod tests {
     /// 同时校验：预警分组(5小时/1小时/维护/生日)、黑名单、即时发送、未来定时、过期抛弃、任务去重、每日任务时刻
     #[tokio::test]
     async fn notify_logic_plan_and_alerts() {
-        // 全局 arona 配置持有者被所有 init 测试共享，跨 await 持锁与其它配置测试串行
-        let _serial = config::CONFIG_TEST_LOCK.lock().await;
+        // 这条用例跑的是默认框架实例的整条链路（配置文件 → 停用名单 → 发送器 → 定时任务）
+        let _serial = GLOBAL_RUNTIME_LOCK.lock().await;
         // 运行期由插件 install() 登记配置区；测试里直接 init()，需自行登记，
         // 否则 notify 段会被当成未知键丢弃
-        config::register_sections();
+        config::register_sections(arona::framework::Framework::global());
         arona::runtime::config::set_bot_id(10000);
         arona::config::standalone::init(write_test_config()).expect("测试配置应能加载");
         arona::config::plugin_config::init();
@@ -647,8 +650,8 @@ mod tests {
     #[ignore = "联网自检, 运行: cargo test notify_daily -- --ignored --nocapture --test-threads=1"]
     #[tokio::test]
     async fn notify_daily_push_network() {
-        let _serial = config::CONFIG_TEST_LOCK.lock().await;
-        config::register_sections();
+        let _serial = GLOBAL_RUNTIME_LOCK.lock().await;
+        config::register_sections(arona::framework::Framework::global());
         arona::runtime::config::set_bot_id(10000);
         arona::config::standalone::init(write_test_config()).expect("测试配置应能加载");
         let sender = Arc::new(CaptureSender::new());

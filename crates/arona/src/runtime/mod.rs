@@ -8,6 +8,8 @@ pub mod elevate;
 pub mod log;
 pub mod message;
 pub mod paths;
+/// 执行次序（事件监听与命令匹配共用）
+pub mod priority;
 /// 用另一套参数重新拉起自身（软件 OpenGL 兜底 / 渲染后端卡死后换一个）
 #[cfg(feature = "gui")]
 pub mod relaunch;

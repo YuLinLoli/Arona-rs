@@ -1,32 +1,45 @@
-//! 独立模式命令分发器（对应原版 standalone/StandaloneCommandDispatcher）
+//! 独立模式命令登记（对应原版 standalone/StandaloneCommandDispatcher）
 
 use crate::standalone::api;
 use crate::standalone::commands::{self, emergency::EmergencyStop};
 use arona::config::onebot::{ConnectionConfig, ConnectionType, OneBotConfig};
+use arona::plugin::PluginContext;
 use arona::runtime::dispatcher::{
-    CommandContext, CommandHandler, CommandRegistration, SimpleCommandDispatcher, fallback, handler,
+    CommandContext, CommandHandler, CommandRegistration, FallbackHandler, fallback, handler,
 };
 use arona::runtime::message::OutgoingMessage;
 use arona::services;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
-/// 构造独立模式的命令分发器
-pub fn build(config: OneBotConfig) -> Arc<SimpleCommandDispatcher> {
-    api::register_all();
+/// 把本插件的全部命令与兜底登记进框架的命令表（configure 阶段调用）。
+/// 命令名与别家插件撞车时由框架按优先级裁决并记日志，本插件其余命令照常生效。
+pub fn register(ctx: &PluginContext, config: OneBotConfig) {
+    ctx.commands(registrations(config, ctx.service_board().clone()));
+    ctx.fallback(numeric_reply());
+}
+
+/// 本插件的全部命令登记项（装配与自测共用一份，避免两处漂移）
+pub fn registrations(
+    config: OneBotConfig,
+    board: Arc<services::ServiceManager>,
+) -> Vec<CommandRegistration> {
+    api::register_all(&board);
     let service = |name: &str| {
-        services::manager()
+        board
             .find_by_name(name)
             .unwrap_or_else(|| services::ServiceInfo::new(0, "未注册"))
     };
-    let emergency = Arc::new(Mutex::new(EmergencyStop::new()));
+    let emergency = Arc::new(Mutex::new(EmergencyStop::new(board.clone())));
 
     let status_config = config.clone();
+    let status_board = board.clone();
     let arona_status = plain_arg_handler(move |context, arguments| {
         let config = status_config.clone();
+        let board = status_board.clone();
         let arguments = arguments.clone();
         async move {
-            let text = handle_arona(&config, &context, arguments).await;
+            let text = handle_arona(&config, &board, &context, arguments).await;
             Some(OutgoingMessage::text(text))
         }
     });
@@ -192,19 +205,33 @@ pub fn build(config: OneBotConfig) -> Arc<SimpleCommandDispatcher> {
             registration.with_feature(feature)
         })
         .collect();
-    // 未匹配到任何命令时的兜底：把纯数字回复解析成上一次 /攻略 模糊建议的选项。
-    // 这条逻辑原先硬编码在框架的业务处理器里，现在由插件通过分发器的 FallbackHandler 注入。
-    let numeric_reply = fallback(|context| async move {
+    registrations
+}
+
+/// 未命中任何命令时的兜底：把纯数字回复解析成上一次 /攻略 模糊建议的选项。
+/// 这条逻辑原先硬编码在框架的业务处理器里，现在由插件登记自己的 FallbackHandler。
+pub fn numeric_reply() -> Arc<dyn FallbackHandler> {
+    fallback(|context| async move {
         if let Some(message) =
             crate::standalone::commands::trainer::resolve_numeric_reply(context.clone()).await
         {
             context.reply_message(message).await;
         }
-    });
-    Arc::new(SimpleCommandDispatcher::new(
-        registrations,
-        Some(numeric_reply),
-    ))
+    })
+}
+
+/// 自测用：没有框架装配出来的上下文，直接按本插件 id 登进全局命令表
+#[cfg(test)]
+pub(crate) fn register_into_table(config: OneBotConfig) {
+    use arona::runtime::priority::CommandPriority;
+    for registration in registrations(config, services::global_board()) {
+        arona::runtime::dispatcher::register(crate::PLUGIN_ID, registration);
+    }
+    arona::runtime::dispatcher::register_fallback(
+        crate::PLUGIN_ID,
+        numeric_reply(),
+        CommandPriority::default(),
+    );
 }
 
 /// 命令 -> 分群功能开关 key（见 runtime::config::FEATURES）；空串表示不受分群开关限制
@@ -246,6 +273,7 @@ where
 /// /arona 子命令处理
 async fn handle_arona(
     config: &OneBotConfig,
+    board: &services::ServiceManager,
     context: &CommandContext,
     arguments: Vec<String>,
 ) -> String {
@@ -258,13 +286,16 @@ async fn handle_arona(
         "" | "status" | "状态" => status_text(config),
         "version" | "版本" => version_text(),
         "help" | "帮助" => help_text(config),
-        "service" | "services" | "连接" => handle_service(config, context, &arguments).await,
+        "service" | "services" | "连接" => {
+            handle_service(config, board, context, &arguments).await
+        }
         _ => "未知子命令。使用 /arona help 查看帮助。".to_string(),
     }
 }
 
 async fn handle_service(
     config: &OneBotConfig,
+    board: &services::ServiceManager,
     context: &CommandContext,
     arguments: &[String],
 ) -> String {
@@ -274,7 +305,7 @@ async fn handle_service(
         .unwrap_or_default()
         .as_str()
     {
-        "list" | "列表" => service_list_text(),
+        "list" | "列表" => service_list_text(board),
         "enable" | "启用" => {
             if !context.is_admin {
                 return "权限不足".to_string();
@@ -283,7 +314,7 @@ async fn handle_service(
             let Some(name) = name.map(|s| s.as_str()) else {
                 return "用法: /arona service enable <名称>".to_string();
             };
-            match services::manager().enable(name) {
+            match board.enable(name) {
                 Some(service) => format!("服务已启用: {}", service.name),
                 None => format!("未找到服务: {name}"),
             }
@@ -296,7 +327,7 @@ async fn handle_service(
             let Some(name) = name.map(|s| s.as_str()) else {
                 return "用法: /arona service disable <名称>".to_string();
             };
-            match services::manager().disable(name) {
+            match board.disable(name) {
                 Some(service) => format!("服务已停用: {}", service.name),
                 None => format!("未找到服务: {name}"),
             }
@@ -368,12 +399,12 @@ fn address(conn: &ConnectionConfig, conn_type: ConnectionType) -> String {
     }
 }
 
-fn service_list_text() -> String {
-    let services = services::manager().all();
-    if services.is_empty() {
+fn service_list_text(board: &services::ServiceManager) -> String {
+    let registered = board.all();
+    if registered.is_empty() {
         return "当前没有注册服务".to_string();
     }
-    let lines: Vec<String> = services
+    let lines: Vec<String> = registered
         .iter()
         .map(|service| {
             let state = if service.enable.load(Ordering::SeqCst) {

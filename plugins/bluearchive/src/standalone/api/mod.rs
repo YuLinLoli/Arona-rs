@@ -1,12 +1,11 @@
 //! 服务注册（对应原版 standalone/commands/StandaloneServices）
 //! 先注册全部服务，dispatcher 再按名称取 Arc<ServiceInfo> 用于命令守卫。
 
-use arona::services::{self, ServiceInfo, service_info};
+use arona::services::{ServiceInfo, ServiceManager, service_info};
 use std::sync::Arc;
 
-pub fn register_all() {
-    let list = all_services();
-    services::register_all(&list);
+pub fn register_all(board: &ServiceManager) {
+    board.register_all(crate::PLUGIN_ID, &all_services());
 }
 
 /// 与 StandaloneServices.all 保持一致的服务列表

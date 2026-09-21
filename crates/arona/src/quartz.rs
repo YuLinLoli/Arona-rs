@@ -5,7 +5,6 @@
 //! 任务以名称注册，支持列出、手动触发、暂停/恢复与删除。
 
 use chrono::{DateTime, Local, Timelike};
-use once_cell::sync::OnceCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
@@ -145,132 +144,181 @@ fn next_daily_ms(hour: u32, now_ms: i64) -> i64 {
     }
 }
 
-struct Scheduler {
+/// 定时任务表：任务按名称注册、按组（= 插件 id）整体回收。
+/// 表实例由 [`crate::framework::Framework`] 持有，本模块的自由函数走进程默认实例。
+#[derive(Default)]
+pub struct Scheduler {
     tasks: RwLock<HashMap<String, Arc<TaskEntry>>>,
 }
 
-static SCHEDULER: OnceCell<Scheduler> = OnceCell::new();
+impl Scheduler {
+    fn register(&self, name: &str, group: &str, kind: TaskKind, run: JobFn) -> Arc<TaskEntry> {
+        let existing = self.tasks.read().unwrap().get(name).cloned();
+        if let Some(entry) = existing {
+            entry.canceled.store(true, Ordering::SeqCst);
+        }
+        let entry = Arc::new(TaskEntry {
+            name: name.to_string(),
+            group: group.to_string(),
+            kind,
+            run,
+            paused: AtomicBool::new(false),
+            canceled: AtomicBool::new(false),
+            last_fire: RwLock::new(None),
+            next_fire: RwLock::new(None),
+        });
+        self.tasks
+            .write()
+            .unwrap()
+            .insert(name.to_string(), entry.clone());
+        entry.schedule_cycle();
+        entry
+    }
 
-fn scheduler() -> &'static Scheduler {
-    SCHEDULER.get_or_init(|| Scheduler {
-        tasks: RwLock::new(HashMap::new()),
-    })
+    /// 创建每天固定小时触发的任务（同名存在则替换）
+    pub fn create_daily(&self, hour: u32, name: &str, group: &str, run: JobFn) {
+        self.register(name, group, TaskKind::Daily { hour }, run);
+    }
+
+    /// 创建固定间隔循环任务（首次立即执行）
+    pub fn create_repeat(&self, interval_secs: u64, name: &str, group: &str, run: JobFn) {
+        self.register(name, group, TaskKind::Repeat { interval_secs }, run);
+    }
+
+    /// 创建单次定时任务
+    pub fn create_single_at(&self, ts_ms: i64, name: &str, group: &str, run: JobFn) {
+        self.register(name, group, TaskKind::SingleAt { ts_ms }, run);
+    }
+
+    /// 创建延迟任务（秒）。group 传插件 id，插件停用时整组取消。
+    pub fn create_delay(&self, delay_secs: u64, name: &str, group: &str, run: JobFn) {
+        let ts = chrono::Utc::now().timestamp_millis() + delay_secs as i64 * 1000;
+        self.register(name, group, TaskKind::SingleAt { ts_ms: ts }, run);
+    }
+
+    pub fn exists(&self, name: &str) -> bool {
+        self.tasks.read().unwrap().contains_key(name)
+    }
+
+    pub fn remove(&self, name: &str) -> bool {
+        if let Some(entry) = self.tasks.write().unwrap().remove(name) {
+            entry.canceled.store(true, Ordering::SeqCst);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 按任务组整体取消（插件被禁用时用：一次停掉自己全部的定时任务，不必逐个记名字）
+    pub fn remove_group(&self, group: &str) -> usize {
+        let removed: Vec<Arc<TaskEntry>> = self
+            .tasks
+            .write()
+            .unwrap()
+            .extract_if(|_, entry| entry.group == group)
+            .map(|(_, entry)| entry)
+            .collect();
+        let count = removed.len();
+        for entry in removed {
+            entry.canceled.store(true, Ordering::SeqCst);
+        }
+        count
+    }
+
+    pub fn trigger(&self, name: &str) -> Result<(), String> {
+        let entry = self
+            .tasks
+            .read()
+            .unwrap()
+            .get(name)
+            .cloned()
+            .ok_or_else(|| format!("任务不存在: {name}"))?;
+        tokio::spawn(async move {
+            let run = entry.run.clone();
+            run();
+        });
+        Ok(())
+    }
+
+    pub fn pause_all(&self) {
+        let tasks = self.tasks.read().unwrap();
+        for entry in tasks.values() {
+            entry.paused.store(true, Ordering::SeqCst);
+        }
+    }
+
+    pub fn resume_all(&self) {
+        let tasks = self.tasks.read().unwrap();
+        for entry in tasks.values() {
+            entry.paused.store(false, Ordering::SeqCst);
+        }
+    }
+
+    pub fn list(&self) -> Vec<TaskInfo> {
+        let tasks = self.tasks.read().unwrap();
+        let mut out: Vec<TaskInfo> = tasks
+            .values()
+            .map(|entry| TaskInfo {
+                name: entry.name.clone(),
+                group: entry.group.clone(),
+                next_fire_ms: *entry.next_fire.read().unwrap(),
+                last_fire_ms: *entry.last_fire.read().unwrap(),
+            })
+            .collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
+    }
 }
 
-fn register(name: &str, group: &str, kind: TaskKind, run: JobFn) -> Arc<TaskEntry> {
-    let existing = scheduler().tasks.read().unwrap().get(name).cloned();
-    if let Some(entry) = existing {
-        entry.canceled.store(true, Ordering::SeqCst);
-    }
-    let entry = Arc::new(TaskEntry {
-        name: name.to_string(),
-        group: group.to_string(),
-        kind,
-        run,
-        paused: AtomicBool::new(false),
-        canceled: AtomicBool::new(false),
-        last_fire: RwLock::new(None),
-        next_fire: RwLock::new(None),
-    });
-    scheduler()
-        .tasks
-        .write()
-        .unwrap()
-        .insert(name.to_string(), entry.clone());
-    entry.schedule_cycle();
-    entry
+fn scheduler() -> &'static Scheduler {
+    crate::framework::Framework::global().jobs()
 }
 
 /// 创建每天固定小时触发的任务（同名存在则替换）
 pub fn create_daily(hour: u32, name: &str, group: &str, run: JobFn) {
-    register(name, group, TaskKind::Daily { hour }, run);
+    scheduler().create_daily(hour, name, group, run);
 }
 
 /// 创建固定间隔循环任务（首次立即执行）
 pub fn create_repeat(interval_secs: u64, name: &str, group: &str, run: JobFn) {
-    register(name, group, TaskKind::Repeat { interval_secs }, run);
+    scheduler().create_repeat(interval_secs, name, group, run);
 }
 
 /// 创建单次定时任务
 pub fn create_single_at(ts_ms: i64, name: &str, group: &str, run: JobFn) {
-    register(name, group, TaskKind::SingleAt { ts_ms }, run);
+    scheduler().create_single_at(ts_ms, name, group, run);
 }
 
-/// 创建延迟任务（秒）
-pub fn create_delay(delay_secs: u64, name: &str, run: JobFn) {
-    let ts = chrono::Utc::now().timestamp_millis() + delay_secs as i64 * 1000;
-    register(name, "Delay", TaskKind::SingleAt { ts_ms: ts }, run);
+/// 创建延迟任务（秒）。group 传插件 id，插件停用时整组取消。
+pub fn create_delay(delay_secs: u64, name: &str, group: &str, run: JobFn) {
+    scheduler().create_delay(delay_secs, name, group, run);
 }
 
 pub fn exists(name: &str) -> bool {
-    scheduler().tasks.read().unwrap().contains_key(name)
+    scheduler().exists(name)
 }
 
 pub fn remove(name: &str) -> bool {
-    if let Some(entry) = scheduler().tasks.write().unwrap().remove(name) {
-        entry.canceled.store(true, Ordering::SeqCst);
-        true
-    } else {
-        false
-    }
+    scheduler().remove(name)
 }
 
-/// 按任务组整体取消（插件被禁用时用：一次停掉自己全部的定时任务，不必逐个记名字）
+/// 按任务组整体取消（插件被禁用时用）
 pub fn remove_group(group: &str) -> usize {
-    let removed: Vec<Arc<TaskEntry>> = scheduler()
-        .tasks
-        .write()
-        .unwrap()
-        .extract_if(|_, entry| entry.group == group)
-        .map(|(_, entry)| entry)
-        .collect();
-    let count = removed.len();
-    for entry in removed {
-        entry.canceled.store(true, Ordering::SeqCst);
-    }
-    count
+    scheduler().remove_group(group)
 }
 
 pub fn trigger(name: &str) -> Result<(), String> {
-    let entry = scheduler()
-        .tasks
-        .read()
-        .unwrap()
-        .get(name)
-        .cloned()
-        .ok_or_else(|| format!("任务不存在: {name}"))?;
-    tokio::spawn(async move {
-        let run = entry.run.clone();
-        run();
-    });
-    Ok(())
+    scheduler().trigger(name)
 }
 
 pub fn pause_all() {
-    let tasks = scheduler().tasks.read().unwrap();
-    for entry in tasks.values() {
-        entry.paused.store(true, Ordering::SeqCst);
-    }
+    scheduler().pause_all();
 }
 
 pub fn resume_all() {
-    let tasks = scheduler().tasks.read().unwrap();
-    for entry in tasks.values() {
-        entry.paused.store(false, Ordering::SeqCst);
-    }
+    scheduler().resume_all();
 }
 
 pub fn list() -> Vec<TaskInfo> {
-    let tasks = scheduler().tasks.read().unwrap();
-    let mut out: Vec<TaskInfo> = tasks
-        .values()
-        .map(|entry| TaskInfo {
-            name: entry.name.clone(),
-            group: entry.group.clone(),
-            next_fire_ms: *entry.next_fire.read().unwrap(),
-            last_fire_ms: *entry.last_fire.read().unwrap(),
-        })
-        .collect();
-    out.sort_by(|a, b| a.name.cmp(&b.name));
-    out
+    scheduler().list()
 }
