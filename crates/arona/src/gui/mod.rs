@@ -1936,8 +1936,10 @@ impl AronaGui {
             .selectable(false),
         );
         ui.label(
-            "碧蓝档案 QQ 机器人 arona 的 Rust 移植版：OneBot 独立模式，完全剥离 Mirai / JVM。",
+            "QQ 机器人框架（OneBot 11 独立模式）：连接、授权、命令分发、插件生命周期与聊天留档都在这里，\
+             具体玩法由功能插件提供。",
         );
+        ui.weak("原版 arona（Kotlin + Mirai 插件）的 Rust 重写版，完全剥离 Mirai / JVM。");
         ui.add_space(12.0);
 
         card_row(ui, dark, |ui| {
@@ -1946,20 +1948,29 @@ impl AronaGui {
                 "https://github.com/YuLinLoli/Arona-rs",
                 "https://github.com/YuLinLoli/Arona-rs",
             );
+            ui.hyperlink_to(
+                "插件开发指南 PLUGIN_DEVELOPMENT.md",
+                "https://github.com/YuLinLoli/Arona-rs/blob/Arona-Dev/PLUGIN_DEVELOPMENT.md",
+            );
         });
         ui.add_space(10.0);
 
         card_row(ui, dark, |ui| {
             section_title(ui, "鸣谢");
-            ui.label("本项目的玩法、数据与美术素材来自原版 arona 项目，感谢原作者的付出：");
+            ui.label("框架脱胎于原版 arona，命令模型、事件与配置约定参考了它的实现：");
             ui.hyperlink_to("原版 arona（diyigemt）", "https://github.com/diyigemt");
+            ui.label("插件契约与事件优先级对齐 Mirai：");
+            ui.hyperlink_to("Mirai（事件 / 命令模型）", "https://github.com/mamoe/mirai");
+            ui.label("协议层实现 OneBot 11 规范：");
+            ui.hyperlink_to("OneBot 11", "https://github.com/botuniverse/onebot-11");
+            ui.label("功能插件带来的玩法、数据与美术素材，版权归各自项目的作者所有。");
         });
         ui.add_space(10.0);
 
         card_row(ui, dark, |ui| {
             section_title(ui, "开源协议");
             ui.label("GNU Affero General Public License v3.0（AGPL-3.0-only）。");
-            ui.label("本程序按「现状」提供，不附带任何担保；移植部分版权归 Arona-rs 作者所有。");
+            ui.label("本程序按「现状」提供，不附带任何担保；框架部分版权归 Arona-rs 作者所有。");
         });
         ui.add_space(10.0);
 
