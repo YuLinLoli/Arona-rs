@@ -1,0 +1,20 @@
+[package]
+name = "hello-plugin"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Arona 插件开发示例：命令、事件钩子、出站钩子、类型化配置与每日任务各来一发"
+
+[lib]
+name = "hello_plugin"
+path = "src/lib.rs"
+
+[dependencies]
+# 插件只依赖框架本体，gui 由 host 决定；把 default-features 关掉才不会把 eframe 拖进来
+arona = { path = "../../crates/arona", version = "1.0.0", default-features = false }
+serde = { workspace = true }
+
+[dev-dependencies]
+# 单测里手工拼一段 YAML，验证"用户只写一项也能读出来"
+serde_yaml = { workspace = true }

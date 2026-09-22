@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/arona", "crates/arona-host", "plugins/bluearchive"]
+members = ["crates/arona", "crates/arona-host", "plugins/bluearchive", "plugins/hello"]
 
 [workspace.package]
 edition = "2024"
