@@ -89,8 +89,8 @@ pub struct OneBotConfig {
     pub self_id: i64,
     #[serde(default = "default_nickname")]
     pub nickname: String,
-    /// 本地图片(抽卡结果/活动日历/攻略图等)改用 `file://` 路径直传 OneBot 实现，不再内嵌 base64。
-    /// 仅当 OneBot 实现(如 NapCat)与机器人同机部署、能访问相同磁盘时开启；默认 false(内嵌 base64)。
+    /// 来自本机磁盘的图片（插件生成的结果图、上传的图片文件等）改用 `file://` 路径直传 OneBot 实现，
+    /// 不再内嵌 base64。仅当 OneBot 实现(如 NapCat)与机器人同机部署、能访问相同磁盘时开启；默认 false(内嵌 base64)。
     #[serde(default)]
     pub send_image_as_file: bool,
     #[serde(default)]
@@ -384,7 +384,7 @@ fn template(config: &OneBotConfig) -> String {
     ));
     out.push_str("\n# ==================== 消息发送 ====================\n");
     out.push_str(
-        "# 本地图片(抽卡结果图/活动日历/攻略图等)是否改用 file:// 路径直传 OneBot 实现。\n",
+        "# 发到群里的图片如果来自本机磁盘(插件生成的结果图、文件分享等)，是否改用 file:// 路径直传 OneBot 实现。\n",
     );
     out.push_str(
         "# 开启后上行消息不再内嵌十几 MB 的 base64，发送更快；图片按原始文件上传，不做任何压缩。\n",

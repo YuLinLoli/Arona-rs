@@ -4,6 +4,9 @@
 
 插件契约对齐 [mirai](https://docs.mirai.com) 的插件模型（`PluginManager` / `plugin.yml` / `ApiVersion` / `EventPriority` / `CommandManager` / `CoroutineScope` / `DiContainer` / `ConfigKey`），只是把 Kotlin 的挂起函数与 JVM 类加载换成 Rust 的 `async` 与静态注册。§3 给出逐项对照。
 
+**想先跑起来再看文档：`plugins/hello/` 是一份可编译的最小样例插件**（`cargo test -p hello-plugin` 全绿），
+命令、事件钩子、出站钩子、类型化配置、每日任务各演示了一发，本文讲的接口基本都能在那儿对着读。
+
 ## 1. 目录与版本
 
 ```
@@ -12,6 +15,7 @@ plugins.toml               # 功能插件清单：host 编译期据此静态注�
 crates/arona/              # 框架库 crate：name=arona, version=1.0.0（发布版从 1.0.0 起）
 crates/arona-host/         # 宿主可执行：name=arona-host, version=1.0.0, 产物 bin=arona-rs
 plugins/bluearchive/       # 碧蓝档案功能插件：name=bluearchive-plugin, version=0.3.4, lib=bluearchive_plugin
+plugins/hello/             # 开发示例插件：name=hello-plugin, lib=hello_plugin（刻意不进 plugins.toml）
 ```
 
 版本约定：框架与 host 同为 `1.0.0`；功能插件 `BluearchivePlugin` 的版本号（`0.3.4`）接替拆分前本项目的版本号，随插件功能演进单独递增。
@@ -762,8 +766,15 @@ api.delete_msg(message_id).await?;
        "your_plugin::YourPlugin",
    ]
    ```
-4. 在 host `crates/arona-host/Cargo.toml` 的 `[dependencies]` 里加上该 crate
-   （同样 `default-features = false`）。
+4. 在 host `crates/arona-host/Cargo.toml` 里加两条：**可选依赖**与**同名 feature**，并把 feature 写进 `default`：
+   ```toml
+   [dependencies]
+   your-plugin = { path = "../../plugins/your-plugin", version = "0.1.0", default-features = false, optional = true }
+
+   [features]
+   default = ["gui", "your-plugin"]
+   your-plugin = ["dep:your-plugin"]
+   ```
 5. 把新 crate 加进根 `Cargo.toml` 的 `members`。
 
 `crates/arona-host/build.rs` 读 `plugins.toml` 生成 `OUT_DIR/plugins.rs`（一个
@@ -771,6 +782,15 @@ api.delete_msg(message_id).await?;
 引回并在 `arona::run(..)` 之前调用它 —— **不要再去 main.rs 里硬编码注册**。改了 `plugins.toml`
 无需改任何 Rust 代码，build.rs 已 `rerun-if-changed` 该文件。清单顺序只影响同层插件的展示/装配先后，
 跨层顺序由 `depends`/`soft_depends` 决定。
+
+第 4 步那个同名 feature 是**编译期开关**：build.rs 按 `CARGO_FEATURE_<crate 名大写、- 换成 _>` 判断，
+没打开的清单条目既不生成注册代码也不链接该 crate。所以"一个插件一档"，关掉别人的插件不会连带
+把它的代码编进产物；一个都不开就是纯框架 exe：
+
+```bash
+cargo build --release -p arona-host --no-default-features --features gui   # 不含任何功能插件
+ARONA_PLUGINS=0 cargo installer                                            # 同一份东西打成安装包
+```
 
 首次启动后 `plugins/<id>/`（含 `plugin.yml`）、`config/<id>/arona.yml` 会自动出现，GUI「插件管理」页立刻能开关它。
 

@@ -3,7 +3,7 @@
 # OneBot 协议连接配置见同目录 onebot.yml；本文件只放非 OneBot 的配置。
 #
 # 这里只有框架自己的项。功能插件的配置住在各自的 config/<插件>/arona.yml
-# （例如碧蓝档案插件是 config/bluearchive/arona.yml），插件加载后自动生成带注释的模板，
+# （插件 id 是什么，目录名就是什么，例如 config/hello/arona.yml），插件加载后自动生成带注释的模板，
 # 框架不需要知道插件有哪些配置项，因此升级插件改了默认值也只会补齐插件自己那份文件。
 
 # 允许响应的群号列表，留空表示响应所有群
@@ -15,7 +15,7 @@ managers: []
 # 同一插件连续 panic 多少次就自动隔离停用（0 = 只记日志、不停用），留默认即可
 framework:
   panic_disable_threshold: 5
-  # 未声明 with_prefix_match 的命令是否也允许最短前缀匹配（开着时 /抽 会命中 /抽卡）
+  # 未声明 with_prefix_match 的命令是否也允许最短前缀匹配（开着时输入 /stat 也能命中 /status）
   prefix_match_by_default: false
 
 # ==================== 聊天记录缓存 ====================

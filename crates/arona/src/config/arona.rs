@@ -576,7 +576,7 @@ fn template(config: &AronaConfig) -> String {
         config.framework.panic_disable_threshold
     ));
     out.push_str(
-        "  # 未声明 with_prefix_match 的命令是否也允许最短前缀匹配（开着时 /抽 会命中 /抽卡）\n",
+        "  # 未声明 with_prefix_match 的命令是否也允许最短前缀匹配（开着时输入 /stat 也能命中 /status）\n",
     );
     out.push_str(&format!(
         "  prefix_match_by_default: {}\n",
