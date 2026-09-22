@@ -14,6 +14,14 @@
 ;                                        不传则该组件不存在；传了也允许在「自定义安装」里取消勾选
 ;    /DHasDxc=1                           包里带上 {#AppSourceDir}\dxcompiler.dll + dxil.dll
 ;                                        （DX12 着色器编译器，渲染降级链的第一档）
+;    /DWithPlugins=1                      这是带功能插件的构建：释放插件自己的默认配置，
+;                                        程序简介与随包的「安装说明.txt」都用 intro.txt（含功能一览）；
+;                                        不传则是纯框架版，两份文案都换成 intro-framework.txt
+;    /DOutputTag=-framework               安装包文件名后缀，用来区分纯框架版与带插件版；
+;                                        不传则没有后缀
+;
+;  纯框架安装包（不链接、也不注册任何功能插件）由构建任务在 ARONA_PLUGINS=0 时产出，
+;  它只带框架本体：OneBot 连接、群授权、命令分发、插件生命周期与管理面板。
 ;
 ;  安装/更新行为：
 ;    - 安装目录会写进注册表 HKA\Software\YuLinLoli\Arona-rs（InstallPath / Version / ExeName）
@@ -32,6 +40,11 @@
 
 #ifndef OutputDir
   #define OutputDir "..\target\release"
+#endif
+
+; 安装包文件名后缀：纯框架版（不带功能插件）用 -framework，默认无后缀
+#ifndef OutputTag
+  #define OutputTag ""
 #endif
 
 #define AppName "Arona-rs"
@@ -62,11 +75,16 @@ DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
 AllowNoIcons=yes
 ; 程序介绍（首次安装时展示；更新安装会自动跳过）
+; 带功能插件时介绍功能一览，纯框架版只介绍框架本身
+#ifdef WithPlugins
 InfoBeforeFile=intro.txt
+#else
+InfoBeforeFile=intro-framework.txt
+#endif
 ; 开源协议：AGPLv3 完整原文（首次安装时展示；更新安装会自动跳过）
 LicenseFile=..\LICENSE
 OutputDir={#OutputDir}
-OutputBaseFilename=arona-rs-{#AppVersion}-setup-win-x64
+OutputBaseFilename=arona-rs-{#AppVersion}{#OutputTag}-setup-win-x64
 SetupIconFile=..\assets\arona.ico
 UninstallDisplayIcon={app}\{#AppExeName}
 UninstallDisplayName={#AppName} {#AppVersion}
@@ -130,14 +148,23 @@ Source: "{#AppSourceDir}\{#AppExeName}"; DestDir: "{app}"; Flags: ignoreversion 
 Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion; Components: main
 Source: "..\LICENSE.zh-CN.md"; DestDir: "{app}"; Flags: ignoreversion; Components: main
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion; Components: main
+; 随包再放一份「安装说明.txt」，就是向导第一页那份文案：带插件与纯框架各有对应版本，
+; 装完打开就能看到「这一版有什么、没什么」，不会拿插件的功能清单去介绍纯框架
+#ifdef WithPlugins
 Source: "intro.txt"; DestDir: "{app}"; DestName: "安装说明.txt"; Flags: ignoreversion; Components: main
+#else
+Source: "intro-framework.txt"; DestDir: "{app}"; DestName: "安装说明.txt"; Flags: ignoreversion; Components: main
+#endif
 ; ---- 默认配置文件：只在缺失时释放，已存在（含用户改过的）一律不动 ----
 ;      uninsneveruninstall: 卸载时默认保留，是否删除由卸载流程单独询问
 ;      运行目录固定是 exe 所在目录（快捷方式已设 WorkingDir），配置统一在 config/ 下，
 ;      每个插件自己的配置与数据再各占一层子目录（config/bluearchive/、data/bluearchive/）
 Source: "defaults\onebot.yml"; DestDir: "{app}\config"; Flags: onlyifdoesntexist uninsneveruninstall; Components: main
 Source: "defaults\arona.yml"; DestDir: "{app}\config"; Flags: onlyifdoesntexist uninsneveruninstall; Components: main
+#ifdef WithPlugins
+; 碧蓝档案插件的攻略源配置：只有这个插件在包里时才释放
 Source: "defaults\trainer_config.yml"; DestDir: "{app}\config\bluearchive"; Flags: onlyifdoesntexist uninsneveruninstall; Components: main
+#endif
 ; ---- CPU 软件渲染依赖（大体积依赖与 exe 分开存储，安装时释放到 {app}\softgl）----
 ;      程序在 exe 同级目录寻找 softgl\，找不到就跳过软渲染，不影响机器人功能
 #ifdef HasSoftgl

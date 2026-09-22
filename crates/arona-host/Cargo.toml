@@ -12,10 +12,13 @@ path = "src/main.rs"
 
 [dependencies]
 arona = { path = "../arona", version = "1.0.0", default-features = false }
-bluearchive-plugin = { path = "../../plugins/bluearchive", version = "0.3.4", default-features = false }
+bluearchive-plugin = { path = "../../plugins/bluearchive", version = "0.3.4", default-features = false, optional = true }
 
 [features]
 # 默认包含 GUI：启动即打开管理面板，加 --nogui 只启动命令行(黑窗口)模式
-default = ["gui"]
+# 默认也带上功能插件；纯框架构建用 --no-default-features --features gui
+default = ["gui", "bluearchive-plugin"]
 # 打开 host 的 gui 同时打开框架的 gui（eframe/wgpu）
 gui = ["arona/gui"]
+# 一个功能插件一档：关掉既不链接也不注册（build.rs 按同名 CARGO_FEATURE_* 生成注册代码）
+bluearchive-plugin = ["dep:bluearchive-plugin"]

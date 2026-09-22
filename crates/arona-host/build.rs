@@ -4,6 +4,8 @@
 //!       `rc.exe` 编译为 `.res` -> 通过 `cargo:rustc-link-arg` 交给链接器。
 //!       另：读仓库根目录的 `plugins.toml` -> 生成 `OUT_DIR/plugins.rs`（`register_plugins()`），
 //!       由 `src/main.rs` 用 `include!` 引回，main.rs 因此不再硬编码任何插件。
+//!       清单里某一项对应的 Cargo 特性没打开时，那一项不会出现在生成的注册代码里，
+//!       所以 `--no-default-features --features gui` 得到的是不含任何功能插件的纯框架 exe。
 //!
 //! 清单（RT_MANIFEST, 资源 id 1）里声明的是 `asInvoker`（保持系统默认的启动级别），
 //! 管理员权限由程序在运行期通过 `crates/arona/src/runtime/elevate.rs` 自提权（弹 UAC）获得，
@@ -64,6 +66,10 @@ fn main() {
 
 /// 读取 plugins.toml，生成 `OUT_DIR/plugins.rs`：一个 `register_plugins()` 函数，
 /// 依次把清单里的插件类型注册进框架。main.rs 用 `include!` 引回，从而不再硬编码插件。
+///
+/// 清单里每一项都要在 host 的 Cargo.toml 有一个与之同名的可选依赖/特性
+/// （`bluearchive_plugin::X` ↔ feature `bluearchive-plugin`）。特性没打开时这一项直接跳过，
+/// 于是 `--no-default-features --features gui` 就能产出不链接、不注册任何功能插件的纯框架 exe。
 fn generate_plugin_registrations() {
     let manifest_dir = match std::env::var("CARGO_MANIFEST_DIR") {
         Ok(dir) => PathBuf::from(dir),
@@ -87,17 +93,57 @@ fn generate_plugin_registrations() {
          #[inline]\n\
          pub(crate) fn register_plugins() {\n",
     );
+    let mut registered = 0usize;
     for path in &plugins {
-        code.push_str(&format!(
-            "    arona::plugin::register(std::sync::Arc::new(<{path}>::new()));\n"
-        ));
+        match feature_env_of(path) {
+            // 特性没开：这一项既不注册也不链接，纯框架构建走的就是这条路
+            Some(env) if std::env::var_os(&env).is_none() => {
+                code.push_str(&format!(
+                    "    // 跳过 {path}：本次构建未启用特性 {}\n",
+                    env_to_feature(&env)
+                ));
+            }
+            _ => {
+                code.push_str(&format!(
+                    "    arona::plugin::register(std::sync::Arc::new(<{path}>::new()));\n"
+                ));
+                registered += 1;
+            }
+        }
     }
     code.push_str("}\n");
+
+    if registered == 0 && !plugins.is_empty() {
+        println!(
+            "cargo:warning=plugins.toml 登记了 {} 个功能插件，本次构建一个都没启用，产物是纯框架版",
+            plugins.len()
+        );
+    }
 
     let generated = out_dir.join("plugins.rs");
     if let Err(err) = std::fs::write(&generated, code) {
         println!("cargo:warning=写入生成的插件注册代码失败: {err}");
     }
+}
+
+/// 插件类型路径对应的 Cargo 特性环境变量名：`bluearchive_plugin::Foo` -> `CARGO_FEATURE_BLUEARCHIVE_PLUGIN`。
+/// 不带外部 crate 的路径（`crate::MyPlugin` 之类）无法按特性门控，返回 None 表示一律注册。
+fn feature_env_of(path: &str) -> Option<String> {
+    let crate_name = path.split("::").next()?.trim();
+    if crate_name == "crate" || crate_name == "self" {
+        return None;
+    }
+    Some(format!(
+        "CARGO_FEATURE_{}",
+        crate_name.to_uppercase().replace('-', "_")
+    ))
+}
+
+/// 环境变量名退回 Cargo 特性名，只为上面那条跳过注释可读
+fn env_to_feature(env: &str) -> String {
+    env.trim_start_matches("CARGO_FEATURE_")
+        .to_lowercase()
+        .replace('_', "-")
 }
 
 /// 极简解析：取 `plugins = [ ... ]` 数组里所有双引号字符串作为插件类型路径。

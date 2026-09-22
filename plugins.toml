@@ -1,10 +1,13 @@
 # 功能插件清单（host 二进制据此在编译期静态注册插件）。
 #
 # 每一项是一个实现了 `arona::plugin::AronaPlugin`、且提供 `::new()` 的类型路径。
-# 新增一个功能插件只需两步：
-#   1. 在下面的 plugins 数组里加一行类型路径；
-#   2. 在 crates/arona-host/Cargo.toml 的 [dependencies] 里加上对应 crate。
+# 新增一个功能插件只需三步：
+#   1. 在 crates/arona-host/Cargo.toml 的 [dependencies] 里加上对应 crate（optional = true）；
+#   2. 在 [features] 里加一个与依赖同名的特性（`xxx-plugin = ["dep:xxx-plugin"]`）并写进 default；
+#   3. 在下面的 plugins 数组里加一行类型路径。
 # crates/arona-host/build.rs 读取本文件生成注册代码，main.rs 不再硬编码任何插件。
+# 特性没打开的那一项会被跳过，所以纯框架交付（不含任何功能插件）用：
+#   cargo build --release -p arona-host --no-default-features --features gui
 plugins = [
     "bluearchive_plugin::BluearchivePlugin",
 ]

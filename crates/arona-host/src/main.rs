@@ -4,8 +4,9 @@
 //! 含 GUI 的 Windows 构建使用 windows 子系统（GUI 模式不弹控制台），`--nogui`
 //! 时会由框架接回上级终端或新建控制台。
 //!
-//! 想换/加功能包，只改仓库根目录的 `plugins.toml`（外加 host 的 Cargo 依赖）即可，
-//! `register_plugins()` 由 build.rs 依据该清单自动生成，本文件不再硬编码任何插件。
+//! 想换/加功能包，只改仓库根目录的 `plugins.toml`（外加 host 的 Cargo 依赖与同名特性）即可，
+//! `register_plugins()` 由 build.rs 依据该清单与已启用的特性自动生成，本文件不再硬编码任何插件。
+//! 一个功能插件都不带时（`--no-default-features --features gui`）产物就是纯框架 exe。
 
 // 含 GUI 时用 windows 子系统，避免 GUI 模式多出一个控制台窗口；测试目标保持控制台。
 #![cfg_attr(
