@@ -1,18 +1,19 @@
 # Cargo 别名配置（相当于本项目常用的“构建任务”快捷命令）
 #
 # 本工程是 workspace：
-#   crates/arona         框架（OneBot + GUI + 群授权 + 命令分发 + 生命周期）
+#   crates/arona         框架（OneBot + GUI + 群授权 + 命令分发 + 插件装载与生命周期）
 #   crates/arona-host    可执行入口，产物 arona-rs[.exe]
-#   plugins/bluearchive  碧蓝档案功能插件（BluearchivePlugin）
-# 因此 build/run/dist/installer 都固定打在 -p arona-host 上，自检用例在 -p bluearchive-plugin 上。
+#   plugins/hello        示例功能插件，产物 hello_plugin.dll —— 运行期由框架扫描 plugins/
+#                        装载，宿主不链接它，因此它不出现在任何构建产物里
+# build/run/dist/installer 都固定打在 -p arona-host 上：产物永远是框架本体。
 #
 # 用法示例：
 #   cargo build-release   # 发布构建(默认含 GUI), 产物: target/release/arona-rs[.exe]
 #   cargo run-nogui       # 以纯命令行(黑窗口)模式运行
 #   cargo dist            # 发布构建: 产物 arona-rs[.exe]（主程序不带版本号, 交付推荐）
 #   cargo installer       # 发布构建 + 打 Windows 安装包(需 Inno Setup 6, 安装包名带版本号)（见 installer/）
+#   cargo build-plugin    # 构建示例插件 dll: target/release/hello_plugin.dll
 #   cargo run-release     # 发布构建并直接运行独立版
-#   cargo smoke-image     # 生成抽卡/活动日历样例图并做像素级自检（忽略的自检用例）
 # 若需在别名后追加参数, 直接写在其后即可, 例如: cargo build-release --verbose
 
 [alias]
@@ -28,22 +29,8 @@ dist = "test -p arona-host dist_build --release -- --ignored --nocapture --test-
 installer = "test -p arona-host installer_build --release -- --ignored --nocapture --test-threads=1"
 # 发布构建并立即运行
 run-release = "run --release -p arona-host"
-# 图片渲染冒烟自检: 生成样例 PNG 到 data/bluearchive/image 并断言关键区域颜色
-smoke-image = "test -p bluearchive-plugin render -- --ignored --nocapture"
-# /十连 端到端自检: 走完整命令链路并生成结果图到 data/bluearchive/image/gacha/result
-smoke-tenpull = "test -p bluearchive-plugin ten_pull -- --ignored --nocapture --test-threads=1"
-# /攻略 端到端自检: 拉取活动攻略/日程笔记/当期卡池/云端图片
-smoke-trainer = "test -p bluearchive-plugin trainer_test -- --ignored --nocapture --test-threads=1"
-# 活动推送逻辑/调度自检(不联网): 5小时/1小时预警、维护文案、每日任务时刻
-smoke-notify = "test -p bluearchive-plugin notify_logic_plan_and_alerts -- --nocapture --test-threads=1"
-# 每日活动推送端到端自检(联网): 三服日历图+文本推送到群
-smoke-notify-net = "test -p bluearchive-plugin notify_daily_push_network -- --ignored --nocapture --test-threads=1"
-# 学生生日端到端自检(联网): 三服日历数据流/文本/图片均包含未来一周生日
-smoke-birthday = "test -p bluearchive-plugin birthday -- --ignored --nocapture --test-threads=1"
-# 本地资源图片刷新自检(不联网/不需要字体): 每日 0 点任务注册时刻
-smoke-image-refresh = "test -p bluearchive-plugin image_refresh -- --nocapture --test-threads=1"
-# 启动刷新本地资源图片自检(联网): 拉取三服活动并生成三张日历图
-smoke-image-refresh-net = "test -p bluearchive-plugin refresh_all_images -- --ignored --nocapture --test-threads=1"
+# 构建示例插件（产物 target/release/hello_plugin.dll）：把它拷进运行目录的 plugins/ 再启动框架
+build-plugin = "build --release -p hello-plugin"
 # 发布构建(默认已含管理 GUI): 产物 target/release/arona-rs[.exe], 直接运行即打开管理面板
 build-gui = "build --release -p arona-host"
 # 发布构建(不含 GUI 的精简命令行版, 减小体积)
@@ -53,8 +40,9 @@ gui = "run --release -p arona-host"
 # 构建并以纯命令行(黑窗口)模式运行
 run-nogui = "run --release -p arona-host -- --nogui"
 
-# 静态链接 MSVC 运行库：产物自带 VCRUNTIME/UCRT，服务器上无需安装
-# "Microsoft Visual C++ 2015-2022 Redistributable"（解决“缺少 VCRUNTIME140.dll”）
+# 静态链接 MSVC 运行库：产物自带 VCRUNTIME/UCRT，服务器上无需装
+# "Microsoft Visual C++ 2015-2022 Redistributable"（解决“缺少 VCRUNTIME140.dll”）。
+# 插件仓库的 .cargo/config.toml 必须与这里一致，否则插件 dll 会被框架的 ABI 握手拒载。
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static"]
 

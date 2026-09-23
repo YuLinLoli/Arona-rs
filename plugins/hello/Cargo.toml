@@ -4,11 +4,14 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Arona 插件开发示例：命令、事件钩子、出站钩子、类型化配置与每日任务各来一发"
+description = "Arona 插件开发示例：一个动态装载的 dll 插件，命令、事件钩子、出站钩子、类型化配置与每日任务各来一发"
 
 [lib]
 name = "hello_plugin"
 path = "src/lib.rs"
+# cdylib 产出可被框架扫描加载的 hello_plugin.dll；rlib 那份只给 `cargo test` 用，
+# 宿主永远不链接它——插件与框架之间只有运行期的 dll 这一层关系。
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 # 插件只依赖框架本体，gui 由 host 决定；把 default-features 关掉才不会把 eframe 拖进来

@@ -477,7 +477,7 @@ mod tests {
                 name: "抽卡",
                 description: "",
             },
-            "bluearchive",
+            "hello",
         );
         let mut settings = BTreeMap::new();
         settings.insert(
@@ -497,7 +497,7 @@ mod tests {
         assert!(gating.feature_enabled(None, "gacha"));
         // 群内插件名单（比对忽略大小写），没设置的群一律放行
         assert!(!gating.plugin_enabled_in_group("Other", Some(100)));
-        assert!(gating.plugin_enabled_in_group("bluearchive", Some(100)));
+        assert!(gating.plugin_enabled_in_group("hello", Some(100)));
         assert!(gating.plugin_enabled_in_group("other", Some(200)));
         assert!(gating.feature_enabled(Some(200), "gacha"));
         // 群内黑名单只在那个群里成立
@@ -506,8 +506,8 @@ mod tests {
         gating.set_global_blacklist(vec![7]);
         assert!(gating.is_blacklisted(7, None));
         // 全局停用插件连带它名下的功能（名单比对同样忽略大小写）
-        gating.set_disabled_plugins(vec!["BLUEARCHIVE".to_string()]);
-        assert!(!gating.plugin_enabled("bluearchive"));
+        gating.set_disabled_plugins(vec!["HELLO".to_string()]);
+        assert!(!gating.plugin_enabled("hello"));
         assert!(!gating.feature_enabled(Some(200), "gacha"));
         // 取单群设置不必克隆整张表
         assert_eq!(
@@ -540,7 +540,7 @@ mod tests {
                 name: "抽卡",
                 description: "",
             },
-            "bluearchive",
+            "hello",
         );
         gating.register_feature(
             Feature {
@@ -551,7 +551,7 @@ mod tests {
             "who-is-arona",
         );
         assert_eq!(gating.features().len(), 2);
-        gating.set_disabled_plugins(vec!["BlueArchive".to_string()]);
+        gating.set_disabled_plugins(vec!["Hello".to_string()]);
         assert_eq!(
             gating
                 .features()
@@ -560,7 +560,7 @@ mod tests {
                 .collect::<Vec<&str>>(),
             vec!["whoami"]
         );
-        assert_eq!(gating.features_of("bluearchive").len(), 1);
+        assert_eq!(gating.features_of("hello").len(), 1);
         assert!(gating.feature_keys_text().contains("gacha"));
     }
 }

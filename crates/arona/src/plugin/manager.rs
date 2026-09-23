@@ -7,9 +7,10 @@
 //! 3. **停用要收干净** —— `stop()` 之后由框架统一回收该插件的命令、事件订阅、
 //!    定时任务、后台任务与服务（mirai 靠 CoroutineScope 消失达成的同一效果）。
 //!
-//! 静态编译模式下装载器是 [`BUILTIN_LOADER`]：`crates/arona-host/build.rs` 依据
-//! 仓库根目录的 `plugins.toml` 生成 `arona::plugin::register(..)` 调用。
-//! 将来要加动态装载，只需再实现一个 [`PluginLoader`]，插件作者写的代码不变。
+//! 正路装载器是 [`dynamic::DynamicPluginLoader`]：启动时扫描 `plugins/` 目录，把用户
+//! 放进去的插件 dll 装配进来（对应 mirai 扫描 `plugins/` 找 jar）。
+//! [`BUILTIN_LOADER`] 只是"编译进了本程序的插件实例"这个兜底口子——框架自身的产物
+//! 永远走动态装载，宿主不链接任何功能插件。
 use crate::framework::Framework;
 use crate::plugin::AronaPlugin;
 use crate::plugin::context::{PluginContext, PluginRegistrar};
@@ -675,7 +676,7 @@ pub(crate) fn describe(plugin: &ManagedPlugin) -> String {
         }
     };
     format!(
-        "# 本文件由框架启动时自动生成，描述编译进本程序的插件（mirai 风格的 plugin.yml）。\n\
+        "# 本文件由框架装载插件时自动生成，内容与插件上报的元信息一致（mirai 风格的 plugin.yml）。\n\
          # 插件目录只放随包资源；配置与数据按统一约定各归其位：\n\
          id: {id}\n\
          name: {name}\n\

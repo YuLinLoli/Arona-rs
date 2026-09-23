@@ -5,9 +5,9 @@
 //! <工作目录>/
 //!   config/arona.yml          框架配置（授权 / 黑名单 / 分群 / 禁用插件）
 //!   config/onebot.yml         OneBot 连接配置
-//!   config/<插件>/arona.yml   某个插件自己的配置（如 config/bluearchive/arona.yml）
+//!   config/<插件>/arona.yml   某个插件自己的配置（如 config/hello/arona.yml）
 //!   data/arona/               框架自己的数据（聊天记录缓存 chatlog.db）
-//!   data/<插件>/…             某个插件自己的数据（如 data/bluearchive/image、arona.db）
+//!   data/<插件>/…             某个插件自己的数据（如 data/hello/image、arona.db）
 //!   logs/                     按天滚动的日志与 startup-error.log
 //!   plugins/<插件>/           某个插件的目录（清单 plugin.yml 与随包资源）
 //! ```

@@ -1,10 +1,11 @@
 //! arona 框架：OneBot v11 连接、管理面板(GUI)、群授权/黑名单与命令分发骨架，
-//! 以及启动/关闭的生命周期编排。具体功能由插件（实现 [`plugin::AronaPlugin`]）提供，
-//! host 在 [`run`] 之前用 [`plugin::register`] 注册插件。
+//! 以及启动/关闭的生命周期编排。具体功能由插件提供——插件是编译成 dll 的独立 crate，
+//! 用户在启动前把它放进运行目录的 `plugins/`，[`run`] 会扫描目录并自动装配
+//! （见 [`plugin::dynamic`]），框架本体不链接任何功能插件。
 //!
-//! 这个 crate 就是插件开发时引入的依赖：`arona = { path = "..." }`，
-//! 在插件里通过 [`runtime`] / [`config`] / [`onebot`] / [`services`] / [`quartz`] 等
-//! 复用框架能力，并可 `cargo run`（走 host）开发与运行调试。
+//! 这个 crate 就是插件开发时引入的唯一依赖：`arona = { path = "...", default-features = false }`，
+//! 插件在 [`runtime`] / [`config`] / [`onebot`] / [`services`] / [`quartz`] 里复用框架能力，
+//! 生命周期回调由框架驱动，插件自己不提供 `main`。
 
 #[cfg(feature = "gui")]
 pub mod gui;

@@ -2,7 +2,7 @@
 //!
 //! 原版独立模式对标准输出/错误流做统一染色，判定顺序与优先级完全一致：
 //! 1. 以 `[Arona` / `[OneBot` 开头的行                     -> 亮绿（优先，即使含 WARNING）
-//! 2. 前缀是某个插件的显示名（`[BluearchivePlugin] …`）    -> 淡紫
+//! 2. 前缀是某个插件的显示名（`[HelloPlugin] …`）    -> 淡紫
 //! 3. 含 `WARNING:` / `WARNING：` / `SLF4J`，
 //!    或含被空白包裹的 `INFO|DEBUG|WARN|ERROR|TRACE`       -> 亮黄
 //! 4. 其它行                                              -> 原样
@@ -190,7 +190,7 @@ pub fn color_for_line(line: &str) -> Option<Color> {
     if line.starts_with("[Arona") || line.starts_with("[OneBot") {
         return Some(Color::BrightGreen);
     }
-    // [BluearchivePlugin] 一类：插件自己的日志淡紫，跟框架的亮绿区分开
+    // [HelloPlugin] 一类：插件自己的日志淡紫，跟框架的亮绿区分开
     if source_of(line).is_some_and(crate::plugin::is_plugin_name) {
         return Some(Color::BrightMagenta);
     }
@@ -587,14 +587,14 @@ mod tests {
     fn log_source_is_read_out_of_the_prefix() {
         // 插件日志按这个前缀去查已登记的显示名，命中才染淡紫
         assert_eq!(
-            source_of("[BluearchivePlugin] 活动推送已启用"),
-            Some("BluearchivePlugin")
+            source_of("[HelloPlugin] 活动推送已启用"),
+            Some("HelloPlugin")
         );
         assert_eq!(source_of("[Arona] hello"), Some("Arona"));
         // 细化到动作后仍要认得插件名，否则淡紫配色会跟着丢
         assert_eq!(
-            source_of("[BluearchivePlugin:定时推送] 开始推送"),
-            Some("BluearchivePlugin")
+            source_of("[HelloPlugin:定时推送] 开始推送"),
+            Some("HelloPlugin")
         );
         assert_eq!(source_of("plain line"), None);
         assert_eq!(source_of("[没有闭合的括号"), None);

@@ -1,14 +1,15 @@
 //! 插件契约层：功能部分以插件形式插入框架。
 //!
 //! 框架只负责 OneBot 连接、管理面板、群授权/黑名单与命令分发骨架；
-//! 具体功能（抽卡/活动/攻略……）由插件提供。开发插件时把本 crate 作为依赖引入，
-//! 用 host（或直接 `cargo run`）即可开发与运行调试。
+//! 具体功能由插件提供，形态是**放在 `plugins/` 目录下的动态库**（Windows 上是 dll）：
+//! 用户启动前把插件丢进去，框架启动时自动发现并装配（见 [`dynamic`]）。
+//! 框架本体不含任何功能插件，也不为某个插件网开后门。
 //!
 //! 对齐 mirai 的插件模型，一次装配合约按四个阶段推进，每个阶段能做什么被接口卡死：
 //!
 //! | 阶段 | mirai 对应 | 插件该做什么 | 交接面 |
 //! | --- | --- | --- | --- |
-//! | load | `PluginManager.loadPlugin` | 无（host 静态注册实例） | [`register`] |
+//! | load | `PluginManager.loadPlugins`（扫描 `plugins/`） | 无（框架扫描目录并握手，见 [`abi`]） | [`register`] |
 //! | install | `Plugin.onEnable` 前的 DI 声明 | 登记功能开关、配置区 | [`PluginRegistrar`] |
 //! | configure | `CommandManager.registerCommand` | 登记命令/事件订阅、公布服务 | [`PluginContext`] |
 //! | start | `CoroutineScope.launch` | 开数据库、拉后台与定时任务 | [`PluginContext`] |
@@ -20,8 +21,10 @@
 //! 停用是「装配的镜像」：插件的 [`AronaPlugin::stop`] 跑完后，框架再把该插件名下的命令、
 //! 事件订阅、定时任务、后台任务与服务一并收回（见 [`manager::revoke_resources`]），
 //! 所以插件不必（也无法）靠自己在 stop 里清理干净来保证停用生效。
+pub mod abi;
 pub mod context;
 pub mod description;
+pub mod dynamic;
 pub mod health;
 pub mod manager;
 pub mod scope;
@@ -30,8 +33,10 @@ use crate::runtime::log;
 use std::future::Future;
 use std::sync::Arc;
 
+pub use abi::DYNAMIC_LOADER;
 pub use context::{PluginContext, PluginRegistrar};
 pub use description::{ApiVersion, FRAMEWORK_API_VERSION, PluginMeta};
+pub use dynamic::DynamicPluginLoader;
 pub use manager::{
     BUILTIN_LOADER, LifecycleOptions, LoaderRegistry, ManagedPlugin, PluginLoader, PluginManager,
     PluginState,
@@ -114,7 +119,7 @@ pub fn display_name(id: &str) -> String {
         .unwrap_or_else(|| id.to_string())
 }
 
-/// 插件 id + 动作 → 日志来源（`BluearchivePlugin:定时推送`）：框架在进入插件代码的每个
+/// 插件 id + 动作 → 日志来源（`HelloPlugin:定时推送`）：框架在进入插件代码的每个
 /// 入口用它换掉 `[Arona]`，动作名按入口给粗粒度默认值，插件可在内部再细化（[`action`]）。
 pub fn log_source(id: &str, action: &str) -> String {
     if id.is_empty() {
@@ -162,14 +167,21 @@ pub fn state_of(id: &str) -> Option<PluginState> {
     manager().find(id).map(|plugin| plugin.state())
 }
 
-/// install 阶段：先消化额外装载器，再登记功能清单与配置区。
+/// install 阶段：先扫描 `plugins/` 目录并消化其它装载器，再登记功能清单与配置区。
 /// 单个插件失败只记日志，不影响其余插件。
 pub fn install_all() -> Result<(), String> {
+    ensure_dynamic_loader();
     manager().load_registered_loaders();
     for (id, reason) in manager().install_all() {
         log::error(format!("插件 {id} 登记失败: {reason}"));
     }
     Ok(())
+}
+
+/// 登记内置的目录扫描装载器（幂等：`plugins/` 只在启动时扫一遍）
+fn ensure_dynamic_loader() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| add_loader(Arc::new(dynamic::DynamicPluginLoader)));
 }
 
 /// 装配阶段：只为启用的插件登记命令与事件订阅
@@ -233,8 +245,8 @@ pub fn dispatcher_active_in_group(group_id: Option<i64>) -> bool {
 }
 
 /// 建好插件的三件套目录并写下 `plugins/<id>/plugin.yml`：
-/// 静态编译模式下插件不单独出包，这个目录就是它在磁盘上的"存在证明"，
-/// 用户从中能看出程序里装了谁、它的配置与数据放在哪。
+/// 内容直接由插件 dll 的 `meta()` 渲染，磁盘上看到的描述与代码里的完全一致（对齐
+/// mirai 从 jar 里读 `plugin.yml` 的做法），用户从中能看出装了谁、它的配置与数据放在哪。
 pub(crate) fn prepare_plugin_home(plugin: &Arc<ManagedPlugin>) {
     let id = plugin.id();
     let dir = crate::runtime::paths::plugin_dir(id);

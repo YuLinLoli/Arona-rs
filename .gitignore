@@ -13,10 +13,14 @@ arona-standalone/
 /crates/arona/data/
 /crates/arona/logs/
 /crates/arona/plugins/
-/plugins/bluearchive/config/
-/plugins/bluearchive/data/
-/plugins/bluearchive/logs/
-/plugins/bluearchive/plugins/
+/crates/arona-host/config/
+/crates/arona-host/data/
+/crates/arona-host/logs/
+/crates/arona-host/plugins/
+/plugins/hello/config/
+/plugins/hello/data/
+/plugins/hello/logs/
+/plugins/hello/plugins/
 
 # 软件 OpenGL 兜底依赖(Mesa llvmpipe, 约 62MB): 用 scripts/fetch-softgl.ps1 现场获取, 不入库
 /softgl/

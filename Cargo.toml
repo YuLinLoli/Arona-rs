@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/arona", "crates/arona-host", "plugins/bluearchive", "plugins/hello"]
+members = ["crates/arona", "crates/arona-host", "plugins/hello"]
 
 [workspace.package]
 edition = "2024"
@@ -24,6 +24,8 @@ rand = "0.8"
 base64 = "0.22"
 once_cell = "1"
 log = "0.4"
+# 运行期加载功能插件 dll（plugins/ 目录扫描）
+libloading = "0.8"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 fontdue = "0.8"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }

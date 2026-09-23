@@ -171,6 +171,30 @@ impl Framework {
         GLOBAL.get_or_init(Framework::new).clone()
     }
 
+    /// 把一个外部实例认领成**本份代码里的**进程默认实例。
+    ///
+    /// 动态插件 dll 静态链接了整整一份框架代码，`quartz::exists`、`container::instance()`
+    /// 这类自由函数读的是 dll 自己的 `GLOBAL`——那套表是空的，写进去的东西宿主永远看不见。
+    /// 装载器在造实例之前调它，把宿主的实例接过来，此后插件里的自由函数落的都是宿主真正
+    /// 在跑的那套注册表。只能认领一次（`GLOBAL` 是 `OnceLock`），且必须早于任何插件代码。
+    ///
+    /// # Safety
+    /// `host` 必须指向一个由宿主 `Arc` 持有、且在进程结束前不会被释放的 `Framework`。
+    pub unsafe fn adopt_host(host: *const std::ffi::c_void) -> bool {
+        if host.is_null() {
+            return false;
+        }
+        let host = host.cast::<Framework>();
+        // 指的已经是本份代码的默认实例：接管等于没改变，算成功（宿主的单测走这条）
+        let current = GLOBAL.get().map_or(std::ptr::null(), Arc::as_ptr);
+        if std::ptr::eq(host, current) {
+            return true;
+        }
+        // 计数 +1 后包成 Arc 交给 GLOBAL：宿主那份永不释放，这一份也就不必归还
+        unsafe { Arc::increment_strong_count(host) };
+        GLOBAL.set(unsafe { Arc::from_raw(host) }).is_ok()
+    }
+
     /// 本实例是否就是进程默认实例（只有它可以写进程级的配置文件）
     fn is_process_default(&self) -> bool {
         std::ptr::eq(self, Framework::global())

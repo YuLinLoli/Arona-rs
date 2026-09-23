@@ -6,9 +6,9 @@
 #   2. git tag v1.0.0 && git push origin v1.0.0
 #   3. Actions 自动构建 -> 上传工件 -> 创建 Release
 #      产物: arona-rs-1.0.0-win-x64.zip（便携版, 内含 arona-rs.exe + softgl/ + DXC DLL, 带版本号）
-#            arona-rs-1.0.0-setup-win-x64.exe（安装包, 含功能插件、程序介绍与 AGPLv3 全文）
-#            arona-rs-1.0.0-framework-setup-win-x64.exe（纯框架安装包, 不链接任何功能插件）
-#      便携 zip 与前面的安装包都是「带功能插件」的那一份；纯框架版只有安装包
+#            arona-rs-1.0.0-setup-win-x64.exe（安装包, 含程序介绍与 AGPLv3 全文）
+#      两个包都只含框架本体：功能插件是各自仓库编出的 dll，用户装好后放进 plugins\ 目录，
+#      框架启动时自动扫描装载（工具链要求见 PLUGIN_DEVELOPMENT.md）
 #      渲染运行库全部随包发布: 解压/安装后无需装任何依赖就能打开管理面板
 #      裸 exe 不上传: 要单文件就用安装包（或自己解压 zip）, 这样 Release 里不会有
 #      名字相同、无法区分版本的 arona-rs.exe
@@ -162,16 +162,6 @@ jobs:
           $setup = "target/release/arona-rs-$($env:APP_VERSION)-setup-win-x64.exe"
           if (-not (Test-Path $setup)) { Write-Error "未找到安装包 $setup"; exit 1 }
           "SETUP_PATH=$setup" >> $env:GITHUB_ENV
-          # 纯框架安装包由下一步才产出，这里先把文件名传下去给上传步骤用
-          "FRAMEWORK_SETUP_PATH=target/release/arona-rs-$($env:APP_VERSION)-framework-setup-win-x64.exe" >> $env:GITHUB_ENV
-
-      # 纯框架安装包：不链接、不注册任何功能插件，给只想自己写插件的人。
-      # 必须排在 Package zip 之后——它会把 target/release/arona-rs.exe 覆盖成不含插件的那份，
-      # 便携 zip 已经打好才安全。
-      - name: Build framework installer
-        env:
-          ARONA_PLUGINS: "0"
-        run: cargo test -p arona-host installer_build --release -- --ignored --nocapture --test-threads=1
 
       # 上传工件: 便携 zip + 安装包（裸 exe 只用于打包 zip/安装包，不单独上传）
       - name: Upload-Artifact
@@ -181,7 +171,6 @@ jobs:
           path: |
             ${{ env.ZIP_PATH }}
             ${{ env.SETUP_PATH }}
-            ${{ env.FRAMEWORK_SETUP_PATH }}
           compression-level: 0
 
   # 2) 取回工件并发布 Release

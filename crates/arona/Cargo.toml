@@ -27,6 +27,8 @@ uuid = { workspace = true }
 base64 = { workspace = true }
 once_cell = { workspace = true }
 log = { workspace = true }
+# 启动时扫描 plugins/ 目录、把功能插件 dll 映射进进程（见 plugin::dynamic）
+libloading = { workspace = true }
 image = { workspace = true }
 # GUI 管理面板：由 host 通过 `arona/gui` 打开（插件依赖本 crate 时不会强制启用）
 eframe = { workspace = true, optional = true }

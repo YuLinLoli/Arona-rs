@@ -1,8 +1,11 @@
-//! Arona 插件开发示例（配套文档：仓库根 `PLUGIN_DEVELOPMENT.md`，见 §15「新增一个插件」）
+//! Arona 动态插件开发示例（配套文档：仓库根 `PLUGIN_DEVELOPMENT.md`）
 //!
-//! 这个 crate 刻意**不进 `plugins.toml`、也不被 host 依赖**：它只保证 `cargo check -p hello-plugin`
-//! 过得去，装着它机器人不会长出别的功能。要真跑起来，把 `hello_plugin::HelloPlugin` 加进
-//! `plugins.toml` 的清单，并在 `crates/arona-host/Cargo.toml` 里加一条同名 feature。
+//! 这是框架装载方式的**标准形态**：本 crate 编译成 `hello_plugin.dll`，用户在启动前
+//! 把它放进运行目录的 `plugins/`，框架启动时自动扫描、握手、装配。宿主不链接它，
+//! 所以改这个文件不需要重新编译框架，重装一次 dll 就生效。
+//!
+//! 与框架的全部关系就是文件末尾那一行 [`arona::export_arona_plugin!`]，加上
+//! 下面这些生命周期回调——插件不提供 `main`，也不该自己起进程，一切由框架驱动。
 //!
 //! 一个插件会用到的接口都在这里各演示一遍：
 //! - `install`：登记一个分群功能开关 + 一块强类型配置（落在 `config/hello/arona.yml`）
@@ -291,6 +294,10 @@ impl AronaPlugin for HelloPlugin {
         // （plugin::manager::revoke_resources）。插件只关自己打开的句柄，这里一个都没有。
     }
 }
+
+// 动态装载入口：导出 `arona_plugin_abi` / `arona_plugin_toolchain` / `arona_plugin_new`
+// 三个 C 符号，框架扫描 plugins/ 时靠它们握手并取出实例。插件作者只需写这一行。
+arona::export_arona_plugin!(HelloPlugin::new());
 
 /// 该不该给这条出站消息加前缀：前缀空、没内容、或头一段已经带着前缀时都不加
 fn should_add_prefix(message: &OutgoingMessage, prefix: &str) -> bool {

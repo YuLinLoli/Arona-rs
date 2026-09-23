@@ -309,7 +309,7 @@ impl PluginContext {
     }
 
     /// 在本插件作用域内跑后台任务，并把它的日志前缀细化成 `[插件名:动作]`
-    /// （如 `[BluearchivePlugin:定时推送]`）。任务会跨 `await` 在工作线程间搬动，
+    /// （如 `[HelloPlugin:定时推送]`）。任务会跨 `await` 在工作线程间搬动，
     /// 所以动作名必须走这里随任务下发，`plugin::action` 的线程局部来源撑不过一次挂起。
     pub fn spawn_as<F>(&self, action: &str, task: F) -> tokio::task::JoinHandle<F::Output>
     where

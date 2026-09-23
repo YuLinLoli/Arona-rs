@@ -13,39 +13,17 @@
 //! （DXC 着色器编译器）。它们都不入库，靠 scripts/fetch-softgl.ps1 与 scripts/fetch-dxc.ps1
 //! 现场获取；缺哪个就跳过对应副本并打印提示，安装包也不会带上对应组件。
 //!
-//! 交付纯框架版本（不链接、不注册任何功能插件，安装包也不带插件默认配置）：
-//!   ARONA_PLUGINS=0 cargo installer   ->  target/release/arona-rs-<版本号>-framework-setup-win-x64.exe
-//!   ARONA_PLUGINS=0 cargo dist        ->  纯框架 exe
-//! 不设或设成其他值 = 按 plugins.toml 带上全部功能插件（默认）。
+//! 产物永远是框架本体：功能插件不链接进 exe，而是编译成 dll 由用户在启动前放进
+//! `plugins\`，框架启动时扫描装载（见 `arona::plugin::dynamic`）。
+//! 因此这里不存在"带插件的宿主"这条分支，也不需要给包名加区分后缀。
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// 本次构建是否带上 plugins.toml 里的功能插件（默认带）。
-///
-/// 交付纯框架版本时设 `ARONA_PLUGINS=0`：host 用 `--no-default-features --features gui` 构建，
-/// 功能插件既不链接也不注册，安装包也不会释放插件自己的默认配置。
-fn with_plugins() -> bool {
-    match std::env::var("ARONA_PLUGINS") {
-        Ok(value) => !matches!(
-            value.trim().to_lowercase().as_str(),
-            "0" | "none" | "false" | "off"
-        ),
-        Err(_) => true,
-    }
-}
-
 /// 发布构建（默认含管理 GUI），返回 target/release/arona-rs[.exe]
-fn build_release(root: &Path, plugins: bool) -> PathBuf {
+fn build_release(root: &Path) -> PathBuf {
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
-    println!(
-        "[dist] 开始发布构建（{}）",
-        if plugins {
-            "含功能插件"
-        } else {
-            "纯框架，不含功能插件"
-        }
-    );
+    println!("[dist] 开始发布构建");
     // workspace 根是虚拟清单，`--features` 必须落到具体包上：产物就是 host 的 arona-rs.exe
     let mut command = Command::new(&cargo);
     command
@@ -53,11 +31,7 @@ fn build_release(root: &Path, plugins: bool) -> PathBuf {
         .arg("--release")
         .arg("-p")
         .arg("arona-host");
-    if plugins {
-        command.args(["--features", "gui"]);
-    } else {
-        command.args(["--no-default-features", "--features", "gui"]);
-    }
+    command.args(["--features", "gui"]);
     let status = command
         .current_dir(root)
         .status()
@@ -170,7 +144,7 @@ fn copy_dxc(root: &Path) -> bool {
 #[test]
 fn dist_build() {
     let root = workspace_root();
-    build_release(&root, with_plugins());
+    build_release(&root);
     let exe = finalize_binary(&root);
     println!("[dist] 构建产物: {}", exe.display());
 
@@ -196,14 +170,9 @@ fn installer_build() {
     let root = workspace_root();
     let version = env!("CARGO_PKG_VERSION");
     let release_dir = target_release_dir(&root);
-    let plugins = with_plugins();
-    let tag = if plugins { "" } else { "-framework" };
-    println!(
-        "[installer] 开始构建安装包 (arona-rs {version}{tag})，功能插件: {}",
-        if plugins { "带上" } else { "不带" }
-    );
+    println!("[installer] 开始构建安装包 (arona-rs {version})");
 
-    build_release(&root, plugins);
+    build_release(&root);
     let exe = finalize_binary(&root);
     println!("[installer] 主程序: {}", exe.display());
 
@@ -255,18 +224,12 @@ fn installer_build() {
     if has_dxc {
         command.arg("/DHasDxc=1");
     }
-    // 带功能插件才释放插件的默认配置、才用带功能介绍的那页向导文案
-    if plugins {
-        command.arg("/DWithPlugins=1");
-    } else {
-        command.arg("/DOutputTag=-framework");
-    }
     command.arg("arona-rs.iss");
 
     let status = command.status().expect("启动 ISCC.exe 失败");
     assert!(status.success(), "Inno Setup 编译安装包失败");
 
-    let setup = release_dir.join(format!("arona-rs-{version}{tag}-setup-win-x64.exe"));
+    let setup = release_dir.join(format!("arona-rs-{version}-setup-win-x64.exe"));
     let size = std::fs::metadata(&setup)
         .map(|meta| meta.len())
         .unwrap_or_default();

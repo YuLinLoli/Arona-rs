@@ -1,24 +1,25 @@
 # Arona 插件开发指南
 
-本项目拆成「框架 + 功能插件」两层。框架只提供 **OneBot 连接（含 v11 全量动作接口与事件钩子）、管理面板(GUI)、群授权/黑名单、插件与功能的启停门控、命令分发骨架** 与生命周期编排；具体功能（抽卡、活动日历、攻略、塔罗……）一律以**插件**形式实现并插入框架。
+本项目拆成「框架 + 功能插件」两层。框架只提供 **OneBot 连接（含 v11 全量动作接口与事件钩子）、管理面板(GUI)、群授权/黑名单、插件与功能的启停门控、命令分发骨架** 与生命周期编排；具体玩法一律以**插件**形式实现并插入框架。
 
-插件契约对齐 [mirai](https://docs.mirai.com) 的插件模型（`PluginManager` / `plugin.yml` / `ApiVersion` / `EventPriority` / `CommandManager` / `CoroutineScope` / `DiContainer` / `ConfigKey`），只是把 Kotlin 的挂起函数与 JVM 类加载换成 Rust 的 `async` 与静态注册。§3 给出逐项对照。
+插件契约对齐 [mirai](https://docs.mirai.com) 的插件模型（`PluginManager` / `plugin.yml` / `ApiVersion` / `EventPriority` / `CommandManager` / `CoroutineScope` / `DiContainer` / `ConfigKey`），装载方式也一样：**用户在启动前把插件包放进 `plugins/` 目录，框架启动时扫描、握手、装配**。差别只在包的形态——mirai 是 jar 由 ClassLoader 隔离加载，这里是 `cdylib` 编出的 dll 直接映射进宿主进程，因此对构建工具链的要求比 mirai 严格（§22 是硬性发布要求，务必读）。
 
-**想先跑起来再看文档：`plugins/hello/` 是一份可编译的最小样例插件**（`cargo test -p hello-plugin` 全绿），
+**想先跑起来再看文档：`plugins/hello/` 是一份完整的示例插件**，编译出 `hello_plugin.dll` 丢进 `plugins/` 就能装载；
 命令、事件钩子、出站钩子、类型化配置、每日任务各演示了一发，本文讲的接口基本都能在那儿对着读。
 
 ## 1. 目录与版本
 
 ```
 Cargo.toml                 # 虚拟 workspace（resolver=2）
-plugins.toml               # 功能插件清单：host 编译期据此静态注册插件（build.rs 读取）
 crates/arona/              # 框架库 crate：name=arona, version=1.0.0（发布版从 1.0.0 起）
 crates/arona-host/         # 宿主可执行：name=arona-host, version=1.0.0, 产物 bin=arona-rs
-plugins/bluearchive/       # 碧蓝档案功能插件：name=bluearchive-plugin, version=0.3.4, lib=bluearchive_plugin
-plugins/hello/             # 开发示例插件：name=hello-plugin, lib=hello_plugin（刻意不进 plugins.toml）
+plugins/hello/             # 示例插件：name=hello-plugin, crate-type=["cdylib", "rlib"]
 ```
 
-版本约定：框架与 host 同为 `1.0.0`；功能插件 `BluearchivePlugin` 的版本号（`0.3.4`）接替拆分前本项目的版本号，随插件功能演进单独递增。
+框架仓库里不含任何功能插件（示例除外），宿主也不链接插件：功能插件是**各自独立的 crate**，
+编译出 `xxx_plugin.dll` 后由用户放进运行目录的 `plugins/`，框架启动时扫描装载（§22）。
+
+版本约定：框架与 host 同为 `1.0.0`，插件版本号各自演进。
 **插件接口的破坏性改动抬 `arona::plugin::FRAMEWORK_API_VERSION`**（与 crate 版本号无关），见 §6。
 
 运行期的落盘目录由框架统一规定（见 §7），插件不自己挑地方：
@@ -27,27 +28,26 @@ plugins/hello/             # 开发示例插件：name=hello-plugin, lib=hello_p
 <运行目录>/
   config/arona.yml          框架配置：groups / managers / global_blacklist / group_settings / disabled_plugins / framework
   config/onebot.yml         OneBot 连接配置
-  config/<插件>/arona.yml   该插件自己的配置（如 config/bluearchive/arona.yml）
-  data/<插件>/…             该插件自己的数据（如 data/bluearchive/image、arona.db、backups）
+  config/<插件>/arona.yml   该插件自己的配置（如 config/hello/arona.yml）
+  data/<插件>/…             该插件自己的数据（如 data/hello/image、arona.db、backups）
   logs/                     按天滚动的日志
-  plugins/<插件>/           该插件的目录（框架写 plugin.yml，随包资源放这里）
+  plugins/                  用户放的插件 dll —— 框架扫描这一层以及它的每个一级子目录
+  plugins/<插件>/           框架按 id 渲染的 plugin.yml；插件的随包资源也放这里
 ```
 
 ## 2. 职责边界（依赖方向）
 
-**框架 `arona` 绝不依赖任何插件**，插件单向依赖框架：
+**框架 `arona` 绝不依赖任何插件**，插件单向依赖框架；宿主连插件长什么样都不知道，
+只在运行期按 ABI 约定的四个导出符号跟 dll 打交道（§22）：
 
 ```
-arona-host  ──depends──▶  arona (框架)
-     │                        ▲
-     └──depends──▶ bluearchive-plugin
-                            │
-                            └──depends──▶ arona (框架)
+arona-host ──depends──▶ arona（框架）──启动时扫描──▶ plugins/*.dll ──depends──▶ arona（框架）
 ```
 
 框架反向调用插件只能通过 `arona::plugin`（契约层：注册表 + 生命周期编排 + 目录/登记交接面），加上
 `arona::onebot::hooks`（事件订阅）、`arona::runtime::dispatcher`（命令表）、`arona::container`（服务）、
-`arona::config`（配置）与 `arona::quartz`（定时任务）。任何"框架里 `use bluearchive_plugin::…`"都是设计违规。
+`arona::config`（配置）与 `arona::quartz`（定时任务）。任何"框架或宿主里 `use 某插件::…`"都是设计违规——
+框架仓库里连一个具体插件的名字都不该出现，否则就成了"谁写插件都要往框架里填一笔"。
 
 ### 注册表挂在哪：`Framework` 实例
 
@@ -109,17 +109,23 @@ arona-host  ──depends──▶  arona (框架)
 | `DiContainer.declare` / `instance<T>()` | `ctx.declare_service::<T>(..)` / `ctx.service::<T>()` | `container.rs` |
 | —（原版 Arona 的 `StandaloneServiceInfo` 表） | `arona::services::ServiceManager`：`ctx.register_service(..)`，条目带归属、插件停用时一并撤销 | `services/mod.rs` |
 | `ConfigKey<T>` + `configManager[key]` | `PluginConfig` + `ctx.config::<T>(key)` → `ConfigEntry::<T>::get/set/update` | `config/arona.rs`、`config/plugin_config.rs` |
+| `JvmPluginManager` 扫描 `plugins/` 找 jar、独立 ClassLoader 隔离 | `plugin::dynamic::DynamicPluginLoader` 扫描 `plugins/` 找 dll，`libloading` 映射进宿主进程，按四个 C 导出符号握手，再把宿主的进程实例/日志出口/tokio 句柄交进 dll | `plugin/dynamic.rs`、`plugin/abi.rs` |
 
-**没做的一件事**：动态装载（`JvmPluginManager` 那套从目录扫 jar）。装载形态被抽象成 `PluginLoader` trait，
-当前只有 `BUILTIN_LOADER`（编译期静态注册）。将来要加动态装载只需再实现一个 `PluginLoader`，
-插件作者写的代码一行都不用改。
+**与 mirai 最大的不同**：mirai 用独立 ClassLoader 把每个 jar 隔开，插件字节码与宿主各不相干；
+这里是把 dll 直接映射进宿主进程、并跨边界交换 `Arc<dyn AronaPlugin>`。省掉了进程外通信的开销与
+序列化边界，代价是两件事必须由框架自己补上：**"两边同一套工具链"这条前提由握手逐项把关**，
+以及 **ClassLoader 隔离顺带解决的"全局状态只有一份"这里不成立**——dll 静态链接了自己的那份
+`arona`，所以装载器在造实例前把宿主的进程默认实例、日志出口与 tokio 句柄交回插件
+（§22「宿主的上行通道」）。对插件作者的实际影响：写法与静态编译时完全一样，不用绕路。
 
 ## 4. 生命周期（`arona::run` → `run_bot` 的真实顺序）
 
-宿主在调用 `arona::run(args)` **之前**注册插件（`register_plugins()` 由 `crates/arona-host/build.rs`
-依据 `plugins.toml` 生成，见 §15）；`run` 内部按序驱动四阶段：
+`arona::run(args)` 内部按序驱动四阶段——插件不需要、也无法在 `run` 之前登记，装载完全由磁盘决定：
 
-1. `plugin::install_all()` —— **早于 `arona.yml` 加载**。先消化额外 `PluginLoader`，再按依赖拓扑序逐个插件：
+1. `plugin::install_all()` —— **早于 `arona.yml` 加载**。先跑装载器：`DynamicPluginLoader` 扫描
+   `plugins/`（连同它的一级子目录）里的每个 dll，逐个 `LoadLibrary` → ABI 与工具链指纹握手 →
+   取出实例，以 `loader: dynamic` 记进插件表；**单个文件握手失败只记一条日志，不影响其余插件**。
+   然后按依赖拓扑序逐个插件：
    建好 `plugins/<id>/`、`config/<id>/`、`data/<id>/` 并写 `plugins/<id>/plugin.yml` → **契约版本握手**
    （不兼容即标 `Failed`，不跑 install）→ 调 `install(&PluginRegistrar)`：插件在此登记功能开关与配置区，
    使生成的配置模板认得这些键、注释里带完整功能清单。
@@ -180,19 +186,19 @@ use arona::plugin::{ApiVersion, PluginMeta};
 
 fn meta(&self) -> PluginMeta {
     PluginMeta::new(
-        "bluearchive",                                  // 目录名与配置里的键都用它
-        "BluearchivePlugin",                            // GUI/日志展示名
+        "voice-room",                                   // 目录名与配置里的键都用它
+        "VoiceRoomPlugin",                              // GUI/日志展示名
         env!("CARGO_PKG_VERSION"),
-        "碧蓝档案功能插件（抽卡/活动/攻略/塔罗）",
+        "语音房管理：排队上麦、静音、房管投票",
     )
-    .with_author("Arona-rs")
+    .with_author("你的名字")
     // .requires_api(ApiVersion::new(1, 1, 0))          // 用到比当前框架新的接口时才抬
     // .depends_on(&["core-data"])                      // 硬依赖：任一缺失/停用则本插件不装配
     // .soft_depends_on(&["gacha"])                     // 软依赖：只决定装配先后，缺了照样跑
 }
 ```
 
-`id` 用小写短横线名（`bluearchive`、`voice-room` 这种），它是**磁盘上的身份**：
+`id` 用小写短横线名（`voice-room`、`music` 这种），它是**磁盘上的身份**：
 `plugins/<id>/`、`config/<id>/arona.yml`、`data/<id>/`、`disabled_plugins: [<id>]`、
 `group_settings.<群号>.disabled_plugins` 全都用它。**改名等于换一份用户数据，定下来就别动。**
 匹配时大小写不敏感。
@@ -227,11 +233,13 @@ fn meta(&self) -> PluginMeta {
 这些接口都顺手 `create_dir_all`（`install_all()` 阶段已先建好三件套），插件取到路径就能直接写。
 `plugins/<id>/plugin.yml` 是框架自动生成的 mirai 风格清单
 （`id/name/version/author/description/apiVersion/loader/depends/softDepends/config/data/image`），
-静态编译模式下插件不单独出包，这个目录就是它在磁盘上的"存在证明"。
+`plugins/<id>/` 是推荐投放位置：dll 本身放这里，随包资源也放这里，
+`plugin.yml` 由框架按插件上报的元信息渲染出来（§22）。
 
 id 目录名在阶段之外也要用时（比如模块级函数），直接用
 `arona::runtime::paths::plugin_data_dir(PLUGIN_ID)` / `plugin_image_dir` / `plugin_config_dir`，
-把 `PLUGIN_ID` 作为 `pub(crate) const` 与 `meta().id` 共用一个来源（见 `plugins/bluearchive/src/lib.rs`）。
+把 `PLUGIN_ID` 作为 `pub(crate) const` 与 `meta().id` 共用一个来源（见 `plugins/hello/src/lib.rs`）。
+`runtime::paths` 只是拼路径 + 顺手建目录，属于刻意留在进程级的那一类，插件用它是安全的。
 
 运行目录是**当前工作目录**（安装包的快捷方式把它设成安装目录）。旧版本把这些放在
 `arona-standalone/` 下：框架的 `paths::prepare()` 会**复制**它认识的几项到新位置；
@@ -668,14 +676,14 @@ notify.update(|c| c.every_day_hour = 20)?;           // 读—改—写：落盘
 `load_in(&framework, file)` 走指定实例（认键、接管旧顶层插件配置键都按那套实例的表来）。
 
 约束与行为：
-- 键名要和插件功能对得上，且**不同插件之间不能撞 key**（撞名时保留先登记的；想区分就用带语义的前缀，如 `bluearchive_notify`）。
+- 键名要和插件功能对得上，且**不同插件之间不能撞 key**（撞名时保留先登记的；想区分就用带语义的前缀，如 `voice_room_notify`）。
 - 空列表渲染成 `key: []`、空映射渲染成 `key: {}`；非空列表按块式缩进写出；字段注释按点分路径落在正确缩进上。
 - 缺文件时框架在 `plugin_config::init()` 生成带注释模板；插件升级**新登记的顶层键**会在下次启动按默认值补进
   用户已有的文件（用户改过的值一律不动）；已有键里新增的**子字段**由强类型默认值兜着，下次写回时一起落盘。
 - 用户手改 `config/<插件>/arona.yml` 也会被看到：框架的轮询任务发现 mtime 变了就重载该文件，
   并只回调该插件的 `on_config_reload`。`set/update` 之后必定回调，需要即时生效的定时任务在那里重建
   （判"真的变了才重建"，别每次热重载都重建一遍）。
-- 旧写法兼容：把 `notify:` 直接写在框架 `arona.yml` 顶层的，加载时会被接管并搬进 `config/bluearchive/arona.yml`，
+- 旧写法兼容：把 `notify:` 直接写在框架 `arona.yml` 顶层的，加载时会被接管并搬进本插件的 `config/<插件>/arona.yml`，
   框架那份文件同步清掉该键，用户不用手改。
 - GUI/`/config` 指令编辑框架自己的那几个键；插件配置区由插件的指令或手改 YAML 维护。
   GUI「插件管理」页会列出每个插件的配置文件与数据目录，并给「打开」按钮。
@@ -753,61 +761,97 @@ api.delete_msg(message_id).await?;
 
 ## 15. 新增一个插件
 
-1. 在 workspace 里建 crate，`Cargo.toml` 依赖框架（**务必 `default-features = false`**，见下节）：
+插件是**独立仓库、独立 crate**：不进框架的 workspace，也不需要框架侧改任何文件。
+
+1. 建 crate，`Cargo.toml` 里两处关键设置：
+
    ```toml
+   [lib]
+   crate-type = ["cdylib", "rlib"]   # cdylib 出 dll；rlib 那份只给 `cargo test` 用
+
    [dependencies]
-   arona = { path = "../../crates/arona", version = "1.0.0", default-features = false }
+   # 务必 default-features = false（§16）。arona 的版本必须与目标宿主完全一致
+   arona = { path = "../Arona-rs/crates/arona", version = "1.0.0", default-features = false }
    ```
-2. 实现 `AronaPlugin`（`meta` 必填 id+name+version），并提供无参 `::new()`（注册代码要调它）。
-3. 在仓库根目录 `plugins.toml` 的数组里加一行类型路径：
+
+   再建一份 `.cargo/config.toml`，把框架仓库根目录那份的 `[target.*]` 段落**原样抄过来**：
+
    ```toml
-   plugins = [
-       "bluearchive_plugin::BluearchivePlugin",
-       "your_plugin::YourPlugin",
-   ]
+   [target.x86_64-pc-windows-msvc]
+   rustflags = ["-C", "target-feature=+crt-static"]
    ```
-4. 在 host `crates/arona-host/Cargo.toml` 里加两条：**可选依赖**与**同名 feature**，并把 feature 写进 `default`：
-   ```toml
-   [dependencies]
-   your-plugin = { path = "../../plugins/your-plugin", version = "0.1.0", default-features = false, optional = true }
 
-   [features]
-   default = ["gui", "your-plugin"]
-   your-plugin = ["dep:your-plugin"]
+   CRT 口径不同会让两边各带一份运行库，跨模块分配/释放内存直接炸；框架的握手也会在这里拒载。
+2. 实现 `AronaPlugin`（`meta` 必填 id + name + version）。
+3. 在 `src/lib.rs` 末尾导出一行入口：
+
+   ```rust
+   arona::export_arona_plugin!(MyPlugin::default());
    ```
-5. 把新 crate 加进根 `Cargo.toml` 的 `members`。
 
-`crates/arona-host/build.rs` 读 `plugins.toml` 生成 `OUT_DIR/plugins.rs`（一个
-`register_plugins()`，按清单顺序 `arona::plugin::register(Arc::new(<path>::new()))`），`main.rs` 用 `include!`
-引回并在 `arona::run(..)` 之前调用它 —— **不要再去 main.rs 里硬编码注册**。改了 `plugins.toml`
-无需改任何 Rust 代码，build.rs 已 `rerun-if-changed` 该文件。清单顺序只影响同层插件的展示/装配先后，
-跨层顺序由 `depends`/`soft_depends` 决定。
+   宏负责导出四个 C 符号（`arona_plugin_abi` / `arona_plugin_toolchain` / `arona_plugin_host` /
+   `arona_plugin_new`），框架靠它们完成握手、把宿主的进程实例与日志出口交进 dll，再取出实例。
+   **插件不要写 `main`、也不提供任何可执行入口**——
+   插件只能被框架装载、不能独立运行，这点与 mirai 一致。
+4. 构建并投放：
 
-第 4 步那个同名 feature 是**编译期开关**：build.rs 按 `CARGO_FEATURE_<crate 名大写、- 换成 _>` 判断，
-没打开的清单条目既不生成注册代码也不链接该 crate。所以"一个插件一档"，关掉别人的插件不会连带
-把它的代码编进产物；一个都不开就是纯框架 exe：
+   ```bash
+   cargo build --release                              # 产物 target/release/my_plugin.dll
+   cp target/release/my_plugin.dll <宿主运行目录>/plugins/my_plugin/
+   ```
 
-```bash
-cargo build --release -p arona-host --no-default-features --features gui   # 不含任何功能插件
-ARONA_PLUGINS=0 cargo installer                                            # 同一份东西打成安装包
+   启动框架即自动装载。推荐让每个插件独占一层以 id 命名的子目录（`plugins/<id>/`），
+   这样随包资源能跟 dll 放在一起；直接把 dll 丢在 `plugins/` 根下同样能被发现。
+
+装载成功的标志是这三行日志：
+
+```
+[Arona] 插件 ABI 握手通过: 布局 2，契约 1.0.0
+[Arona] 已装载动态插件: HelloPlugin 0.1.0 (hello_plugin.dll)
+[Arona] 插件已启动: HelloPlugin v0.1.0
 ```
 
-首次启动后 `plugins/<id>/`（含 `plugin.yml`）、`config/<id>/arona.yml` 会自动出现，GUI「插件管理」页立刻能开关它。
+`plugins/<id>/plugin.yml`、`config/<id>/arona.yml` 由框架在装载时自动写出来，GUI「插件管理」页
+立刻能开关它。换插件、删插件都不必重新编译框架，**但必须重启框架**——`plugins/` 只在启动时扫一遍，
+运行期不做热插拔（卸载 dll 不安全；"停用"只回收该插件名下的资源，模块照常常驻）。
 
 ## 16. feature 统一陷阱：GUI 只在 host 打开
 
-`arona` 的 `default = ["gui"]` 会拉进 `eframe`/`wgpu`。插件与 host 都以 `default-features = false` 依赖 `arona`，
-**只有 host 通过自身的 `gui = ["arona/gui"]` feature 打开 GUI**。这样插件不参与 GUI 编译、也不改变框架 GUI 开关的归属，
-避免 Cargo feature 统一把 `gui` 意外扩散。host 的 `default = ["gui"]` 决定了产物是否含管理面板。
+`arona` 的 `default = ["gui"]` 会拉进 `eframe`/`wgpu`。**插件必须以 `default-features = false` 依赖 arona**，
+否则一个只会打日志的插件也要把整套 GUI 编译一遍。宿主那边由自身的 `gui = ["arona/gui"]` 打开面板，
+`default = ["gui"]` 决定产物带不带管理界面。
+
+静态链接时代这条只是"别让 feature 顺藤摸瓜扩散出去"；换成动态装载之后它同时是个 **ABI 问题**——
+`Framework`、`PluginContext` 这些跨边界类型的字段布局，两边必须一模一样。
+所以 `gui` 被特殊对待：它只门控 `arona::gui` 与两个 GUI 启动辅助模块，不参与插件可见的任何类型布局，
+因此**不进 ABI 指纹**（见 `crates/arona/build.rs` 的 `ABI_NEUTRAL_FEATURES`，那里还放了它的别名
+`default`——别名本身不改变代码）。
+这条前提是被盯住的不变量——`plugin::abi` 里有用例扫遍源码，谁往 `plugin/`、`framework.rs`、`runtime/`
+之类的地方塞 `#[cfg(feature = "gui")]` 成员，用例就会红。
+除这两个之外的任何 feature 都算进指纹，两边差一个就直接拒载。
 
 ## 17. 开发与调试
+
+框架仓库里（`cargo run` 的运行目录是 `target/debug`，`--release` 时是 `target/release`）：
 
 ```bash
 cargo run -p arona-host                  # 默认打开管理面板 GUI
 cargo run -p arona-host -- --nogui       # 纯命令行模式（黑窗口）
 cargo run -p arona-host -- --test-notify # 20 秒后跑一次每日推送，便于联调
 cargo build -p arona-host --no-default-features   # 精简命令行版
+cargo build-plugin                       # 编示例插件：target/release/hello_plugin.dll
 ```
+
+插件仓库里：
+
+```bash
+cargo build --release    # 改一行代码就是"重编 + 重拷 dll + 重启框架"这三步
+cargo test               # rlib 那份给单测用，纯逻辑不必起宿主
+```
+
+日常联调就是 `cp target/release/<插件>.dll <宿主运行目录>/plugins/<id>/` 后重启框架，
+看启动日志有没有那三行「装载成功」的输出（§15）。装载失败一定会有明确的中文原因，
+不会静默不出现——先查日志再怀疑代码。
 
 改动后的验证口径（本地 GUI 构建需要 ATL，见下节"零依赖"约束；纯逻辑改动用 `--no-default-features` 更快）：
 
@@ -819,12 +863,15 @@ cargo clippy --workspace --all-targets              # 框架侧 error 级必须�
 cargo fmt --all
 ```
 
-或用 `.cargo/config.toml` 里的别名：`cargo build-release` / `cargo build-nogui` / `cargo gui` /
-`cargo run-nogui` / `cargo dist`（整理交付产物）/ `cargo installer`（打安装包）/ `cargo smoke-*`（各链路自检）。
+或用 `.cargo/config.toml` 里的别名：`cargo build-release` / `cargo build-nogui` / `cargo build-plugin` /
+`cargo gui` / `cargo run-nogui` / `cargo dist`（整理交付产物）/ `cargo installer`（打安装包）。
 本地联调 OneBot 时，ws-forward（框架连出去到一个 WS 服务）比 ws-reverse 好驱动：
 后者在本项目里不把 `admin::call_api` 路由给已连接客户端。
 
-因为插件与框架在同一 workspace，断点可直接打在插件源码里。
+断点与 panic 定位：dll 是被宿主进程映射的，IDE 里 **attach 到 `arona-rs.exe`** 就能停在插件源码上；
+插件仓库若要调试发布构建，加一段 `[profile.release] debug = 1` 再重编 dll。
+框架侧的启动路径（`arona-host`）与插件仓库不在同一个 workspace，直接把 host 的 `Cargo.toml`
+用 `arona = { path = "../Arona-rs/crates/arona" }` 指过来即可同源联调。
 本地运行若被提权逻辑拦住，用 `ARONA_NO_ELEVATE=1` 绕过。
 
 GUI 相关的落地细节（改动前务必先读）：
@@ -865,11 +912,12 @@ GUI 相关的落地细节（改动前务必先读）：
   id 撞了才会互相删对方的文件；入口也指到隔离实例上：
   `ConfigEntry::<T>::in_store(&framework.configs(), id, key)`、`arona::config::arona::load_in(&framework, file)`、
   `framework.sections().register(..)`。这样用例之间真并行，`#[test]` 就够，不必 async。
-- 只有**确实要测进程默认实例**的用例才需要串行锁（框架里 `runtime::log`、`runtime::console`，
-  bluearchive 的每日推送链路各留了一把，锁的注释写明了守的是什么）。往默认实例里塞测试插件是错的写法。
+- 只有**确实要测进程默认实例**的用例才需要串行锁（框架里 `runtime::log`、`runtime::console`
+  各留了一把，锁的注释写明了守的是什么）。往默认实例里塞测试插件是错的写法。
   异步用例统一 `#[tokio::test(flavor = "current_thread")]`。
 - 插件代码里取注册表走 `ctx`（`ctx.framework()` / `ctx.service_board()`），不要用 `X::global()` 那套
-  自由函数——它们只转发到进程默认实例，用了就等于绕开了隔离。
+  自由函数——它们只转发到进程默认实例，用了就等于绕开了隔离。dll 插件里那份默认实例已被宿主的
+  上行通道改指过来（§22），不会写进空表，但单测隔离照样做不出来。
 - 生命周期里的闭包要 `'static`：需要 `ctx` 时先 `let context = ctx.clone();` 再 `move` 进去
   （`PluginContext` 是 `Arc` 包装的廉价克隆）。
 - 插件代码里不要 `std::process::exit`，也不要长阻塞主线程；耗时活计用 `ctx.spawn(..)`（§10）或 `arona::quartz`。
@@ -946,8 +994,8 @@ Arona 的等价物在框架侧：**框架会调用的插件入口**全被兜住�
 记账的是 `arona::plugin::health::HealthBoard`（挂在框架实例上，`framework.health()`）：
 
 ```rust
-framework.health().failures("bluearchive");     // 当前连击数（成功一次即清零）
-framework.health().forget("bluearchive");       // 插件重新装配时清空
+framework.health().failures("voice-room");     // 当前连击数（成功一次即清零）
+framework.health().forget("voice-room");       // 插件重新装配时清空
 ```
 
 同一插件**连续** panic 到达阈值（默认 5 次）时，框架先把该插件写进停用名单（命令与钩子立刻不再路由，
@@ -1038,6 +1086,120 @@ chatlog:
 开关与保留期都是**现读现判**：记账点每条消息读一次，清理任务在配置热重载时按新值校准
 （周期没变就不重建，避免每改一次配置就多清一遍库）。
 
-> 老版本的 `plugins/bluearchive/src/standalone/history.rs` 是这件事的插件侧实现，已删除；
-> 它的用例整套搬进了框架的 `runtime::chatlog` 测试。配置里如果还留着插件那份 `chatlog` 段，
+> 这件事在旧版本里是插件自己实现的（插件仓库的 `standalone/history.rs`），现已上收到框架：
+> 用例整套搬进了 `runtime::chatlog` 的测试。配置里如果还留着插件那份 `chatlog` 段，
 > 框架会在启动日志里点名城到 `config/arona.yml`。
+
+## 22. 动态装载与工具链要求（发布插件前必读）
+
+mirai 靠 JVM ClassLoader 把插件隔离开，Rust 没有等价物。本框架的选择是：**dll 与宿主直接交换
+`Arc<dyn AronaPlugin>`**，代价是把"两边必须是同一套工具链编出来的"这条前提变成硬性发布要求。
+前提一旦不成立，症状是随机崩溃而不是干净的报错，所以框架在装载时逐项核对，**对不上就拒载**。
+
+### 装载器做什么
+
+`arona::plugin::dynamic` 在 `plugin::install_all()` 里跑一次：
+
+1. 扫 `<运行目录>/plugins/` 这一层，以及它的每一个一级子目录，收所有 `*.dll`
+   （Linux `.so`、macOS `.dylib`）。文件名以 `_` 开头的当作插件自带的第三方运行库，跳过。
+2. 逐个 `LoadLibrary` → 取 `arona_plugin_abi` / `arona_plugin_toolchain` / `arona_plugin_host`
+   / `arona_plugin_new` 四个符号。
+3. 握手，全过后**先把宿主的上行通道交进 dll**（下一小节），再取实例登记进插件表，`loader` 记为 `dynamic`。
+4. 模块句柄**故意不释放**（`std::mem::forget`）：插件实例的虚表指向该模块的代码段，
+   `FreeLibrary` 之后任何一次虚调用都是野指针。因此框架不提供运行期卸载——「停用」只回收
+   该插件名下的命令、钩子、任务与服务，dll 本身常驻到进程结束。
+
+单个文件在任何一步失败都只影响它自己：日志里一条中文原因，其余插件照常装配。
+
+### 宿主的上行通道（为什么插件不需要绕路）
+
+mirai 的插件和框架在同一个 ClassLoader 树里，`MiraiInstance` 只有一份。这里不行：dll 把 `arona`
+**静态链接成了自己的第二份**，于是 `Framework::global()`、日志文件句柄、tokio 句柄这些进程级状态
+天生有两套，插件写进自己那套宿主永远看不见——表现为"命令登记了却没人路由"这种最难查的静默失效。
+
+装载器在握手通过之后、造实例之前，把宿主真正在跑的三样东西交给插件（`export_arona_plugin!` 生成的
+`arona_plugin_host` 符号，接管失败直接拒载）：
+
+| 交出去的东西 | 插件侧的效果 |
+| --- | --- |
+| 宿主的进程默认实例 | `arona::quartz::*`、`arona::container::instance()`、`arona::plugin::manager()` 等自由函数全部落到宿主那套注册表 |
+| 宿主的日志出口 | `arona::runtime::log::info(..)` 进同一个日志文件、同一个 GUI 实时日志，来源标注仍按 `[插件名:动作]` |
+| 宿主登记的 tokio 句柄 | 在 GUI 主线程上装配插件时（面板里关掉再打开），`ctx.spawn` / 定时任务照样投得出去 |
+
+所以**插件写起来和同仓静态编译时一样**：能用 `ctx` 就用 `ctx`（下面那条禁令的真实含义），
+偶尔用到进程级自由函数也不会静默失效。接管由宏与装载器完成，插件代码里没有任何对应的手续。
+
+#### 但 `tokio::` 直接调用还是要绕一下
+
+tokio 也被静态链接成了两份，而"当前在哪个运行时里"这个上下文是**线程局部**的——宿主只能在
+它自己那份 tokio 的 thread-local 上打标记，dll 那份永远是空的。框架因此在 `reactor::spawn`
+的任务体开头按任务自己那份 tokio 补装一次上下文（`ensure_thread_context`），于是：
+
+- **`ctx.spawn` / `ctx.spawn_as` / `arona::quartz` 的任务体里**：`tokio::time::sleep`、`tokio::select!`
+  这些都能正常用（那条线程已被点亮，且点亮是常驻的）。要写会等待、会发请求的逻辑，走这条路。
+- **命令与钩子的 async 体里**：那段 future 由宿主 poll，poll 它的那条线程**未必**被点亮过，
+  直接 `tokio::time::sleep(..)` 或自己 `reqwest::*` 有概率炸「there is no reactor running」。
+  需要延时或重试就把那截挪进 `ctx.spawn_as("动作名", async { .. })`，或者用框架预制的服务方法
+  （§14 的收发接口、`arona::services::*`）——它们在宿主侧执行，用的就是宿主那份 tokio。
+
+### 握手核对的五项
+
+| 项 | 来源 | 不一致的后果 |
+| --- | --- | --- |
+| 符号布局版本 | `arona::plugin::abi::ABI_LAYOUT` | 四个导出符号的签名变过，新旧不可混用 |
+| 框架契约版本 | `FRAMEWORK_API_VERSION`（主版本相等 + 框架次版本不低于插件要求） | 插件用到了宿主还没有的接口 |
+| rustc 版本与 host 三件套 | 两边各自 `rustc -vV` 的 `release` / `host` 两行 | `dyn Trait` 胖指针布局、泛型单态化产物可能对不上 |
+| 目标三元组 + profile + CRT 链接方式 | `TARGET` / `PROFILE` / `crt-static` | debug 与 release 混编会炸；两套 MSVC 运行库会各自分配释放内存 |
+| arona 版本 + 除 `gui`/`default` 外的 feature 集合 | `CARGO_PKG_VERSION` / `CARGO_FEATURE_*` | 两边看到的 `Framework` / `PluginContext` 不是同一个结构 |
+
+指纹由 `crates/arona/build.rs` 算出、由 `export_arona_plugin!` 原样上报（末尾带 NUL，宿主按 C
+字符串读），宿主按字符串全等比对。`gui` 与它的别名 `default` 是被放行的两个例外（§16）：
+`gui` 有源码扫描用例盯着它不改共享类型布局，`default` 若不放行，`cargo build --workspace`
+与插件作者的 `cargo build -p <插件>` 会算出不同指纹，同仓编出来的 dll 反而装不进自己的宿主。
+
+### 发布插件时必须写明的三件事
+
+```
+适用于 Arona-rs 1.0.0（框架契约 1.0.0）
+构建工具链：rustc 1.90.0 (xxxxxxx 2026-06-01)，x86_64-pc-windows-msvc，--release，crt-static
+下载后放进 <框架运行目录>/plugins/<你的id>/，重启框架
+```
+
+第三件事别偷懒写成"任意 rustc 都能用"——那不是宽松，是把干净的拒载推迟成随机的崩溃。
+真要跨编译器版本，得走进程外通信（子进程 + JSON-RPC）或 wasm 组件模型，
+那是与本框架这套契约不同的另一条路。
+
+### 插件侧禁止清单
+
+- **不要 `main`、不要可执行入口**：插件只能被框架装载；作者要调试，自己去装一份框架。
+- **不要把 `arona` 的进程级自由函数用在登记路径上**（`arona::plugin::manager()`、
+  `arona::container::instance()`、`arona::quartz::*` 之类）。它们一律落到**进程默认实例**：
+  静态编译进宿主时那个实例就是宿主自己，dll 里则被上一小节的上行通道接管——所以**不再会静默失效**。
+  仍然不建议用，是因为默认实例是进程级的：单测里造不出第二份，几个插件并存时也共用同一张表，
+  回收和隔离都做不出来。命令、钩子、服务、配置区、定时任务的登记必须走 `install` 阶段的
+  `&PluginRegistrar` 或 `configure`/`start` 阶段的 `&PluginContext`。
+  （纯数据类型与无状态构造器——`runtime::message` 的消息段、`runtime::args` 的参数声明、
+  `runtime::priority` 等——不在此列，它们不碰注册表。）
+- **不要裸 `tokio::spawn`**：用 `ctx.spawn(..)` / `ctx.spawn_as(..)`，否则停用时收不掉它。
+  确实需要 runtime 句柄时走 `arona::runtime::reactor`，那是刻意留在进程级的那一份。
+- **命令与钩子的 async 体里不要直接碰 `tokio::`**（`time::sleep`、`select!`、自带的 `reqwest` 都算）：
+  dll 那份 tokio 的线程局部上下文没人在那里点亮，表现为**偶发**的「there is no reactor running」。
+  要等待要发请求，挪进 `ctx.spawn_as(..)` 的后台任务，或用框架预制的服务方法——上一小节写了原理。
+- **不要 `std::panic::set_hook`、不要 `std::process::exit`、不要改全局 locale/时区**：
+  你和宿主活在同一个进程里。框架确实在每个入口都 `catch_unwind`（§20），但那是兜底，不是许可。
+- **不要假设自己会最后一个退出**：停用只是回收资源，模块常驻。
+
+### 拒载日志对照表
+
+| 日志里的原因 | 怎么办 |
+| --- | --- |
+| `缺少导出符号 arona_plugin_new，不是 Arona 插件或版本过旧` | 这个 dll 不是插件；或它漏写了 `export_arona_plugin!` |
+| `缺少导出符号 arona_plugin_host` | 插件是用更早的框架（三符号 ABI）编的，用当前框架重新编译 |
+| `插件没能接管宿主的上行通道（代码 1）` | 通道指针为空，基本只可能是 ABI 对不上——两边框架版本重编 |
+| `插件没能接管宿主的上行通道（代码 2）` | dll 在握手之前就自己建了默认实例（多半是静态初始化里调了 `Framework::global()`），或它那份 `arona` 跟宿主不是同一份源码 |
+| `无法加载模块: …` | 插件依赖的第三方 dll 没跟它放在同一个子目录 / 目标三元组不对（32 位包丢进 64 位宿主） |
+| `插件 ABI 布局版本不匹配` | 插件是更早或更晚的框架接口编的，换配套版本 |
+| `插件按框架契约 1.x.0 编译，当前框架只有 1.y.0` | 让插件作者降到宿主版本，或者升级宿主 |
+| `插件与框架的构建工具链不一致` | 日志会把两边指纹逐段打出来，按差异项对齐（多数是 profile 或 rustc 版本） |
+| `插件上报的工具链指纹满 4096 字节还没有结尾` | 四个导出符号是手写的、漏了 NUL 结尾——改用 `export_arona_plugin!` |
+| `插件入口返回了空实例` | 插件的构造表达式返回了空指针 |

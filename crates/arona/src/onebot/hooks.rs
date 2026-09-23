@@ -22,7 +22,7 @@
 //! );
 //!
 //! // 拿不到 ctx 时的等价底层入口（第一个参数是插件 id）
-//! arona::onebot::hooks::on_message("bluearchive", handler);
+//! arona::onebot::hooks::on_message("hello", handler);
 //! ```
 //!
 //! 门控语义（框架负责，插件不用自己判断）：

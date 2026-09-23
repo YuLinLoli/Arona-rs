@@ -53,7 +53,7 @@ impl PluginScope {
         self.spawn_as("后台任务", task)
     }
 
-    /// 同上，但日志前缀细化成 `[插件名:动作]`（如 `[BluearchivePlugin:定时推送]`）。
+    /// 同上，但日志前缀细化成 `[插件名:动作]`（如 `[HelloPlugin:定时推送]`）。
     ///
     /// 后台任务会跨 `await` 在 runtime 的工作线程之间搬动，线程局部的来源撑不过一次挂起，
     /// 所以动作名必须随任务一起交给日志外壳、每次轮询重设，而不是在 spawn 前 `with_action`。

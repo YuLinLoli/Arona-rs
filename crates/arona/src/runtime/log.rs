@@ -2,6 +2,7 @@
 //! 独立模式输出到 stdout，并附带写入 logs/arona-yyyy-MM-dd.log（按天滚动）。
 
 use once_cell::sync::OnceCell;
+use std::ffi::CString;
 use std::fs::OpenOptions;
 use std::future::Future;
 use std::io::Write;
@@ -160,7 +161,7 @@ fn refined_source(action: &str) -> Option<String> {
     crate::plugin::is_plugin_name(plugin).then(|| format!("{plugin}:{action}"))
 }
 
-/// 把当前来源细化成 `[插件名:动作]`（如 `[BluearchivePlugin:定时推送]`），只在 `f` 期间有效。
+/// 把当前来源细化成 `[插件名:动作]`（如 `[HelloPlugin:定时推送]`），只在 `f` 期间有效。
 ///
 /// 框架按入口给的是粗动作（`装配` / `命令 活动` / `事件 群消息` / `定时 ChatLogPurge`），
 /// 插件比框架清楚自己那一步在干什么，包一层就精确到「发送消息」「踢人」这个粒度；
@@ -184,22 +185,145 @@ pub fn with_action_async<F: Future>(action: &str, future: F) -> impl Future<Outp
     Sourced::new(refined_source(action), future)
 }
 
+/// 当前线程显式设置的日志来源；没设置过时是 `None`（区别于回落到 `[Arona]`）
+fn explicit_source() -> Option<String> {
+    SOURCE.with(|slot| slot.borrow().clone())
+}
+
 fn source() -> String {
-    SOURCE
-        .with(|slot| slot.borrow().clone())
-        .unwrap_or_else(|| "Arona".to_string())
+    explicit_source().unwrap_or_else(|| "Arona".to_string())
 }
 
 fn log(level: &str, message: &str) {
+    // 动态插件 dll 里静态链接了另一份本模块，日志文件与 GUI 缓冲都只在宿主那侧存在：
+    // 接管过就必须把这条交回宿主落地，否则插件日志等于没打。
+    let bridge = HOST.get().copied();
+    if let Some(bridge) = bridge.filter(|_| !RELAYING.with(|flag| flag.get())) {
+        let _guard = RelayGuard::enter();
+        emit_foreign(&bridge, level, message);
+        return;
+    }
     let line = format!("[{}] {message}", source());
+    write_line(level, &line);
+}
+
+/// dll 侧：把一条日志拆成 C 字符串交给宿主。来源也带上，宿主没标注时用它兜底。
+fn emit_foreign(bridge: &HostBridge, level: &str, message: &str) {
+    let (Ok(level), Ok(message)) = (CString::new(level), CString::new(message)) else {
+        return;
+    };
+    let source = explicit_source().and_then(|text| CString::new(text).ok());
+    (bridge.log)(
+        level.as_ptr(),
+        message.as_ptr(),
+        source
+            .as_ref()
+            .map_or(std::ptr::null(), |text| text.as_ptr()),
+    );
+}
+
+/// 落地一行已经组好来源的日志（宿主自己走这条，插件转发行由 [`relay`] 走这条）
+fn write_line(level: &str, line: &str) {
     // 控制台按原版 ColoredPrintStream 规则染色（[Arona]/[OneBot] 亮绿, WARNING/SLF4J 亮黄）
     if level == "ERROR" {
-        crate::runtime::console::eprint_rule_line(&line);
+        crate::runtime::console::eprint_rule_line(line);
     } else {
-        crate::runtime::console::print_rule_line(&line);
+        crate::runtime::console::print_rule_line(line);
     }
     // 日志文件写入前会剥离 ANSI, 保持纯文本
-    append_file(&line);
+    append_file(line);
+}
+
+// ==================== 动态插件的上行出口 ====================
+
+/// 宿主交给插件的那份通道（定义在契约层，这里只是缩写）
+type HostBridge = crate::plugin::abi::HostBridge;
+
+/// 已接管时指向宿主的通道；插件 dll 里这份由 [`attach_host`] 写入，宿主自己那份正常恒空
+/// （`plugin::abi` 的自检用例会刻意让宿主接管一次，那正是为了验这条转发链）
+static HOST: OnceCell<HostBridge> = OnceCell::new();
+
+thread_local! {
+    /// 正在往宿主转发：宿主自己的 `log()` 不能再抛回去，否则无限递归
+    static RELAYING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// 转发中标记的作用域守卫：进入时置位，退出时还原前值（宿主侧落地可能嵌套在 dll 的转发里）
+struct RelayGuard(bool);
+
+impl RelayGuard {
+    fn enter() -> Self {
+        Self(RELAYING.with(|flag| flag.replace(true)))
+    }
+}
+
+impl Drop for RelayGuard {
+    fn drop(&mut self) {
+        RELAYING.with(|flag| flag.set(self.0));
+    }
+}
+
+/// dll 侧：把自己打的日志改交宿主落地（由 `plugin::abi::attach_host` 调用）
+pub(crate) fn attach_host(bridge: HostBridge) {
+    let _ = HOST.set(bridge);
+}
+
+/// 宿主侧：接住插件转来的一条日志。
+///
+/// 来源以宿主这一侧为准——进入插件代码的每个入口（生命周期回调、命令、事件钩子、定时任务）
+/// 都由框架在宿主侧标好了；只有宿主没设置来源时，才用 dll 带上来的那个。
+/// 控制台出口会顺手把这行推进 GUI 的实时缓冲（见 `runtime::console`），这里不再单独 `push_live`。
+extern "C" fn relay(
+    level: *const std::os::raw::c_char,
+    message: *const std::os::raw::c_char,
+    source: *const std::os::raw::c_char,
+) {
+    let text = |ptr: *const std::os::raw::c_char| {
+        if ptr.is_null() {
+            return String::new();
+        }
+        // SAFETY: 按约定，指针指向 NUL 结尾的合法 UTF-8，且在本次调用期间有效
+        unsafe { std::ffi::CStr::from_ptr(ptr) }
+            .to_string_lossy()
+            .into_owned()
+    };
+    let message = text(message);
+    if message.is_empty() {
+        return;
+    }
+    let level = if level.is_null() {
+        "INFO".to_string()
+    } else {
+        text(level)
+    };
+    let fallback = if source.is_null() {
+        None
+    } else {
+        Some(text(source))
+    };
+    let line = format!(
+        "[{}] {message}",
+        explicit_source()
+            .or(fallback)
+            .unwrap_or_else(|| "Arona".to_string())
+    );
+    let _guard = RelayGuard::enter();
+    write_line(&level, &line);
+}
+
+/// 宿主侧：进程默认实例指针，交给插件 dll 认领
+extern "C" fn host_framework() -> *const std::ffi::c_void {
+    std::ptr::from_ref(crate::framework::Framework::global()).cast()
+}
+
+/// 宿主侧：交给插件 dll 的上行通道，进程内一份、指针常驻
+pub(crate) fn host_bridge() -> &'static HostBridge {
+    static BRIDGE: OnceCell<HostBridge> = OnceCell::new();
+    BRIDGE.get_or_init(|| HostBridge {
+        log: relay,
+        framework: host_framework,
+        runtime: crate::runtime::reactor::host_handle,
+    })
 }
 
 // ==================== 实时日志缓冲（GUI 日志选项卡用） ====================
@@ -428,25 +552,21 @@ mod tests {
     fn source_switches_per_plugin_and_restores_on_exit() {
         // 嵌套进出插件代码时来源不能串味：出来还得是 [Arona]
         assert_eq!(source(), "Arona");
-        assert_eq!(
-            with_source("BluearchivePlugin", || source()),
-            "BluearchivePlugin"
-        );
+        assert_eq!(with_source("HelloPlugin", source), "HelloPlugin");
         assert_eq!(source(), "Arona");
     }
 
     #[test]
     fn action_leaves_framework_source_alone() {
         // 没有插件在名下（测试里没有任何已登记插件）时动作不生效：框架日志始终是 [Arona]
-        assert_eq!(with_action("发送消息", || source()), "Arona");
+        assert_eq!(with_action("发送消息", source), "Arona");
         assert_eq!(refined_source("发送消息"), None);
         // 插件给的粗动作也一样只看冒号前的插件名，未登记就不挂动作
         assert_eq!(
-            with_source("BluearchivePlugin:装配", || with_action(
-                "发送消息",
-                || source()
-            )),
-            "BluearchivePlugin:装配"
+            with_source("HelloPlugin:装配", || with_action("发送消息", || {
+                source()
+            })),
+            "HelloPlugin:装配"
         );
     }
 
@@ -454,7 +574,7 @@ mod tests {
     async fn sourced_future_keeps_action_across_awaits() {
         // 线程局部的来源撑不过挂起，外壳必须每次轮询重设，否则 await 之后又退回 [Arona]
         let seen = tokio::task::spawn(Sourced::new(
-            Some("BluearchivePlugin:发送消息".to_string()),
+            Some("HelloPlugin:发送消息".to_string()),
             async {
                 tokio::task::yield_now().await;
                 source()
@@ -462,7 +582,7 @@ mod tests {
         ))
         .await
         .unwrap();
-        assert_eq!(seen, "BluearchivePlugin:发送消息");
+        assert_eq!(seen, "HelloPlugin:发送消息");
     }
 
     #[test]
@@ -477,6 +597,69 @@ mod tests {
         assert!(live_version() > 0);
         clear_live();
         assert!(!live_lines().iter().any(|line| line.text == marker));
+    }
+
+    /// 宿主替插件落地日志：来源以宿主这一侧为准，宿主没标注时才用 dll 带上来的那个。
+    /// 搞反的话插件日志会全部顶着 `[Arona]`，或把框架自己标的动作名（`命令 活动`）抹掉。
+    #[test]
+    fn relayed_plugin_line_keeps_the_host_source() {
+        let _serial = LIVE_LOG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        clear_live();
+        let level = CString::new("INFO").unwrap();
+        let message = CString::new("来自 dll 的一行").unwrap();
+        let dll_source = CString::new("HelloPlugin:自检").unwrap();
+
+        // 宿主自己标了来源 -> 用宿主的；转发期间宿主标注的动作名不能被 dll 带上来那个盖掉
+        let marked = with_source("HelloPlugin:命令 自检", || {
+            relay(level.as_ptr(), message.as_ptr(), dll_source.as_ptr());
+            source()
+        });
+        assert_eq!(marked, "HelloPlugin:命令 自检");
+        // 宿主没标（插件自己的后台线程）-> 用 dll 带上来的
+        relay(level.as_ptr(), message.as_ptr(), dll_source.as_ptr());
+        // 两边都没有 -> 回落到 [Arona]
+        relay(level.as_ptr(), message.as_ptr(), std::ptr::null());
+        // 正文为空的不该留下一行
+        let empty = CString::new("").unwrap();
+        relay(level.as_ptr(), empty.as_ptr(), std::ptr::null());
+
+        let lines = live_lines();
+        // 只认本用例的行：缓冲是共享的，别的测试随时会往里推
+        let texts = lines
+            .iter()
+            .filter(|line| line.text.contains("来自 dll 的一行"))
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            texts,
+            vec![
+                "[HelloPlugin:命令 自检] 来自 dll 的一行",
+                "[HelloPlugin:自检] 来自 dll 的一行",
+                "[Arona] 来自 dll 的一行",
+            ],
+            "转发行落地结果不对: {texts:?}"
+        );
+        clear_live();
+    }
+
+    /// `RelayGuard` 必须真的把标记立起来：漏了它，宿主在转发途中打的日志会再抛给宿主自己，
+    /// 变成无限递归的栈溢出。嵌套时退出内层不能提前把外层的标记清掉。
+    #[test]
+    fn relay_guard_marks_its_scope() {
+        let off = || RELAYING.with(|flag| flag.get());
+        assert!(!off());
+        {
+            let _outer = RelayGuard::enter();
+            assert!(off());
+            {
+                let inner = RelayGuard::enter();
+                drop(inner);
+                assert!(off(), "退出内层不该把外层的标记一起清掉");
+            }
+        }
+        assert!(!off());
     }
 
     #[test]

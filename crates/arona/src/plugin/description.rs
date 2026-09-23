@@ -1,6 +1,6 @@
 //! 插件描述元数据（对应 mirai 的 `PluginDescription` / jar 内的 `plugin.yml`）
 //!
-//! 静态编译模式下这些值写在插件的 `meta()` 里，框架启动时把它们渲染成
+//! 这些值写在插件的 `meta()` 里，框架装载插件时把它们渲染成
 //! `plugins/<id>/plugin.yml`，磁盘上看到的描述与代码里的完全一致。
 use std::fmt;
 
@@ -43,7 +43,7 @@ pub const FRAMEWORK_API_VERSION: ApiVersion = ApiVersion::new(1, 0, 0);
 /// 插件元信息（规范要求：必须有 id、name 与 version）
 #[derive(Clone, Debug)]
 pub struct PluginMeta {
-    /// 短横线/小写的稳定标识（如 `bluearchive`）：目录名与配置里的键都用它，
+    /// 短横线/小写的稳定标识（如 `hello`）：目录名与配置里的键都用它，
     /// 即 `plugins/<id>/`、`config/<id>/arona.yml`、`data/<id>/`、`disabled_plugins: [<id>]`。
     /// 改名等于换一份用户数据，所以定下来就别动。
     pub id: &'static str,

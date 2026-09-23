@@ -4,7 +4,7 @@ version = "1.0.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Arona-rs 可执行入口：装载 arona 框架与 plugins.toml 登记的功能插件"
+description = "Arona-rs 可执行入口：只装载 arona 框架本体，功能插件在运行期从 plugins/ 目录装载"
 
 [[bin]]
 name = "arona-rs"
@@ -12,13 +12,12 @@ path = "src/main.rs"
 
 [dependencies]
 arona = { path = "../arona", version = "1.0.0", default-features = false }
-bluearchive-plugin = { path = "../../plugins/bluearchive", version = "0.3.4", default-features = false, optional = true }
+# 这里不写任何功能插件依赖，也不加插件特性开关：
+# 插件是编译成 dll 的独立 crate，由框架在启动时扫描 plugins/ 目录装载，
+# 宿主装了什么只取决于用户的磁盘，不取决于这次构建。
 
 [features]
 # 默认包含 GUI：启动即打开管理面板，加 --nogui 只启动命令行(黑窗口)模式
-# 默认也带上功能插件；纯框架构建用 --no-default-features --features gui
-default = ["gui", "bluearchive-plugin"]
+default = ["gui"]
 # 打开 host 的 gui 同时打开框架的 gui（eframe/wgpu）
 gui = ["arona/gui"]
-# 一个功能插件一档：关掉既不链接也不注册（build.rs 按同名 CARGO_FEATURE_* 生成注册代码）
-bluearchive-plugin = ["dep:bluearchive-plugin"]
