@@ -1132,15 +1132,36 @@ mirai 的插件和框架在同一个 ClassLoader 树里，`MiraiInstance` 只有
 #### 但 `tokio::` 直接调用还是要绕一下
 
 tokio 也被静态链接成了两份，而"当前在哪个运行时里"这个上下文是**线程局部**的——宿主只能在
-它自己那份 tokio 的 thread-local 上打标记，dll 那份永远是空的。框架因此在 `reactor::spawn`
-的任务体开头按任务自己那份 tokio 补装一次上下文（`ensure_thread_context`），于是：
+它自己那份 tokio 的 thread-local 上打标记，dll 那份天生是空的。框架因此在投递任务时套了一层
+`poll_fn`，**每轮询一帧**就按任务自己那份 tokio 短暂补装一次上下文（`EnterGuard` 不是 `Send`，
+跨 `await` 持有它会连任务一起变得不能发送），于是：
 
 - **`ctx.spawn` / `ctx.spawn_as` / `arona::quartz` 的任务体里**：`tokio::time::sleep`、`tokio::select!`
-  这些都能正常用（那条线程已被点亮，且点亮是常驻的）。要写会等待、会发请求的逻辑，走这条路。
-- **命令与钩子的 async 体里**：那段 future 由宿主 poll，poll 它的那条线程**未必**被点亮过，
-  直接 `tokio::time::sleep(..)` 或自己 `reqwest::*` 有概率炸「there is no reactor running」。
-  需要延时或重试就把那截挪进 `ctx.spawn_as("动作名", async { .. })`，或者用框架预制的服务方法
-  （§14 的收发接口、`arona::services::*`）——它们在宿主侧执行，用的就是宿主那份 tokio。
+  这些都能正常用（当前这一帧刚被点亮）。要写会等待、会发请求的逻辑，走这条路。
+- **命令与钩子的 async 体里**：那段 future 由宿主直接 poll，宿主的补装覆盖不到它，
+  直接 `tokio::time::sleep(..)` 有概率炸「there is no reactor running」。需要延时或重试就把那截
+  挪进 `ctx.spawn_as("动作名", async { .. })`，或者用框架预制的服务方法（§14 的收发接口、
+  `arona::services::*`）——它们在宿主侧执行，用的就是宿主那份 tokio。
+
+##### 依赖库自己 `tokio::spawn` 的那一类
+
+补装只发生在**框架投出去的任务**上。第三方库自己 `tokio::spawn` 的常驻后台任务不在这条链上，
+它第二次醒来时脚下那份 tokio 又空了。实测的一例：`reqwest` 0.12（hyper-util 0.1.20）**开着连接池**
+时，会把"后台补连接""空闲驱逐"交给 `TokioExecutor::execute` → dll 那份 `tokio::spawn` → panic；
+panic 发生在池子的锁里，于是紧接着每次 `checkout` 都炸 `PoisonError`，整条出站链路废掉。插件侧
+一行配置就绕开了：
+
+```rust
+reqwest::Client::builder()
+    .timeout(Duration::from_secs(60))
+    .pool_max_idle_per_host(0) // 关池：hyper 走「直接连接」那条路，不再派生后台任务
+    .build()?;
+```
+
+代价是每个请求多一次 TCP+TLS 握手。判断自己是不是踩了这类坑：panic 栈上有
+`tokio::task::spawn::spawn` 与某个第三方库的 `execute`，而**你的代码一帧都不在栈上**。
+除了关掉库的后台任务，另一条路是别自带这套依赖——凡"进程级只该有一份"的东西
+（连接池、全局定时器、驱动线程）都优先用框架暴露的方法拿，宿主那份 tokio 是常驻点亮的。
 
 ### 握手核对的五项
 

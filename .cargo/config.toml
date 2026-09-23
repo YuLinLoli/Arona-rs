@@ -13,7 +13,7 @@
 #   cargo dist            # 发布构建: 产物 arona-rs[.exe]（主程序不带版本号, 交付推荐）
 #   cargo installer       # 发布构建 + 打 Windows 安装包(需 Inno Setup 6, 安装包名带版本号)（见 installer/）
 #   cargo build-plugin    # 构建示例插件 dll: target/release/hello_plugin.dll
-#   cargo run-release     # 发布构建并直接运行独立版
+#   cargo run-release     # 发布构建并直接运行框架（插件由 plugins/ 目录自动装载）
 # 若需在别名后追加参数, 直接写在其后即可, 例如: cargo build-release --verbose
 
 [alias]

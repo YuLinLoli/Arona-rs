@@ -129,7 +129,7 @@ Root: HKA; Subkey: "{#RegSubKey}"; ValueType: dword;  ValueName: "SoftglInstalle
 ; 插件目录先建出来，用户一眼就知道把功能插件的 dll 丢哪里（框架启动时也会自建，
 ; 但空目录摆在安装现场比让人去猜路径友好）。uninsneveruninstall：卸载时默认留着，
 ; 免得把用户自己装的插件文件连带抹掉。
-Name: "{app}\plugins"; Attributes: uninsneveruninstall
+Name: "{app}\plugins"; Flags: uninsneveruninstall
 
 [Files]
 ; ---- 主程序 ----

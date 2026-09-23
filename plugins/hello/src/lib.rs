@@ -295,8 +295,9 @@ impl AronaPlugin for HelloPlugin {
     }
 }
 
-// 动态装载入口：导出 `arona_plugin_abi` / `arona_plugin_toolchain` / `arona_plugin_new`
-// 三个 C 符号，框架扫描 plugins/ 时靠它们握手并取出实例。插件作者只需写这一行。
+// 动态装载入口：导出 `arona_plugin_abi` / `arona_plugin_toolchain` / `arona_plugin_host`
+// / `arona_plugin_new` 四个 C 符号，框架扫描 plugins/ 时靠它们握手、核对工具链、
+// 接管宿主状态并取出实例。插件作者只需写这一行。
 arona::export_arona_plugin!(HelloPlugin::new());
 
 /// 该不该给这条出站消息加前缀：前缀空、没内容、或头一段已经带着前缀时都不加
