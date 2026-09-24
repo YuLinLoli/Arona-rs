@@ -473,6 +473,10 @@ pub enum BodyFilter {
     /// 群消息 / 私聊消息
     GroupMessage,
     PrivateMessage,
+    /// 私聊消息 + `sub_type`：`friend`（好友）/ `group`（从群里发起的临时会话）/ `other`。
+    /// mirai 把这些拆成 `FriendMessageEvent` 与 `TempMessageEvent`：只用
+    /// [`PrivateMessage`](BodyFilter::PrivateMessage) 的话，临时会话也会一起被收进来。
+    PrivateSubType(String),
     Notice(NoticeKind),
     /// 通知子类 + 动作（[`NoticeInfo::action`]）：
     /// `BodyFilter::notice(NoticeKind::GroupDecrease, "kick")` 只收"被踢出群"，
@@ -503,6 +507,14 @@ impl BodyFilter {
         BodyFilter::MetaState(kind, state.trim().to_ascii_lowercase())
     }
 
+    /// 私聊消息；`sub_type` 非空时只收那一类（`friend` / `group` / `other`）
+    pub fn private(sub_type: &str) -> BodyFilter {
+        if sub_type.is_empty() {
+            return BodyFilter::PrivateMessage;
+        }
+        BodyFilter::PrivateSubType(sub_type.trim().to_ascii_lowercase())
+    }
+
     /// 这个过滤器是否收该事件
     pub fn matches(&self, body: &EventBody) -> bool {
         match self {
@@ -510,6 +522,13 @@ impl BodyFilter {
             BodyFilter::Kind(kind) => body.kind() == Some(*kind),
             BodyFilter::GroupMessage => matches!(body, EventBody::GroupMessage { .. }),
             BodyFilter::PrivateMessage => matches!(body, EventBody::PrivateMessage { .. }),
+            BodyFilter::PrivateSubType(want) => matches!(
+                body,
+                EventBody::PrivateMessage { sub_type: found }
+                    if found
+                        .as_deref()
+                        .is_some_and(|found| same_private_sub(found, want))
+            ),
             BodyFilter::Notice(kind) => {
                 matches!(body, EventBody::Notice(found, _) if found == kind)
             }
@@ -538,6 +557,9 @@ impl BodyFilter {
             BodyFilter::Kind(kind) => kind.display_name().to_string(),
             BodyFilter::GroupMessage => "群消息".to_string(),
             BodyFilter::PrivateMessage => "私聊消息".to_string(),
+            BodyFilter::PrivateSubType(sub_type) => {
+                format!("私聊消息({sub_type})")
+            }
             BodyFilter::Notice(kind) => format!("通知:{}", kind.display_name()),
             BodyFilter::NoticeAction(kind, action) => {
                 format!("通知:{}({})", kind.display_name(), action)
@@ -549,6 +571,21 @@ impl BodyFilter {
             }
         }
     }
+}
+
+/// 私聊 sub_type 的两种写法是不是同一件事。
+///
+/// v11 写字符串（`friend` / `group` / `other`），沿用 CQ 码的实现端直接写数字
+/// （`0` / `1` / `2`）。插件按哪一种订阅都该收到同一种消息，否则它得自己记住"这家给的是 0"。
+fn same_private_sub(found: &str, want: &str) -> bool {
+    let family = |list: &[&str]| {
+        list.iter().any(|v| found.eq_ignore_ascii_case(v))
+            && list.iter().any(|v| want.eq_ignore_ascii_case(v))
+    };
+    family(&["friend", "0"])
+        || family(&["group", "temp", "1"])
+        || family(&["other", "2"])
+        || found.eq_ignore_ascii_case(want)
 }
 
 /// 投递给钩子的上下文
@@ -1880,6 +1917,55 @@ mod tests {
             BodyFilter::meta(MetaKind::Lifecycle, ""),
             BodyFilter::Meta(MetaKind::Lifecycle)
         );
+    }
+
+    /// 私聊的 sub_type 有字符串与数字两种写法，而"临时会话"不算好友消息：
+    /// mirai 的 `FriendMessageEvent` 与 `TempMessageEvent` 就是这么分开的
+    #[test]
+    fn private_sub_type_filter_separates_friends_from_temp_sessions() {
+        let private = |sub: serde_json::Value| {
+            EventBody::from_event(&raw_event(json!({
+                "post_type": "message",
+                "message_type": "private",
+                "sub_type": sub,
+            })))
+        };
+        let friend = private(json!("friend"));
+        let temp = private(json!("group"));
+
+        assert!(BodyFilter::private("friend").matches(&friend));
+        assert!(
+            !BodyFilter::private("friend").matches(&temp),
+            "临时会话不是好友私聊"
+        );
+        assert!(BodyFilter::private("group").matches(&temp));
+
+        // 沿用 CQ 码的实现端给的是数字，得归到同一档
+        assert!(
+            BodyFilter::private("friend").matches(&private(json!(0))),
+            "0 就是好友"
+        );
+        assert!(
+            BodyFilter::private("1").matches(&temp),
+            "订阅写数字也该命中临时会话"
+        );
+        assert!(
+            BodyFilter::PrivateMessage.matches(&temp),
+            "整类订阅仍然命中"
+        );
+        assert_eq!(BodyFilter::private(""), BodyFilter::PrivateMessage);
+        assert_eq!(
+            BodyFilter::private("friend").display_name(),
+            "私聊消息(friend)"
+        );
+
+        // 群消息永远不落在私聊档里
+        let group = EventBody::from_event(&raw_event(json!({
+            "post_type": "message",
+            "message_type": "group",
+            "sub_type": "normal",
+        })));
+        assert!(!BodyFilter::private("friend").matches(&group));
     }
 
     /// 发送者身份与引用：钩子侧要和命令侧看到同样的信息
