@@ -22,11 +22,25 @@
 //!
 //! 反过来，凡是**插件也会经自由函数碰到**的状态都必须挂在这里，不能另起 `static`：
 //! 框架配置的持有者（[`Framework::settings`]）、主动发消息的出口
-//! （[`Framework::runtime_services`]）、OneBot 连接池（[`Framework::onebot`]）与聊天记录库
-//! （[`Framework::chatlog`]）都是这么被收进来的——动态插件 dll 静态链接了自己那份框架代码，
-//! 另起的 `static` 在 dll 里是一份空表，只有跟着实例走才会随 [`Framework::adopt_host`]
-//! 一起接到宿主上。判据：**新状态只要放在 `Framework` 上，就不必新增 ABI 通道、不必抬
-//! `ABI_LAYOUT`，插件也一行都不用改。**
+//! （[`Framework::runtime_services`]）、OneBot 连接池（[`Framework::onebot`]）、聊天记录库
+//! （[`Framework::chatlog`]）与远端资料缓存（[`Framework::peers`]）都是这么被收进来的——
+//! 动态插件 dll 静态链接了自己那份框架代码，另起的 `static` 在 dll 里是一份空表，只有跟着
+//! 实例走才会随 [`Framework::adopt_host`] 一起接到宿主上。
+//!
+//! 但**挂上实例只是第一道关**。[`HostBridge::framework`](crate::plugin::abi::HostBridge::framework)
+//! 交出去的是擦成裸指针的实例地址，插件 dll 里那些 `framework.chatlog().open(..)` 形式的
+//! 固有方法会被静态编译进 dll、由 **dll 自己那份代码**去动手：里面是纯 Rust 状态
+//! （`Mutex`/`HashMap`/`Arc`）时读写的是同一块系统堆，行为与宿主一致；里面握着 C 语言句柄时
+//! （sqlite 的 `sqlite3*`）就是拿宿主的句柄调 dll 自带的另一份引擎——实测直接段错误。
+//! 所以 [`Framework::chatlog_api`] 那样再挂一份 `Arc<dyn Trait>` 是第二道关的解法：
+//! **vtable 由宿主生成，跨边界跳进来的才是宿主的代码。**
+//!
+//! 判据由此是两条，缺一不可：① 状态挂在实例上，不另起 `static`；
+//! ② 动手的那份代码要么在宿主侧（trait 出口），要么根本不碰跨镜像资源。
+//! 另外别以为"反正是纯 Rust 字段就能随便加"：字段序与字段类型本身就是跨边界 ABI，
+//! 往中间插一个字段、或改动它任何字段的类型，旧 dll 会按编译期偏移读到错的位置——
+//! 那未定义行为的表现是宿主带崩，不是"握手失败"。加字段一律**追加在末尾**并抬
+//! `ABI_LAYOUT`（见 [`crate::plugin::abi`]）。
 use crate::config::arona::SectionRegistry;
 use crate::config::plugin_config::ConfigStore;
 use crate::config::settings::Settings;
@@ -39,6 +53,7 @@ use crate::quartz::Scheduler;
 use crate::runtime::chatlog::{ChatLog, ChatLogFace};
 use crate::runtime::config::Gating;
 use crate::runtime::dispatcher::CommandRegistry;
+use crate::runtime::peers::PeerCache;
 use crate::runtime::services::RuntimeServices;
 use crate::services::ServiceManager;
 use std::sync::{Arc, OnceLock};
@@ -67,6 +82,8 @@ pub struct Framework {
     loaders: Arc<LoaderRegistry>,
     plugins: Arc<PluginManager>,
     health: Arc<HealthBoard>,
+    /// 群成员/陌生人资料的按需读缓存。**追加在末尾**：字段序是跨边界 ABI 的一部分。
+    peers: Arc<PeerCache>,
 }
 
 /// 框架实例的构造选项（对应 mirai 的 `MiraiInstance.new { }`）
@@ -171,6 +188,7 @@ impl Framework {
             loaders: Arc::default(),
             plugins: plugins.clone(),
             health: health.clone(),
+            peers: Arc::default(),
         });
         // PluginManager 与 HealthBoard 要按归属回收资源、隔离停用插件，得知道整套注册表；
         // 它们先于 Framework 造出来，所以构造完再回填一次。
@@ -252,6 +270,11 @@ impl Framework {
     /// panic 记账与隔离停用判定
     pub fn health(&self) -> &Arc<HealthBoard> {
         &self.health
+    }
+
+    /// 群成员与陌生人资料的按需读缓存（对应 mirai 的 `MemberRead` 那一层）
+    pub fn peers(&self) -> &Arc<PeerCache> {
+        &self.peers
     }
 
     /// 隔离停用某个插件：进停用名单（内存立即生效）→ 回收它登记的一切 → 尽力落盘。

@@ -4,10 +4,12 @@ use crate::config::settings;
 use crate::framework::Framework;
 use crate::onebot::connection::{ConnectionRegistry, OneBotConnection};
 use crate::onebot::console;
+use crate::onebot::hooks::NoticeKind;
 use crate::onebot::message_sender::OneBotMessageSender;
 use crate::onebot::model::{OneBotAction, OneBotEvent};
 use crate::onebot::protocol;
 use crate::runtime::dispatcher::{CommandContext, CommandDispatcher};
+use crate::runtime::peers::PeerCache;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
@@ -79,11 +81,12 @@ impl BusinessHandler {
             // 框架自己的通知处理（机器人被踢时清理 groups 配置）排在钩子**之后**：
             // 插件的 Monitor 档钩子应先看到原样的事件，日志顺序也才和实际处理顺序一致。
             let hooks = self.framework.hooks().clone();
+            let peers = self.framework.peers().clone();
             let self_id = self.self_id();
             tokio::spawn(async move {
                 hooks.dispatch(&event).await;
                 if event.post_type == "notice" {
-                    Self::handle_notice(self_id, &event);
+                    Self::handle_notice(self_id, &peers, &event);
                 }
             });
             return;
@@ -171,10 +174,11 @@ impl BusinessHandler {
         });
     }
 
-    /// 框架自己对通知事件的善后：打日志 + 机器人被移出群时把该群从 groups 配置里摘掉。
-    /// 只在插件钩子跑完之后调用（见 `on_event`）。
-    fn handle_notice(self_id: i64, event: &OneBotEvent) {
+    /// 框架自己对通知事件的善后：打日志 + 机器人被移出群时把该群从 groups 配置里摘掉
+    /// + 让实例上的成员资料缓存跟着作废。只在插件钩子跑完之后调用（见 `on_event`）。
+    fn handle_notice(self_id: i64, peers: &PeerCache, event: &OneBotEvent) {
         let group_id = event.group_id;
+        Self::expire_member_cache(peers, event);
         match event.notice_type.as_deref() {
             Some("group_increase") => {
                 let text = if event.user_id == Some(self_id) {
@@ -224,6 +228,38 @@ impl BusinessHandler {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// 成员资料变了就把缓存里那一条作废，否则"刚升上去的管理员发命令仍被判成普通成员"
+    /// 会一直持续到 60 秒到期。归位口径与插件钩子看到的完全一样（[`NoticeKind`]），
+    /// 所以 NapCat 那批写成 `notice_type="notify"` + 内层动作的名片变更也跑得掉。
+    fn expire_member_cache(peers: &PeerCache, event: &OneBotEvent) {
+        let action = ["sub_type", "type"]
+            .iter()
+            .find_map(|key| event.raw.get(*key).and_then(|v| v.as_str()))
+            .unwrap_or_default();
+        let kind =
+            NoticeKind::parse_with_action(event.notice_type.as_deref().unwrap_or_default(), action);
+        let member_scoped = matches!(
+            kind,
+            NoticeKind::GroupIncrease
+                | NoticeKind::GroupDecrease
+                | NoticeKind::GroupAdmin
+                | NoticeKind::GroupBan
+                | NoticeKind::GroupCardUpdate
+                | NoticeKind::GroupTitleUpdate
+        );
+        if !member_scoped {
+            return;
+        }
+        match (event.group_id, event.user_id) {
+            (Some(group_id), Some(user_id)) => peers.forget_member(group_id, user_id),
+            // 实现端没带当事人 qq 号的那条通知（少数写法）只能整群作废：
+            // 少缓存几条只是多问一次，留着旧的则是判错身份
+            (Some(group_id), None) => peers.forget_group(group_id),
+            (None, Some(user_id)) => peers.forget_everywhere(user_id),
+            (None, None) => {}
         }
     }
 
@@ -408,5 +444,87 @@ mod tests {
                 .map(|line| line.text.clone())
                 .collect::<Vec<_>>()
         );
+    }
+
+    /// 造一条通知事件。`user_id` 与 `self_id` 刻意不相等：走到"机器人自己被踢"那条分支
+    /// 会去改磁盘上的 arona.yml，单元测试不该碰它。
+    fn notice(notice_type: &str, group_id: i64, user_id: i64, action: Option<&str>) -> OneBotEvent {
+        let mut raw = serde_json::Map::new();
+        raw.insert("group_id".into(), json!(group_id));
+        raw.insert("user_id".into(), json!(user_id));
+        if let Some(action) = action {
+            raw.insert("sub_type".into(), json!(action));
+        }
+        OneBotEvent {
+            time: 0,
+            self_id: 10001,
+            post_type: "notice".into(),
+            notice_type: Some(notice_type.into()),
+            message_type: None,
+            sub_type: None,
+            message_id: None,
+            user_id: Some(user_id),
+            operator_id: None,
+            group_id: Some(group_id),
+            raw_message: None,
+            message: None,
+            sender: None,
+            raw: Value::Object(raw),
+        }
+    }
+
+    fn cached_member(cache: &PeerCache, group_id: i64, user_id: i64) {
+        cache.members().put(
+            (group_id, user_id),
+            crate::onebot::api::GroupMemberInfo {
+                group_id,
+                user_id,
+                card: "老师".to_string(),
+                ..Default::default()
+            },
+        );
+    }
+
+    /// 成员资料缓存必须跟着通知事件作废：不然"刚升上去的管理员发命令仍被判成普通成员"
+    /// 会一直持续到 60 秒到期。这里钉的是作废的口径，不是缓存本身（那归 `runtime::cache`）。
+    #[test]
+    fn member_notices_expire_the_cached_profile() {
+        let peers = PeerCache::new();
+        for notice_type in [
+            "group_increase",
+            "group_decrease",
+            "group_admin",
+            "group_ban",
+            "group_card",
+        ] {
+            cached_member(&peers, 20001, 100);
+            BusinessHandler::handle_notice(10001, &peers, &notice(notice_type, 20001, 100, None));
+            assert!(
+                peers.members().get(&(20001, 100)).is_none(),
+                "{notice_type} 之后这个人该重新问过"
+            );
+        }
+
+        // 与成员资料无关的通知不该顺手清掉，否则缓存等于没有
+        cached_member(&peers, 20001, 100);
+        BusinessHandler::handle_notice(10001, &peers, &notice("group_recall", 20001, 100, None));
+        assert!(
+            peers.members().get(&(20001, 100)).is_some(),
+            "群内撤回不该作废成员资料"
+        );
+
+        // NapCat / LLOneBot 把名片变更写成 notice_type="notify" + 内层动作
+        cached_member(&peers, 20001, 100);
+        BusinessHandler::handle_notice(10001, &peers, &notice("notify", 20001, 100, Some("card")));
+        assert!(
+            peers.members().get(&(20001, 100)).is_none(),
+            "notify+card 也该作废，否则内层写法的名片变更缓存就旧下去了"
+        );
+
+        // 同一群里的另一个人不该被牵连
+        cached_member(&peers, 20001, 101);
+        cached_member(&peers, 20001, 100);
+        BusinessHandler::handle_notice(10001, &peers, &notice("group_ban", 20001, 100, None));
+        assert!(peers.members().get(&(20001, 101)).is_some());
     }
 }

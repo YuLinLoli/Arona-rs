@@ -140,9 +140,16 @@ impl Bot {
         )
     }
 
-    /// `get_stranger_info` 查一个人的资料（昵称/性别/年龄）
+    /// `get_stranger_info` 查一个人的资料（昵称/性别/年龄）。
+    /// 这个动作在 NTQQ 系实现端上偏慢，实例上的缓存留 10 分钟（[`PeerCache`](crate::runtime::peers::PeerCache)）
     pub async fn user(&self, user_id: i64) -> Result<StrangerInfo, OneBotError> {
-        self.api().get_stranger_info(user_id, false).await
+        let cache = self.framework().peers();
+        if let Some(info) = cache.strangers().get(&user_id) {
+            return Ok(info);
+        }
+        let info = self.api().get_stranger_info(user_id, false).await?;
+        cache.strangers().put(user_id, info.clone());
+        Ok(info)
     }
 
     // ==================== 收发 ====================
@@ -253,11 +260,36 @@ impl Group {
 
     /// `get_group_member_info` 取一个成员（会查一次实现端，确认这个人真在群里）
     pub async fn member(&self, user_id: i64) -> Result<Member, OneBotError> {
-        self.bot
+        self.member_info(user_id).await?;
+        Ok(self.member_of(user_id))
+    }
+
+    /// mirai 的 `group[id]`：成员资料由实例上的 [`PeerCache`](crate::runtime::peers::PeerCache)
+    /// 按需读一次、留 60 秒，同一个人在同一群里连续问不会反复打网络。
+    /// 命令的权限门控（[`CommandContext::group_role`](crate::runtime::dispatcher::CommandContext::group_role)）
+    /// 用的也是这一份，所以"先判身份再读昵称"只花一次往返。
+    pub async fn member_info(&self, user_id: i64) -> Result<GroupMemberInfo, OneBotError> {
+        let key = (self.group_id, user_id);
+        let cache = self.bot.framework().peers();
+        if let Some(info) = cache.members().get(&key) {
+            return Ok(info);
+        }
+        let info = self
+            .bot
             .api()
             .get_group_member_info(self.group_id, user_id, false)
             .await?;
-        Ok(self.member_of(user_id))
+        cache.members().put(key, info.clone());
+        Ok(info)
+    }
+
+    /// 立刻作废这个人在本群的资料：改了群名片、升了降了管理员之后自己读自己写，
+    /// 不这样做的话接下来 60 秒读到的还是旧身份
+    pub fn forget_member(&self, user_id: i64) {
+        self.bot
+            .framework()
+            .peers()
+            .forget_member(self.group_id, user_id);
     }
 
     /// 拿成员句柄但不查网络：紧接着要操作（禁言/踢人）时用它更省一次往返
@@ -271,10 +303,13 @@ impl Group {
 
     /// `Member.mute`：禁言某人 `seconds` 秒（0 表示解禁）
     pub async fn mute(&self, user_id: i64, seconds: u64) -> Result<(), OneBotError> {
-        self.bot
+        let result = self
+            .bot
             .api()
             .set_group_ban(self.group_id, user_id, seconds)
-            .await
+            .await;
+        self.forget_member(user_id);
+        result
     }
 
     /// 解除某人的禁言
@@ -292,18 +327,25 @@ impl Group {
 
     /// `Member.kick`：踢出成员，`reject_add` 表示同时拒绝其后续加群申请
     pub async fn kick(&self, user_id: i64, reject_add: bool) -> Result<(), OneBotError> {
-        self.bot
+        let result = self
+            .bot
             .api()
             .set_group_kick(self.group_id, user_id, reject_add)
-            .await
+            .await;
+        self.forget_member(user_id);
+        result
     }
 
     /// `Member.permit` / 取消授权：设置管理员
     pub async fn set_admin(&self, user_id: i64, admin: bool) -> Result<(), OneBotError> {
-        self.bot
+        let result = self
+            .bot
             .api()
             .set_group_admin(self.group_id, user_id, admin)
-            .await
+            .await;
+        // 刚升上去的管理员不该在接下来 60 秒里仍被身份门控当普通成员
+        self.forget_member(user_id);
+        result
     }
 
     /// `Group.settings.name`：改群名
@@ -313,10 +355,13 @@ impl Group {
 
     /// `Member.nameCard`：改群名片（空串表示清除）
     pub async fn set_card(&self, user_id: i64, card: &str) -> Result<(), OneBotError> {
-        self.bot
+        let result = self
+            .bot
             .api()
             .set_group_card(self.group_id, user_id, card)
-            .await
+            .await;
+        self.forget_member(user_id);
+        result
     }
 
     /// `Group.announce`：发群公告。`image` 是本地图片路径，`None` 表示纯文字公告
@@ -357,12 +402,10 @@ impl Member {
         self.group_id
     }
 
-    /// `MemberInfo`：名片、昵称、入群时间、头衔与身份
+    /// `MemberInfo`：名片、昵称、入群时间、头衔与身份。
+    /// 走实例上的按需读缓存（60 秒），见 [`Group::member_info`]
     pub async fn info(&self) -> Result<GroupMemberInfo, OneBotError> {
-        self.bot
-            .api()
-            .get_group_member_info(self.group_id, self.user_id, false)
-            .await
+        self.group().member_info(self.user_id).await
     }
 
     /// `Member.mute`
@@ -939,6 +982,35 @@ mod tests {
         assert!(
             MessageReceipt::default().source().is_none(),
             "一个号都没给时不该编出凭据"
+        );
+    }
+
+    /// 资料缓存跟着实例走：搬走 `role_cache` 之前它是进程级 `static`，
+    /// 隔离实例跑测试会看到别家读回来的身份。这条钉死"两套实例互不串台"。
+    #[test]
+    fn the_peer_cache_belongs_to_the_instance_not_the_process() {
+        use crate::onebot::api::GroupMemberInfo;
+        let one = Framework::new();
+        let other = Framework::new();
+        one.peers().members().put(
+            (20001, 100),
+            GroupMemberInfo {
+                group_id: 20001,
+                user_id: 100,
+                ..Default::default()
+            },
+        );
+        assert!(one.peers().members().get(&(20001, 100)).is_some());
+        assert!(
+            other.peers().members().get(&(20001, 100)).is_none(),
+            "另一套实例不该读到这一套缓存回来的资料"
+        );
+        assert!(
+            !std::ptr::eq(
+                &**one.peers() as *const crate::runtime::peers::PeerCache,
+                &**other.peers()
+            ),
+            "两套实例各挂各的缓存"
         );
     }
 

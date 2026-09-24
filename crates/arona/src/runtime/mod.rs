@@ -1,5 +1,7 @@
 //! 运行期模块（对应原版 runtime 包）
 pub mod args;
+/// 带有效期的读缓存原语：远端事实（身份、资料）按需读一次就靠它留住
+pub mod cache;
 /// 聊天记录缓存：进出记账、旧消息引用还原、按存储 id 撤回
 pub mod chatlog;
 pub mod config;
@@ -13,6 +15,8 @@ pub mod http;
 pub mod log;
 pub mod message;
 pub mod paths;
+/// 远端资料的按需读缓存（群成员/陌生人），挂在框架实例上
+pub mod peers;
 /// 执行次序（事件监听与命令匹配共用）
 pub mod priority;
 /// 过期数据清理：框架统一排期与播报，插件只交删除动作

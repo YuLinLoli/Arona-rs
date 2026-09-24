@@ -23,8 +23,8 @@ use crate::plugin::health::HealthBoard;
 use crate::runtime::config::Gating;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 /// 发送者在群里的身份（mirai 的 `MemberPermission`）。
 /// 排序即高低：[`GroupRole::Member`] < [`GroupRole::Admin`] < [`GroupRole::Owner`]。
@@ -123,36 +123,9 @@ pub struct CommandContext {
     pub sender: Arc<dyn MessageSender>,
 }
 
-/// 回查群身份的缓存有效期：同一人连发命令时不必每次都问实现端
-const ROLE_CACHE_TTL: Duration = Duration::from_secs(60);
-
-/// 身份回查结果缓存（(群号, QQ 号) -> (身份, 时刻)）
-type RoleCacheKey = (i64, i64);
-type RoleCacheEntry = (GroupRole, Instant);
-
-/// 缓存条数上限：机器人待的群只会越来越多，过期条目不但不删还会一直占着
-const ROLE_CACHE_MAX: usize = 4096;
-
-/// 身份缓存是**进程级**的：它存的是"这个人在那个群是什么身份"这一远端事实，
-/// 与命令表归属哪家插件无关，隔离实例跑测试时也不会因此看到别家的数据（键里没有实例维度）。
-fn role_cache() -> &'static Mutex<HashMap<RoleCacheKey, RoleCacheEntry>> {
-    static CACHE: OnceLock<Mutex<HashMap<RoleCacheKey, RoleCacheEntry>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// 写入前顺手清掉过期项；仍超上限就整体重来（低频路径，不必上 LRU）
-fn role_cache_put(key: RoleCacheKey, entry: RoleCacheEntry) {
-    let Ok(mut cache) = role_cache().lock() else {
-        return;
-    };
-    if cache.len() >= ROLE_CACHE_MAX {
-        cache.retain(|_, (_, at)| at.elapsed() < ROLE_CACHE_TTL);
-        if cache.len() >= ROLE_CACHE_MAX {
-            cache.clear();
-        }
-    }
-    cache.insert(key, entry);
-}
+/// 回查群身份时给实现端的宽限：命令分发是同步等结果的，不能让一条慢 `get_group_member_info`
+/// 把这次调用挂住。身份本身由实例上的成员资料缓存兜着（见 [`crate::runtime::peers::PeerCache`]）。
+const ROLE_LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
 
 impl CommandContext {
     pub fn target(&self) -> MessageTarget {
@@ -198,38 +171,29 @@ impl CommandContext {
         crate::runtime::chatlog::recall(message_id).await
     }
 
-    /// 群内身份：先读事件自带的 `sender.role`，没有再回查 `get_group_member_info`（缓存 60 秒）。
-    /// 私聊、无连接或实现端不支持时返回 None——按"不满足"处理。
+    /// 群内身份：先读事件自带的 `sender.role`，没有再走实例上的成员资料缓存
+    /// （按需读一次、留 60 秒，见 [`Group::member_info`](crate::bot::Group::member_info)）。
+    /// 私聊、无连接、超时或实现端不支持时返回 None——按"不满足"处理。
     pub async fn group_role(&self) -> Option<GroupRole> {
         if let Some(role) = self.sender_role {
             return Some(role);
         }
         let group_id = self.group_id?;
-        let key = (group_id, self.user_id);
-        if let Some((role, at)) = role_cache().lock().ok()?.get(&key).copied() {
-            if at.elapsed() < ROLE_CACHE_TTL {
-                return Some(role);
-            }
-            // 读到已过期的就地删掉，别等它永远躺在表里
-            if let Ok(mut cache) = role_cache().lock() {
-                cache.remove(&key);
-            }
-        }
-        let api = crate::onebot::api::OneBotApi::global();
-        let wait = api.get_group_member_info(group_id, self.user_id, false);
-        let info = match tokio::time::timeout(Duration::from_secs(3), wait).await {
+        let bot = crate::bot::Bot::current();
+        let group = bot.group(group_id);
+        let info = match tokio::time::timeout(ROLE_LOOKUP_TIMEOUT, group.member_info(self.user_id))
+            .await
+        {
             Ok(Ok(info)) => info,
             _ => return None,
         };
-        let role = if info.is_owner() {
+        Some(if info.is_owner() {
             GroupRole::Owner
         } else if info.is_admin() {
             GroupRole::Admin
         } else {
             GroupRole::Member
-        };
-        role_cache_put(key, (role, Instant::now()));
-        Some(role)
+        })
     }
 }
 
@@ -1049,6 +1013,7 @@ mod tests {
     use crate::framework::FrameworkOptions;
     use crate::runtime::args::arg;
     use crate::runtime::message::MessageSegment;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
 
     struct NullSender;
