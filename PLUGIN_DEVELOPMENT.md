@@ -873,7 +873,7 @@ runtime 上，连接池和 keepalive 全开也不会炸；插件的 `Cargo.toml`
 ```bash
 cargo run -p arona-host                  # 默认打开管理面板 GUI
 cargo run -p arona-host -- --nogui       # 纯命令行模式（黑窗口）
-cargo run -p arona-host -- --test-notify # 20 秒后跑一次每日推送，便于联调
+cargo run -p arona-host -- --test-notify # 20 秒后跑一次每日推送，便于联调（它走的是插件主动发消息那条路，§22 的已知缺口表正好压在这上面）
 cargo build -p arona-host --no-default-features   # 精简命令行版
 cargo build-plugin                       # 编示例插件：target/release/hello_plugin.dll
 ```
