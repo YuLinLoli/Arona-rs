@@ -364,7 +364,8 @@ cargo run-release
 日志里会依次出现「已装载动态插件: <名字> <版本> (<文件名>)」与「插件已启动: …」；
 工具链对不上时会打印「跳过插件 …」并说明差在哪一项。
 **插件必须与框架用同一套工具链构建**（rustc 版本、目标三元组、profile、CRT 链接方式、框架 feature 一致），
-详细要求和发布前自检清单见 [PLUGIN_DEVELOPMENT.md §22](PLUGIN_DEVELOPMENT.md)。
+其中 rustc 版本已经钉在仓库根的 `rust-toolchain.toml` 里：`cargo build` 会自动选中它，
+本地和 CI 不再各凭当天的 stable。详细要求和发布前自检清单见 [PLUGIN_DEVELOPMENT.md §22](PLUGIN_DEVELOPMENT.md)。
 
 ### 安装包
 

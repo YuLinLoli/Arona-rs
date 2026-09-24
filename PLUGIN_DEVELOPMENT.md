@@ -81,7 +81,7 @@ arona-host ──depends──▶ arona（框架）──启动时扫描──�
 **刻意留在进程级的**：日志（`runtime::log`）、目录约定（`runtime::paths`）、OneBot 连接
 （`onebot::application` / `onebot::connection`）、控制台（`runtime::console`）、运行期服务引用
 （`runtime::services`：data root 与消息发送器）、框架自身 `config/arona.yml` 的持有者
-（`config::standalone`）、软渲染兜底（`runtime::softgl`）。它们是「一个进程只有一份」的宿主资源，
+（`config::settings`）、软渲染兜底（`runtime::softgl`）。它们是「一个进程只有一份」的宿主资源，
 不是插件契约的注册表；拆成实例只会让 GUI 和连接层多出一堆无意义的参数。
 
 ## 3. 与 mirai 的对应关系
@@ -138,7 +138,7 @@ arona-host ──depends──▶ arona（框架）──启动时扫描──�
    硬依赖可用性，见 §6）。跑 `configure(&PluginContext)`：登记命令与事件订阅、公布服务。
    状态走 `Installed → Ready`；被停用的停在 `Disabled`。
 5. `plugin::start_all()` —— 对 `Ready` 的插件跑 `start(&PluginContext)`：开数据库、拉预热与定时任务。成功置 `Active`。
-6. 框架装配 `StandaloneBusinessHandler`（持无状态的 `CommandDispatcher` 句柄，真正的命令表挂在
+6. 框架装配 `BusinessHandler`（持无状态的 `CommandDispatcher` 句柄，真正的命令表挂在
    `Framework::global()` 上）并启动 OneBot 连接。
 7. 运行中：
    - `config/arona.yml` 或某个 `config/<插件>/arona.yml` 变更 → 热重载后 `plugin::notify_config_reloaded()`
@@ -1122,7 +1122,7 @@ chatlog:
 开关与保留期都是**现读现判**：记账点每条消息读一次，清理任务在配置热重载时按新值校准
 （周期没变就不重建，避免每改一次配置就多清一遍库）。
 
-> 这件事在旧版本里是插件自己实现的（插件仓库的 `standalone/history.rs`），现已上收到框架：
+> 这件事在旧版本里是插件自己实现的，现已上收到框架：
 > 用例整套搬进了 `runtime::chatlog` 的测试。配置里如果还留着插件那份 `chatlog` 段，
 > 框架会在启动日志里点名城到 `config/arona.yml`。
 
@@ -1207,15 +1207,31 @@ tokio 也被静态链接成了两份，而"当前在哪个运行时里"这个上
 `gui` 有源码扫描用例盯着它不改共享类型布局，`default` 若不放行，`cargo build --workspace`
 与插件作者的 `cargo build -p <插件>` 会算出不同指纹，同仓编出来的 dll 反而装不进自己的宿主。
 
+### 工具链版本以仓库里那一行为准
+
+上表第三项要比对的是 `rustc -vV` 的 `release` 行，而那一行只有版本号（形如 `1.98.0`），
+不含 commit hash。版本本身不再靠自觉：框架仓库与插件模板仓库根的 `rust-toolchain.toml`
+把它钉死，本地 `rustup` 与 CI 都按同一份走，`cargo build` 会自动选中它。
+
+升级流程是四步一起走，缺一步就会有插件装不进宿主：
+
+1. 改两个仓库的 `rust-toolchain.toml` 里同一个 `channel`
+2. 用新工具链重编宿主
+3. 用新工具链重编所有插件
+4. 一起发版
+
+只升框架不重编插件，老插件会全部拒载 —— 这是设计意图，不是回归。
+
 ### 发布插件时必须写明的三件事
 
 ```
 适用于 Arona-rs 1.0.0（框架契约 1.0.0）
-构建工具链：rustc 1.90.0 (xxxxxxx 2026-06-01)，x86_64-pc-windows-msvc，--release，crt-static
+构建工具链：rustc 1.98.0，x86_64-pc-windows-msvc，--release，crt-static
 下载后放进 <框架运行目录>/plugins/<你的id>/，重启框架
 ```
 
-第三件事别偷懒写成"任意 rustc 都能用"——那不是宽松，是把干净的拒载推迟成随机的崩溃。
+第二行的版本号要和 `rust-toolchain.toml` 里那一行对得上。第三件事别偷懒写成"任意 rustc
+都能用"——那不是宽松，是把干净的拒载推迟成随机的崩溃。
 真要跨编译器版本，得走进程外通信（子进程 + JSON-RPC）或 wasm 组件模型，
 那是与本框架这套契约不同的另一条路。
 

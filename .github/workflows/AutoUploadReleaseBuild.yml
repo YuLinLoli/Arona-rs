@@ -53,8 +53,12 @@ jobs:
           }
           Write-Host "必需文件检查通过"
 
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+      # 工具链版本由仓库根的 rust-toolchain.toml 唯一决定：ABI 指纹里带着 rustc 的 release 号，
+      # CI 用当天的 stable 编产物，插件就会和正式宿主对不上指纹而被拒载。rustup 会照那份文件
+      # 自动装好对应版本，这里只把真正生效的版本打进日志，出事时先在日志里核对。
+      - name: Show active toolchain
+        run: rustup show active-toolchain
+        shell: pwsh
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2

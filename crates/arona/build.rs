@@ -43,7 +43,10 @@ fn main() {
         .and_then(|output| String::from_utf8(output.stdout).ok())
         .unwrap_or_default();
 
-    // `rustc -vV` 里 release/host 两行足以锁定编译器身份（含 commit hash）
+    // `rustc -vV` 的 `release:` 行只有版本号（形如 `1.98.0`），短 commit hash 在首行和
+    // `commit-hash:` 行里，这里取不到。所以指纹能挡住"stable 跳到下一版没重编插件"，
+    // 但挡不住 nightly 用户拿同版本号的不同构建混用——那类人本来就该自己保证一致。
+    // 仓库根的 rust-toolchain.toml 把版本钉死，正是为了让这条线不至于靠自觉。
     let release = field(&verbose, "release").unwrap_or("unknown");
     let host = field(&verbose, "host").unwrap_or("unknown");
 
