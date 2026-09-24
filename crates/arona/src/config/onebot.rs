@@ -368,7 +368,7 @@ fn connection_block(key: &str, conn: &ConnectionConfig, comment: &str) -> String
 fn template(config: &OneBotConfig) -> String {
     let mut out = String::new();
     out.push_str("# ==================== Arona OneBot 配置文件 ====================\n");
-    out.push_str("# Rust 移植版（arona-rs）独立运行模式使用本文件。\n");
+    out.push_str("# 本文件描述框架与 OneBot 实现之间的连接。\n");
     out.push_str(
         "# 文件位置：运行目录下的 config/onebot.yml（与框架的 config/arona.yml 同目录），保存后热重载生效。\n",
     );

@@ -513,7 +513,7 @@ fn read_legacy_from_onebot(
 fn template(config: &AronaConfig) -> String {
     let mut out = String::new();
     out.push_str("# ==================== Arona 框架配置 ====================\n");
-    out.push_str("# Rust 移植版（arona-rs）独立运行模式使用本文件，修改后保存即自动热重载。\n");
+    out.push_str("# 框架启动时读本文件，改完保存即自动热重载。\n");
     out.push_str("# 本文件只放框架自身的项：授权、黑名单、分群开关、插件开关与聊天记录缓存。\n");
     out.push_str("# OneBot 协议连接配置见同目录 onebot.yml；功能插件的配置在各自的 config/<插件>/arona.yml。\n\n");
     out.push_str("# 允许响应的群号列表，留空表示响应所有群\n");
