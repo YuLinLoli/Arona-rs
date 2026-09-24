@@ -397,6 +397,104 @@ impl AronaPlugin for HelloPlugin {
                 }),
             )
             .with_feature(FEATURE),
+            // 聊天记录翻页（PLUGIN_DEVELOPMENT.md §21）：mirai 的 `group.history` 那一档出口。
+            // 读的是框架自己那份留档，所以这条同时是"分页在宿主侧执行"的活例子——插件自己去碰
+            // 宿主打开的 `sqlite3*` 句柄就是跨镜像 UB，走 `ChatLogFace` 才不会。
+            CommandRegistration::new(
+                vec!["/示例历史".into(), "/历史翻页".into()],
+                "翻出本群最近五条留档，再用游标往前翻一页",
+                handler(|context, _| async move {
+                    let Some(group) = context.group_id else {
+                        return Some(OutgoingMessage::text("私聊里没有群历史，请到群里发这条"));
+                    };
+                    let handle = context.bot().group(group);
+                    let page = handle.history(5);
+                    let line = match page.records.first() {
+                        Some(newest) => format!(
+                            "留档最近 {} 条，最新一条 {}：{}",
+                            page.records.len(),
+                            newest.name,
+                            newest.text
+                        ),
+                        None => "这个群还没有留档（框架只记它听到与发出的消息）".to_string(),
+                    };
+                    let older = match page.cursor() {
+                        Some(cursor) => format!("往前一页 {} 条", handle.history_before(5, cursor).records.len()),
+                        None => "往前到头了（cursor=None）".to_string(),
+                    };
+                    Some(OutgoingMessage::text(format!("{line}；{older}")))
+                }),
+            )
+            .with_feature(FEATURE),
+            // 图片句柄（§19）：mirai 的 `Image.upload()` 在这里没有对应动作，能复用的只有
+            // 实现端给过的 `file_id`。所以这一问验的是"从收到的图片段里几种线索都不丢，
+            // 回头还能按同一份线索再发一次"。请**带着一条图片消息**发它，否则只会报没图。
+            CommandRegistration::new(
+                vec!["/示例图片".into(), "/图片句柄".into()],
+                "把随命令一起来的图片段还原成 Image，再按同一份线索发第二次",
+                handler(|context, _| async move {
+                    let Some(image) = context
+                        .segments
+                        .iter()
+                        .find_map(arona::bot::Image::from_segment)
+                    else {
+                        return Some(OutgoingMessage::text(
+                            "这条命令没带图片段；引用或附上一张图再发一次即可验 file_id",
+                        ));
+                    };
+                    let leads = format!(
+                        "file_id={:?}；url={:?}；path={:?}",
+                        image.file_id(),
+                        image.url(),
+                        image.path(),
+                    );
+                    let target = match context.group_id {
+                        Some(group) => MessageTarget::Group(group),
+                        None => MessageTarget::Private(context.user_id),
+                    };
+                    // 同一份 Image 发两次：第二次带的还是那一条线索，实现端要不要重传由它自己定
+                    let again = send_message(target, OutgoingMessage::from(image.clone())).await;
+                    Some(OutgoingMessage::text(format!(
+                        "图片段还原成功（{leads}）；按同一份线索重发一次 id={:?}",
+                        again.message_id.or(again.real_id)
+                    )))
+                }),
+            )
+            .with_feature(FEATURE),
+            // 资料缓存（§14.2）：`member_info` 读的是实例上的 `PeerCache`，60 秒内同一个人
+            // 只打一次网络。先作废再读三次，中间那次应当省掉往返——三段时间差就是判据，
+            // 实现端那边数到的 `get_group_member_info` 请求应当只有两次。
+            CommandRegistration::new(
+                vec!["/示例缓存".into(), "/资料缓存".into()],
+                "作废后连读三次成员资料，报出各自的耗时（中间那次应命中缓存）",
+                handler(|context, _| async move {
+                    let Some(group) = context.group_id else {
+                        return Some(OutgoingMessage::text("群资料缓存要在群里验，私聊没有群号"));
+                    };
+                    let handle = context.bot().group(group);
+                    let user_id = context.user_id;
+                    handle.forget_member(user_id);
+                    let started = std::time::Instant::now();
+                    let first = handle.member_info(user_id).await;
+                    let took_first = started.elapsed().as_millis();
+                    let started = std::time::Instant::now();
+                    let second = handle.member_info(user_id).await;
+                    let took_second = started.elapsed().as_millis();
+                    handle.forget_member(user_id);
+                    let started = std::time::Instant::now();
+                    let third = handle.member_info(user_id).await;
+                    let took_third = started.elapsed().as_millis();
+                    let same = match (&first, &second, &third) {
+                        (Ok(a), Ok(b), Ok(c)) if a.nickname == b.nickname && b.nickname == c.nickname =>
+                            "三次读回同一份资料",
+                        _ => "有一次的请求失败了，或读回的资料对不上",
+                    };
+                    Some(OutgoingMessage::text(format!(
+                        "成员资料缓存：首次 {took_first}ms；紧接着 {took_second}ms（该命中缓存）；作废后 {took_third}ms。{same}"
+                    )))
+                }),
+            )
+            .with_feature(FEATURE),
         ]);
 
         // 事件钩子：按**子类**订阅，且绑在功能开关上——这个群关掉「示例」时它一起停。
