@@ -1147,7 +1147,7 @@ mirai 靠 JVM ClassLoader 把插件隔离开，Rust 没有等价物。本框架�
 
 单个文件在任何一步失败都只影响它自己：日志里一条中文原因，其余插件照常装配。
 
-### 宿主的上行通道（为什么插件不需要绕路）
+### 宿主的上行通道（接管的就这四样，判据看状态挂在哪）
 
 mirai 的插件和框架在同一个 ClassLoader 树里，`MiraiInstance` 只有一份。这里不行：dll 把 `arona`
 **静态链接成了自己的第二份**，于是 `Framework::global()`、日志文件句柄、tokio 句柄这些进程级状态
@@ -1163,8 +1163,28 @@ mirai 的插件和框架在同一个 ClassLoader 树里，`MiraiInstance` 只有
 | 宿主登记的 tokio 句柄 | 在 GUI 主线程上装配插件时（面板里关掉再打开），`ctx.spawn` / 定时任务照样投得出去 |
 | 宿主的 HTTP 代发通道 | `arona::runtime::http::*`（§14.1）把请求递给宿主那份 reqwest，插件不必自带客户端 |
 
-所以**插件写起来和同仓静态编译时一样**：能用 `ctx` 就用 `ctx`（下面那条禁令的真实含义），
-偶尔用到进程级自由函数也不会静默失效。接管由宏与装载器完成，插件代码里没有任何对应的手续。
+所以**插件写起来和同仓静态编译时一样**：能用 `ctx` 就用 `ctx`（下面那条禁令的真实含义）。
+接管由宏与装载器完成，插件代码里没有任何对应的手续。
+
+但"接管了四样"只意味着**这四样以及挂在它们身后的东西**是通的。判断某个进程级自由函数在插件里
+能不能用，只看一条：**它的状态挂在 `Framework` 实例上，还是另有一个 `static`**。挂在实例上的
+（`quartz`、`container`、`plugin::manager`、`config::plugin_config` 走 `Framework::global().configs()`）
+全部正确，因为交出去的就是宿主那个实例；另起 `static` 的，插件里就是独立的一份空表，
+而 `get_or_init` 让它**不 panic、只是静默失效** —— 比崩掉难查得多。框架里所有 `static` 已按这条
+判据逐个核过一遍，落在插件可见范围内的缺口只有下表两处（`runtime::config::*` 看起来像进程级，
+其实 `gating()` 就是 `Framework::global().gating()`，所以 `groups()` / `bot_id()` 这些在插件里是通的）。
+
+#### 已知还没接过去的两处进程级状态
+
+| 入口 | 插件里的真实行为 | 症状 |
+| --- | --- | --- |
+| `arona::runtime::services::sender_ready` / `send_message` | 宿主在启动流程里 `set_message_sender`，只写到宿主那份；插件这份恒为 `None` | 定时任务与事件钩子里**主动**发的消息**永久不成立**：`sender_ready()` 恒 `false`，`send_message()` 返回默认回执，消息原地丢弃且不带错误。框架自带的示例插件就中招 —— `plugins/hello` 的「每日问好」与「进群欢迎语」两条都是这条路径，写成 `let _ = send_message(..)` 连失败都看不见。命令的回话不受影响（走宿主传进来的 `CommandContext`） |
+| `arona::config::settings::*`（框架那份 `groups`/`managers`） | `settings::init` 只在宿主启动流程里调用，插件那份 `file` 恒为 `None` | 读出来是默认值（`/config` 列出空的管理员表），写则报「配置文件尚未初始化」。插件自己的 `config/<插件>/arona.yml` **不受影响**，那条走实例 |
+
+这两处在插件侧目前**没有替代写法**（`PluginContext` 上没有发送消息的入口）。所以"插件命令能回话、
+单测全绿"都不能证明主动推送链路可用 —— 得真驱动一次主动消息才算验过，§17 的 `--test-notify`
+就是为此留的（它延迟跑一次每日推送，正好压在上面第一行那条判据上）。框架侧把这两份状态收进
+`Framework` 实例之后本表清空，届时不再需要插件配合改代码。
 
 #### 两份 tokio：哪些调用能直接用
 
@@ -1240,12 +1260,17 @@ tokio 也被静态链接成了两份，而"当前在哪个运行时里"这个上
 - **不要 `main`、不要可执行入口**：插件只能被框架装载；作者要调试，自己去装一份框架。
 - **不要把 `arona` 的进程级自由函数用在登记路径上**（`arona::plugin::manager()`、
   `arona::container::instance()`、`arona::quartz::*` 之类）。它们一律落到**进程默认实例**：
-  静态编译进宿主时那个实例就是宿主自己，dll 里则被上一小节的上行通道接管——所以**不再会静默失效**。
-  仍然不建议用，是因为默认实例是进程级的：单测里造不出第二份，几个插件并存时也共用同一张表，
-  回收和隔离都做不出来。命令、钩子、服务、配置区、定时任务的登记必须走 `install` 阶段的
-  `&PluginRegistrar` 或 `configure`/`start` 阶段的 `&PluginContext`。
+  静态编译进宿主时那个实例就是宿主自己，dll 里则被上一小节的上行通道接管——所以**登记路径本身
+  不会静默失效**。仍然不建议用，是因为默认实例是进程级的：单测里造不出第二份，几个插件并存时
+  也共用同一张表，回收和隔离都做不出来。命令、钩子、服务、配置区、定时任务的登记必须走 `install`
+  阶段的 `&PluginRegistrar` 或 `configure`/`start` 阶段的 `&PluginContext`。
   （纯数据类型与无状态构造器——`runtime::message` 的消息段、`runtime::args` 的参数声明、
   `runtime::priority` 等——不在此列，它们不碰注册表。）
+  注意"接管了默认实例"不等于"所有自由函数都通"：判据是上一小节那条 —— **状态挂在实例上才通，
+  另起 `static` 的就是插件自己那份空表**。
+- **目前还别指望 `arona::runtime::services::send_message` 与 `arona::config::settings::*`**：
+  这两处正是上面说的"另起 `static`"，dll 里各持一份空的，主动消息会被静默丢弃、框架配置的读写
+  会报「配置文件尚未初始化」。详见上一小节的已知缺口表，以及怎么用 `--test-notify` 验到它。
 - **不要裸 `tokio::spawn`**：用 `ctx.spawn(..)` / `ctx.spawn_as(..)`，否则停用时收不掉它。
   确实需要 runtime 句柄时走 `arona::runtime::reactor`，那是刻意留在进程级的那一份。
 - **不要自带 HTTP 客户端**：出站请求走 `arona::runtime::http`（§14.1）。dll 里那份 reqwest 只要

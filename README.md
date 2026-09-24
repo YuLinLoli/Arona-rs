@@ -1,6 +1,6 @@
 # Arona-rs
 
-**Arona 框架**的 Rust 实现：一个只保留 **OneBot 11 独立运行模式**、完全剥离 Mirai 的 QQ 机器人框架。
+**Arona 框架**的 Rust 实现：一个只对接 **OneBot 11** 协议、完全剥离 Mirai 的 QQ 机器人框架。
 框架负责连上 OneBot 实现、认权限、分命令、管插件、开管理面板；**具体功能一律来自「功能插件」**。
 
 - 本项目仓库：<https://github.com/YuLinLoli/Arona-rs>
@@ -497,7 +497,7 @@ arona::export_arona_plugin!(MyPlugin::new());
 
 ## 移植声明与许可
 
-本项目是 [diyigemt/arona](https://github.com/diyigemt/arona) 的 Rust 移植版：命令行为、配置项、文案与数据结构均移植自该项目的 AGPLv3 源码（含其独立运行模式），仅保留 OneBot 独立模式、移除全部 Mirai 相关实现。
+本项目是 [diyigemt/arona](https://github.com/diyigemt/arona) 的 Rust 移植版：命令行为、配置项、文案与数据结构均移植自该项目的 AGPLv3 源码，取的是它 `standalone` 模块（不依赖 Mirai 的那一条实现路径）里的行为，只移植 OneBot 11 一侧、移除全部 Mirai 相关实现。
 
 - 上游版权：Copyright (C) 2020-2021 StageGuard / diyigemt，以 GNU AGPLv3 授权
 - 本移植版版权：Copyright (C) 2026 YuLinLoli
