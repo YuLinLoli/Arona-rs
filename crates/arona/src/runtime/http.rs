@@ -77,12 +77,20 @@ pub struct Request {
 impl Request {
     /// 只给 URL 的 GET
     pub fn get(url: impl Into<String>) -> Request {
-        Request { url: url.into(), ..Default::default() }
+        Request {
+            url: url.into(),
+            ..Default::default()
+        }
     }
 
     /// POST 一份表单
     pub fn form(url: impl Into<String>, form: Vec<(String, String)>) -> Request {
-        Request { method: Method::Post, url: url.into(), body: Body::Form(form), ..Default::default() }
+        Request {
+            method: Method::Post,
+            url: url.into(),
+            body: Body::Form(form),
+            ..Default::default()
+        }
     }
 
     /// POST 一段 JSON
@@ -90,7 +98,10 @@ impl Request {
         Request {
             method: Method::Post,
             url: url.into(),
-            body: Body::Raw { content_type: "application/json".into(), text: json.into() },
+            body: Body::Raw {
+                content_type: "application/json".into(),
+                text: json.into(),
+            },
             ..Default::default()
         }
     }
@@ -123,7 +134,14 @@ pub async fn get<K: AsRef<str>, V: AsRef<str>>(
     url: &str,
     headers: &[(K, V)],
 ) -> Result<String, String> {
-    as_text(url, send(Request { headers: own(headers), ..Request::get(url) }).await)
+    as_text(
+        url,
+        send(Request {
+            headers: own(headers),
+            ..Request::get(url)
+        })
+        .await,
+    )
 }
 
 /// GET 一段二进制响应（学生头像、攻略图这类）
@@ -131,7 +149,11 @@ pub async fn get_bytes<K: AsRef<str>, V: AsRef<str>>(
     url: &str,
     headers: &[(K, V)],
 ) -> Result<Vec<u8>, String> {
-    send(Request { headers: own(headers), ..Request::get(url) }).await
+    send(Request {
+        headers: own(headers),
+        ..Request::get(url)
+    })
+    .await
 }
 
 /// 表单 POST
@@ -140,7 +162,10 @@ pub async fn post_form<K: AsRef<str>, V: AsRef<str>, F: AsRef<str>, W: AsRef<str
     headers: &[(K, V)],
     form: &[(F, W)],
 ) -> Result<String, String> {
-    let request = Request { headers: own(headers), ..Request::form(url, own(form)) };
+    let request = Request {
+        headers: own(headers),
+        ..Request::form(url, own(form))
+    };
     as_text(url, send(request).await)
 }
 
@@ -150,14 +175,15 @@ pub async fn post_json<K: AsRef<str>, V: AsRef<str>>(
     headers: &[(K, V)],
     json: &str,
 ) -> Result<String, String> {
-    let request = Request { headers: own(headers), ..Request::json(url, json) };
+    let request = Request {
+        headers: own(headers),
+        ..Request::json(url, json)
+    };
     as_text(url, send(request).await)
 }
 
 fn as_text(url: &str, body: Result<Vec<u8>, String>) -> Result<String, String> {
-    body.and_then(|bytes| {
-        String::from_utf8(bytes).map_err(|_| format!("响应不是合法 UTF-8 {url}"))
-    })
+    body.and_then(|bytes| String::from_utf8(bytes).map_err(|_| format!("响应不是合法 UTF-8 {url}")))
 }
 
 fn own<K: AsRef<str>, V: AsRef<str>>(pairs: &[(K, V)]) -> Vec<(String, String)> {
@@ -205,22 +231,33 @@ fn commit(submit: Submit, request: &Request, user: *mut c_void) {
         _ => (HttpText::default(), HttpText::default()),
     };
     let call = HttpCall {
-        method: match request.method { Method::Get => 0, Method::Post => 1 },
+        method: match request.method {
+            Method::Get => 0,
+            Method::Post => 1,
+        },
         body_kind: match &request.body {
             Body::None => 0,
             Body::Form(_) => 1,
             Body::Raw { .. } => 2,
         },
         url: bytes_of(&request.url),
-        headers: if headers.is_empty() { null() } else { headers.as_ptr() },
+        headers: if headers.is_empty() {
+            null()
+        } else {
+            headers.as_ptr()
+        },
         header_count: headers.len(),
-        form: if form.is_empty() { null() } else { form.as_ptr() },
+        form: if form.is_empty() {
+            null()
+        } else {
+            form.as_ptr()
+        },
         form_count: form.len(),
         body,
         content_type,
-        timeout_ms: request
-            .timeout
-            .map_or(0, |span| u64::try_from(span.as_millis()).unwrap_or(u64::MAX)),
+        timeout_ms: request.timeout.map_or(0, |span| {
+            u64::try_from(span.as_millis()).unwrap_or(u64::MAX)
+        }),
     };
     crate::runtime::log::debug(format!("[HTTP] 插件请求代发 {}", request.url));
     submit(&call, deliver, user);
@@ -273,11 +310,17 @@ unsafe fn text_of(ptr: *const u8, len: usize) -> String {
 }
 
 fn bytes_of(value: &str) -> HttpText {
-    HttpText { ptr: value.as_ptr(), len: value.len() }
+    HttpText {
+        ptr: value.as_ptr(),
+        len: value.len(),
+    }
 }
 
 fn pair((name, value): &(String, String)) -> HttpPair {
-    HttpPair { name: bytes_of(name), value: bytes_of(value) }
+    HttpPair {
+        name: bytes_of(name),
+        value: bytes_of(value),
+    }
 }
 
 // ==================== 宿主侧：真正发这一趟请求 ====================
@@ -304,7 +347,11 @@ pub(crate) extern "C" fn host_submit(call: *const HttpCall, done: HttpDone, user
     let url = request.url.clone();
     let task = async move { report(done, ticket, local(request).await) };
     if crate::runtime::reactor::spawn(task).is_none() {
-        report(done, ticket, Err(format!("宿主的运行时还没起来，发不了 {url}")));
+        report(
+            done,
+            ticket,
+            Err(format!("宿主没有可用的运行时，发不了 {url}")),
+        );
     }
 }
 
@@ -436,11 +483,14 @@ async fn local(request: Request) -> Result<Vec<u8>, String> {
     call = match &request.body {
         Body::None => call,
         Body::Form(items) => call.form(items),
-        Body::Raw { content_type, text } => {
-            call.header(reqwest::header::CONTENT_TYPE, content_type.as_str()).body(text.clone())
-        }
+        Body::Raw { content_type, text } => call
+            .header(reqwest::header::CONTENT_TYPE, content_type.as_str())
+            .body(text.clone()),
     };
-    let response = call.send().await.map_err(|err| format!("请求失败 {url}: {err}"))?;
+    let response = call
+        .send()
+        .await
+        .map_err(|err| format!("请求失败 {url}: {err}"))?;
     let status = response.status();
     let bytes = response
         .bytes()
@@ -455,6 +505,8 @@ async fn local(request: Request) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// 一次性的本地 HTTP 回应：接一条连接，把收到的请求原样当正文答出去，然后收摊。
@@ -463,7 +515,9 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            let Ok((mut socket, _)) = listener.accept().await else { return };
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
             let mut head = Vec::new();
             let mut byte = [0u8; 1];
             // 读到空行为止，就是请求头收完了
@@ -511,7 +565,9 @@ mod tests {
     /// 客户端会把名字规范化成 `X-Game` 这种写法（经系统代理转发时更是如此），
     /// 所以按整行、不区分大小写地找，别去赌发送时的那个大小写。
     fn has_header(echoed: &str, header: &str) -> bool {
-        echoed.lines().any(|line| line.trim_end().eq_ignore_ascii_case(header))
+        echoed
+            .lines()
+            .any(|line| line.trim_end().eq_ignore_ascii_case(header))
     }
 
     #[tokio::test]
@@ -525,7 +581,9 @@ mod tests {
     #[tokio::test]
     async fn a_form_post_reaches_the_server() {
         let url = echo_server(200).await;
-        let text = post_form(&url, &[("game-alias", "ba")], &[("id", "12")]).await.unwrap();
+        let text = post_form(&url, &[("game-alias", "ba")], &[("id", "12")])
+            .await
+            .unwrap();
         assert!(text.starts_with("POST /probe HTTP/1.1"), "{text}");
         assert!(has_header(&text, "game-alias: ba"), "{text}");
         assert!(text.ends_with("id=12"), "表单正文没到: {text}");
@@ -534,7 +592,9 @@ mod tests {
     #[tokio::test]
     async fn a_json_post_carries_its_content_type() {
         let url = echo_server(200).await;
-        let text = post_json(&url, &[] as &[(&str, &str)], "{\"id\":1}").await.unwrap();
+        let text = post_json(&url, &[] as &[(&str, &str)], "{\"id\":1}")
+            .await
+            .unwrap();
         assert!(
             text.contains("application/json"),
             "content-type 该由框架补上: {text}"
@@ -546,7 +606,10 @@ mod tests {
     async fn a_non_success_status_is_an_error() {
         let url = echo_server(503).await;
         let reason = get(&url, &[] as &[(&str, &str)]).await.unwrap_err();
-        assert!(reason.contains("HTTP 503"), "失败原因里该带状态码: {reason}");
+        assert!(
+            reason.contains("HTTP 503"),
+            "失败原因里该带状态码: {reason}"
+        );
         assert!(reason.contains("/probe"), "失败原因里该带 URL: {reason}");
     }
 
@@ -555,7 +618,9 @@ mod tests {
         // 127.0.0.1 上没人监听的端口：要的是"报错返回"，不是崩。
         // 本机挂着系统代理时 reqwest 会跟着走，那条路回来的是代理给的 502 而不是连接拒绝，
         // 所以这里只认"Err 且原因里说清了是哪一种"。
-        let reason = get("http://127.0.0.1:1/none", &[] as &[(&str, &str)]).await.unwrap_err();
+        let reason = get("http://127.0.0.1:1/none", &[] as &[(&str, &str)])
+            .await
+            .unwrap_err();
         assert!(
             reason.contains("请求失败") || reason.contains("返回 HTTP"),
             "连不上该有明确原因: {reason}"
@@ -566,8 +631,14 @@ mod tests {
     #[tokio::test]
     async fn images_come_back_as_bytes() {
         let url = echo_server(200).await;
-        let bytes = get_bytes(&url, &[("referer", "https://example.invalid/")]).await.unwrap();
-        assert!(bytes.starts_with(b"GET /probe"), "{}", String::from_utf8_lossy(&bytes));
+        let bytes = get_bytes(&url, &[("referer", "https://example.invalid/")])
+            .await
+            .unwrap();
+        assert!(
+            bytes.starts_with(b"GET /probe"),
+            "{}",
+            String::from_utf8_lossy(&bytes)
+        );
     }
 
     /// 过一道边界走宿主：这正是插件 dll 里跑的那条路，只是这里宿主与插件同在一个镜像里。
@@ -577,6 +648,196 @@ mod tests {
         let url = echo_server(200).await;
         let text = get(&url, &[("x-via", "bridge")]).await.unwrap();
         assert!(has_header(&text, "x-via: bridge"), "{text}");
+    }
+
+    // ==================== 「done 恰好一次」的计数探针 ====================
+    //
+    // [`host_submit`] 的契约是每条分支都回调**恰好一次**：少一次插件那头永远等不到结果
+    // （`via_host` 的 `await` 挂死），多一次就是同一个 `Box<oneshot::Sender>` 被
+    // `Box::from_raw` 收走两遍（double free）。下面三个用例把各条分支走一遍并数回调次数。
+    //
+    // 记的是「凭据 → 收到的回调」这张表，而不是一个共享计数器：每个用例给自己一个独一无二
+    // 的 `user` 指针，并发跑也就各查各的，不必再拿一把全局锁把自己串行化——那把锁在异步用例
+    // 里还得跨 `await` 持着，正是 `await_holding_lock` 要拦的东西。
+
+    /// 一次回调拷回来的内容。两段字节都只在那次调用期内有效，所以当场拷走。
+    #[derive(Clone, Default, Debug)]
+    struct Report {
+        reason: Option<String>,
+        body: Vec<u8>,
+    }
+
+    static CALLBACKS: Mutex<BTreeMap<usize, Vec<Report>>> = Mutex::new(BTreeMap::new());
+
+    extern "C" fn record_report(
+        user: *mut c_void,
+        error: *const u8,
+        error_len: usize,
+        body: *const u8,
+        body_len: usize,
+    ) {
+        // 这里刻意不 panic：`host_submit` 是 `extern "C"`，回调里的 panic 会 abort 整个测试
+        // 二进制，把同批跑的其它用例一起带走。内容缺失就让用例里的断言去判。
+        let mut report = Report::default();
+        if error_len > 0 && !error.is_null() {
+            // SAFETY: 上面刚验过非空，且约定这段字节在本次调用期内可读
+            let reason = unsafe { std::slice::from_raw_parts(error, error_len) };
+            // 不是 UTF-8 也照样拷出来（变成替换符），让断言去判"原因里有没有那句话"
+            report.reason = Some(String::from_utf8_lossy(reason).to_string());
+        }
+        if body_len > 0 && !body.is_null() {
+            // SAFETY: 同上，约定正文那段字节在本次调用期内可读
+            report.body = unsafe { std::slice::from_raw_parts(body, body_len) }.to_vec();
+        }
+        CALLBACKS
+            .lock()
+            .unwrap()
+            .entry(user as usize)
+            .or_default()
+            .push(report);
+    }
+
+    /// 宿主只把 `user` 原样带回来，从不解引用，所以这里给的是纯哨兵值；每个用例一个。
+    const NULL_CALL: usize = 0x5A5A_1001;
+    const LYING_HEADERS: usize = 0x5A5A_1002;
+    const FAILED_LOCALLY: usize = 0x5A5A_1003;
+    const SUCCEEDED_LOCALLY: usize = 0x5A5A_1004;
+    const DELIVERED: usize = 0x5A5A_1005;
+    const UNREACHABLE: usize = 0x5A5A_1006;
+
+    fn credential(ticket: usize) -> *mut c_void {
+        ticket as *mut c_void
+    }
+
+    /// 某个凭据到现在为止收到的回调，按到达顺序
+    fn callbacks_of(ticket: usize) -> Vec<Report> {
+        CALLBACKS
+            .lock()
+            .unwrap()
+            .get(&ticket)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// 回调由宿主的 worker 线程打来，而 `#[tokio::test]` 默认是单线程 runtime：这里必须用
+    /// `tokio::time::sleep` 让出执行权，换成同步的 `thread::sleep` 会把待投递的代发任务
+    /// 一起堵死，等到的只有超时。
+    async fn await_callback(ticket: usize) {
+        for _ in 0..200 {
+            if !callbacks_of(ticket).is_empty() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// 请求描述坏掉：`host_submit` 连任务都不该派，直接一次回调说明原因。
+    #[test]
+    fn a_refused_request_still_reports_once() {
+        let url = "https://example.invalid/probe".to_string();
+        let good = HttpCall {
+            method: 0,
+            body_kind: 0,
+            url: bytes_of(&url),
+            headers: null(),
+            header_count: 0,
+            form: null(),
+            form_count: 0,
+            body: HttpText::default(),
+            content_type: HttpText::default(),
+            timeout_ms: 0,
+        };
+
+        // 空指针描述
+        host_submit(null(), record_report, credential(NULL_CALL));
+        let reports = callbacks_of(NULL_CALL);
+        assert_eq!(reports.len(), 1, "空指针描述也该回一次");
+        assert!(reports[0].reason.is_some(), "拒绝该说明原因");
+        assert!(reports[0].body.is_empty(), "被拒时不该给正文");
+
+        // 键值计数撒谎
+        let lying = HttpCall {
+            header_count: 3,
+            ..good
+        };
+        host_submit(&lying, record_report, credential(LYING_HEADERS));
+        let reports = callbacks_of(LYING_HEADERS);
+        assert_eq!(reports.len(), 1, "坏描述也该回一次");
+        assert!(
+            reports[0]
+                .reason
+                .as_deref()
+                .is_some_and(|r| r.contains("请求头")),
+            "原因里该说清坏在哪一项: {reports:?}"
+        );
+    }
+
+    /// 就地报错的那一支（宿主侧压根没运行时可用）不走 `host_submit` 去测：进程级那份
+    /// `reactor::RUNTIME` 会被同批跑的其它用例登记成不确定的状态，"投得出去吗"就不是用例能定的了。
+    /// 这里直接收口测 [`report`] —— 它是所有分支共用的那一次回调，成功与失败都必须正好一次。
+    #[test]
+    fn every_reported_outcome_reaches_the_plugin_exactly_once() {
+        report(
+            record_report,
+            Ticket(credential(FAILED_LOCALLY)),
+            Err("没有可用的运行时".to_string()),
+        );
+        let reports = callbacks_of(FAILED_LOCALLY);
+        assert_eq!(reports.len(), 1, "失败只该回调一次");
+        assert_eq!(
+            reports[0].reason.as_deref(),
+            Some("没有可用的运行时"),
+            "失败要把原因原话带到"
+        );
+        assert!(reports[0].body.is_empty(), "失败不该给正文");
+
+        report(
+            record_report,
+            Ticket(credential(SUCCEEDED_LOCALLY)),
+            Ok(b"pong".to_vec()),
+        );
+        let reports = callbacks_of(SUCCEEDED_LOCALLY);
+        assert_eq!(reports.len(), 1, "成功也只该回调一次");
+        assert!(reports[0].reason.is_none(), "成功不该给原因");
+        assert_eq!(reports[0].body, b"pong", "正文指针要当场读得出来");
+    }
+
+    /// 真发出去的那条路：回调一次、正文到位、没有错误段；传输失败同样只回一次。
+    #[tokio::test]
+    async fn a_delivered_request_reports_once() {
+        let url = echo_server(200).await;
+        let request = Request::get(&url);
+        let call = HttpCall {
+            method: 0,
+            body_kind: 0,
+            url: bytes_of(&request.url),
+            headers: null(),
+            header_count: 0,
+            form: null(),
+            form_count: 0,
+            body: HttpText::default(),
+            content_type: HttpText::default(),
+            timeout_ms: 0,
+        };
+        host_submit(&call, record_report, credential(DELIVERED));
+        await_callback(DELIVERED).await;
+        let reports = callbacks_of(DELIVERED);
+        assert_eq!(reports.len(), 1, "成功只该回调一次");
+        assert!(reports[0].reason.is_none(), "成功不该给原因");
+        assert!(!reports[0].body.is_empty(), "正文要非空");
+
+        // 换个没人听的端口：失败同样只回一次，且带原因
+        let dead = "http://127.0.0.1:1/none".to_string();
+        let failing = HttpCall {
+            url: bytes_of(&dead),
+            ..call
+        };
+        host_submit(&failing, record_report, credential(UNREACHABLE));
+        await_callback(UNREACHABLE).await;
+        let reports = callbacks_of(UNREACHABLE);
+        assert_eq!(reports.len(), 1, "失败也只该回调一次");
+        assert!(reports[0].reason.is_some(), "失败该带原因");
+        assert!(reports[0].body.is_empty());
     }
 
     /// 请求描述是插件给的裸指针：空指针、越界长度、非 UTF-8、错位计数都得当场拒掉，
@@ -602,22 +863,46 @@ mod tests {
         assert_eq!(request.timeout, None);
 
         assert!(unsafe { take_call(null()) }.is_err_and(|reason| reason.contains("空指针")));
-        let dangling = HttpCall { url: HttpText { ptr: null(), len: 8 }, ..good };
+        let dangling = HttpCall {
+            url: HttpText {
+                ptr: null(),
+                len: 8,
+            },
+            ..good
+        };
         assert!(unsafe { take_call(&dangling) }.is_err_and(|reason| reason.contains("空指针")));
-        let too_long =
-            HttpCall { url: HttpText { ptr: url.as_ptr(), len: TEXT_LIMIT + 1 }, ..good };
+        let too_long = HttpCall {
+            url: HttpText {
+                ptr: url.as_ptr(),
+                len: TEXT_LIMIT + 1,
+            },
+            ..good
+        };
         assert!(unsafe { take_call(&too_long) }.is_err_and(|reason| reason.contains("超出上限")));
-        let bad_utf8 = HttpCall { url: HttpText { ptr: [0xFFu8].as_ptr(), len: 1 }, ..good };
-        assert!(
-            unsafe { take_call(&bad_utf8) }.is_err_and(|reason| reason.contains("合法 UTF-8"))
-        );
+        let bad_utf8 = HttpCall {
+            url: HttpText {
+                ptr: [0xFFu8].as_ptr(),
+                len: 1,
+            },
+            ..good
+        };
+        assert!(unsafe { take_call(&bad_utf8) }.is_err_and(|reason| reason.contains("合法 UTF-8")));
         let bogus_method = HttpCall { method: 7, ..good };
         assert!(unsafe { take_call(&bogus_method) }.is_err_and(|reason| reason.contains("方法码")));
-        let lying_count = HttpCall { header_count: 3, ..good };
+        let lying_count = HttpCall {
+            header_count: 3,
+            ..good
+        };
         assert!(unsafe { take_call(&lying_count) }.is_err_and(|reason| reason.contains("请求头")));
-        let too_many = HttpCall { header_count: PAIR_LIMIT + 1, ..good };
+        let too_many = HttpCall {
+            header_count: PAIR_LIMIT + 1,
+            ..good
+        };
         assert!(unsafe { take_call(&too_many) }.is_err_and(|reason| reason.contains("最多")));
-        let no_url = HttpCall { url: HttpText::default(), ..good };
+        let no_url = HttpCall {
+            url: HttpText::default(),
+            ..good
+        };
         assert!(unsafe { take_call(&no_url) }.is_err_and(|reason| reason.contains("没有 URL")));
     }
 
@@ -630,10 +915,8 @@ mod tests {
         assert_eq!(request.method, Method::Post);
         assert_eq!(request.url, "/upload");
         assert_eq!(request.headers, vec![("k".to_string(), "v".to_string())]);
-        assert!(
-            matches!(&request.body, Body::Raw { content_type, text }
-                if content_type == "application/json" && text == "{\"a\":1}")
-        );
+        assert!(matches!(&request.body, Body::Raw { content_type, text }
+                if content_type == "application/json" && text == "{\"a\":1}"));
         assert_eq!(request.timeout, Some(Duration::from_millis(1500)));
 
         let form = Request::form("/f", vec![("id".to_string(), "12".to_string())]);
