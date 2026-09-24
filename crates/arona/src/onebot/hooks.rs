@@ -686,7 +686,7 @@ where
     Fut: std::future::Future<Output = HookFlow> + Send,
 {
     fn handle<'a>(&'a self, context: Arc<EventContext>) -> BoxFuture<'a, HookFlow> {
-        Box::pin(async move { (self.inner)(context).await })
+        Box::pin(async move { crate::runtime::reactor::scoped((self.inner)(context)).await })
     }
 }
 
@@ -772,7 +772,7 @@ where
     Fut: std::future::Future<Output = ()> + Send,
 {
     fn handle<'a>(&'a self, context: Arc<OutboundContext>) -> BoxFuture<'a, ()> {
-        Box::pin(async move { (self.inner)(context).await })
+        Box::pin(async move { crate::runtime::reactor::scoped((self.inner)(context)).await })
     }
 }
 

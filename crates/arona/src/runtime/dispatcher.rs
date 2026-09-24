@@ -256,7 +256,9 @@ where
         context: Arc<CommandContext>,
         arguments: Vec<String>,
     ) -> BoxFuture<'a, Option<OutgoingMessage>> {
-        Box::pin(async move { (self.inner)(context, arguments).await })
+        Box::pin(
+            async move { crate::runtime::reactor::scoped((self.inner)(context, arguments)).await },
+        )
     }
 }
 
@@ -301,7 +303,9 @@ where
         context: Arc<CommandContext>,
         arguments: Args,
     ) -> BoxFuture<'a, Option<OutgoingMessage>> {
-        Box::pin(async move { (self.inner)(context, arguments).await })
+        Box::pin(
+            async move { crate::runtime::reactor::scoped((self.inner)(context, arguments)).await },
+        )
     }
 }
 
@@ -437,7 +441,7 @@ where
     Fut: std::future::Future<Output = ()> + Send,
 {
     fn handle<'a>(&'a self, context: Arc<CommandContext>) -> BoxFuture<'a, ()> {
-        Box::pin(async move { (self.inner)(context).await })
+        Box::pin(async move { crate::runtime::reactor::scoped((self.inner)(context)).await })
     }
 }
 

@@ -72,3 +72,27 @@ where
         inner.as_mut().poll(cx)
     })))
 }
+
+/// 给**插件交上来的** future 套一层「每帧补装上下文」，用于所有由宿主 poll 的插件回调边界
+/// （命令、类型化命令、兜底、事件钩子、出站钩子）。
+///
+/// 这些包装代码写在泛型 `impl` 里，会随插件的闭包类型在 **dll 那份** `arona` 中单态化，
+/// 于是 [`Handle::enter`] 点亮的是插件自己那份 tokio 的 thread-local；宿主在自己的 worker
+/// 线程上 poll 这段 future 时，它里面的 `tokio::time::sleep` / `tokio::select!` 不再看见空上下文。
+/// 少了这一层，插件命令体里一句 `sleep` 就有概率炸「there is no reactor running」。
+///
+/// 拿不到句柄（纯同步测试里）时原样透传，行为与包装前一致。
+pub fn scoped<F>(task: F) -> impl Future<Output = F::Output>
+where
+    F: Future,
+{
+    let context = current();
+    let mut inner = Box::pin(task);
+    std::future::poll_fn(move |cx| match &context {
+        Some(handle) => {
+            let _guard = handle.enter();
+            inner.as_mut().poll(cx)
+        }
+        None => inner.as_mut().poll(cx),
+    })
+}
