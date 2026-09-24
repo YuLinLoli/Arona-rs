@@ -34,7 +34,7 @@ use crate::framework::Framework;
 use crate::onebot::api::{
     FriendInfo, GroupInfo, GroupMemberInfo, LoginInfo, OneBotApi, OneBotError, StrangerInfo,
 };
-use crate::runtime::chatlog::ChatRecord;
+use crate::runtime::chatlog::{ChatRecord, HistoryCursor, HistoryPage, HistoryScope};
 use crate::runtime::message::{MessageReceipt, MessageSegment, MessageTarget, OutgoingMessage};
 use std::sync::Arc;
 
@@ -226,6 +226,24 @@ impl Group {
         self.bot
             .send(self.target(), OutgoingMessage::text(text))
             .await
+    }
+
+    /// mirai 的 `group.history`：往前翻这个群说过的话（§21 那份留档，从新到旧）。
+    /// 不发协议请求，所以查到的是"机器人见过的"那部分。
+    pub fn history(&self, limit: i64) -> HistoryPage {
+        self.history_at(limit, None)
+    }
+
+    /// 接着上一页往前翻：`cursor` 用上一页 [`HistoryPage::cursor`] 给出的那个，`None` 表示到头了
+    pub fn history_before(&self, limit: i64, cursor: HistoryCursor) -> HistoryPage {
+        self.history_at(limit, Some(cursor))
+    }
+
+    fn history_at(&self, limit: i64, before: Option<HistoryCursor>) -> HistoryPage {
+        self.bot
+            .framework()
+            .chatlog_api()
+            .recent(HistoryScope::Group(self.group_id), limit, before)
     }
 
     /// `get_group_member_list` 全部成员
@@ -448,6 +466,24 @@ impl Friend {
     pub async fn send_text(&self, text: impl Into<String>) -> MessageReceipt {
         self.send(OutgoingMessage::text(text)).await
     }
+
+    /// mirai 的 `user.history`：往前翻与这个人的私聊留档（含机器人自己说出去的）
+    pub fn history(&self, limit: i64) -> HistoryPage {
+        self.history_at(limit, None)
+    }
+
+    /// 接着上一页往前翻
+    pub fn history_before(&self, limit: i64, cursor: HistoryCursor) -> HistoryPage {
+        self.history_at(limit, Some(cursor))
+    }
+
+    fn history_at(&self, limit: i64, before: Option<HistoryCursor>) -> HistoryPage {
+        self.bot.framework().chatlog_api().recent(
+            HistoryScope::Private(self.info.user_id),
+            limit,
+            before,
+        )
+    }
 }
 
 /// 一条消息的凭据（对应 mirai 的 `MessageSource`）：撤回与引用都拿它。
@@ -551,6 +587,143 @@ impl MessageReceipt {
     /// 这条回执对应消息的凭据
     pub fn source(&self) -> Option<MessageSource> {
         self.message_id.or(self.real_id).map(MessageSource::of)
+    }
+}
+
+/// 一张可以反复发的图片（对应 mirai 的 `Image` / `ExternalImage` 消息元素）。
+///
+/// mirai 里图片是消息链上的一个元素，拿到就到处发；OneBot 各家实现端给的线索不一样
+/// （v11 给直链、NTQQ 系给 `file_id`、也有实现端只给本地缓存路径），所以这个句柄把四种
+/// 来源收在一起，[`Image::segment`] 时按「直链 > 本地路径 > 字节 > `file_id`」的优先级落地
+/// （和协议层 [`crate::onebot::protocol`] 的取值顺序一致，几个都在时一并带上）。
+///
+/// 它是 `Clone` 的且不含任何连接状态，可以直接放进插件自己的缓存里长期持有。
+/// **没有 `upload` 这一步**：OneBot v11 没有"先传上去换个 id 回来"的标准动作，
+/// 发图时由实现端自己上传；能复用的 `file_id` 只可能来自入站消息
+/// （[`Image::from_segment`]）或框架留档（[`Image::from_stored`]）。
+#[derive(Clone, Debug, Default)]
+pub struct Image {
+    url: Option<String>,
+    path: Option<String>,
+    /// 图片字节：发出时框架直接转 base64 带走，不落机器人硬盘
+    bytes: Option<Arc<[u8]>>,
+    file_id: Option<String>,
+}
+
+impl Image {
+    /// 从图片字节构造（渲染出来的攻略图/日历图这类现生成的内容）
+    pub fn from_bytes(bytes: impl AsRef<[u8]>) -> Image {
+        Image {
+            bytes: Some(Arc::from(bytes.as_ref())),
+            ..Default::default()
+        }
+    }
+
+    /// 从机器人本机的文件路径构造：实现端按路径读文件上传，路径必须在实现端进程读得到
+    pub fn from_file(path: impl Into<String>) -> Image {
+        Image {
+            path: Some(path.into()),
+            ..Default::default()
+        }
+    }
+
+    /// 从直链构造。QQ 的图床直链带签名、会过期，长期持有请优先用 [`Image::from_file_id`]
+    pub fn from_url(url: impl Into<String>) -> Image {
+        Image {
+            url: Some(url.into()),
+            ..Default::default()
+        }
+    }
+
+    /// 从实现端给的图片标识构造。**只有给过它的那个实现端认得**，
+    /// 换实现端或跨账号都不保证还能取到
+    pub fn from_file_id(file_id: impl Into<String>) -> Image {
+        Image {
+            file_id: Some(file_id.into()),
+            ..Default::default()
+        }
+    }
+
+    /// 从收到的图片段原样取出：几种线索有哪个留哪个，等下一并带回，不在这一步猜该用哪个
+    pub fn from_segment(segment: &MessageSegment) -> Option<Image> {
+        let MessageSegment::Image {
+            url,
+            file,
+            data,
+            file_id,
+        } = segment
+        else {
+            return None;
+        };
+        let image = Image {
+            url: non_empty(url.as_deref()),
+            path: non_empty(file.as_deref()),
+            bytes: data.as_ref().map(|bytes| Arc::from(bytes.as_slice())),
+            file_id: non_empty(file_id.as_deref()),
+        };
+        (!image.is_empty()).then_some(image)
+    }
+
+    /// 从框架聊天记录库 `image` 列存的那个字符串还原。
+    /// 那一列三种写法都可能出现：`fileid://<id>`（实现端只给了标识）、http(s) 直链、本地路径
+    pub fn from_stored(value: &str) -> Option<Image> {
+        if let Some(id) = value.strip_prefix(crate::runtime::chatlog::FILE_ID_SCHEME) {
+            return non_empty(Some(id)).map(Image::from_file_id);
+        }
+        non_empty(Some(value)).map(|value| {
+            if value.starts_with("http://") || value.starts_with("https://") {
+                Image::from_url(value)
+            } else {
+                Image::from_file(value)
+            }
+        })
+    }
+
+    /// 一个线索都没有（收到的是既没链接、也没路径、还没字节的空图片段）
+    pub fn is_empty(&self) -> bool {
+        self.url.is_none() && self.path.is_none() && self.bytes.is_none() && self.file_id.is_none()
+    }
+
+    /// 实现端给的图片标识，没给过时 `None`
+    pub fn file_id(&self) -> Option<&str> {
+        self.file_id.as_deref()
+    }
+
+    /// 直链，没给过时 `None`
+    pub fn url(&self) -> Option<&str> {
+        self.url.as_deref()
+    }
+
+    /// 机器人本机上的文件路径，没给过时 `None`
+    pub fn path(&self) -> Option<&str> {
+        self.path.as_deref()
+    }
+
+    /// 转成消息段，挂进要发的消息里
+    pub fn segment(&self) -> MessageSegment {
+        MessageSegment::Image {
+            url: self.url.clone(),
+            file: self.path.clone(),
+            data: self.bytes.as_ref().map(|bytes| bytes.to_vec()),
+            file_id: self.file_id.clone(),
+        }
+    }
+}
+
+/// 实现端经常回空串而不是干脆不给这个字段，一律折成 `None`
+fn non_empty(value: Option<&str>) -> Option<String> {
+    Some(value?.to_string()).filter(|value| !value.is_empty())
+}
+
+impl From<Image> for MessageSegment {
+    fn from(image: Image) -> MessageSegment {
+        image.segment()
+    }
+}
+
+impl From<Image> for OutgoingMessage {
+    fn from(image: Image) -> OutgoingMessage {
+        OutgoingMessage::new(vec![image.segment()])
     }
 }
 
@@ -767,5 +940,71 @@ mod tests {
             MessageReceipt::default().source().is_none(),
             "一个号都没给时不该编出凭据"
         );
+    }
+
+    /// 图片句柄的意义在于"收到的那张图，回头还发得出去"：
+    /// 从入站段取出来时必须几种线索一个都不丢，落回消息段时也要原样带回去。
+    #[test]
+    fn inbound_image_round_trips_without_losing_a_lead() {
+        let received = MessageSegment::Image {
+            url: Some("https://x.example/a.png".to_string()),
+            file: Some("".to_string()),
+            data: None,
+            file_id: Some("E2A1B3C4".to_string()),
+        };
+        let image = Image::from_segment(&received).expect("有 url 就不算空");
+        assert_eq!(image.url(), Some("https://x.example/a.png"));
+        assert_eq!(image.file_id(), Some("E2A1B3C4"));
+        assert!(matches!(
+            image.segment(),
+            MessageSegment::Image { url, file, data, file_id }
+                if url.as_deref() == Some("https://x.example/a.png")
+                    && file.is_none()
+                    && data.is_none()
+                    && file_id.as_deref() == Some("E2A1B3C4")
+        ));
+
+        // 实现端回空串等同于没回，全空的那一段不该变成一张"能发出去"的图
+        assert!(Image::from_segment(&MessageSegment::Text("不是图".to_string())).is_none());
+        assert!(
+            Image::from_segment(&MessageSegment::Image {
+                url: Some(String::new()),
+                file: Some(String::new()),
+                data: None,
+                file_id: Some(String::new()),
+            })
+            .is_none()
+        );
+    }
+
+    /// 库里那一列的三种写法都得还原成对应那一种来源，不能把 `fileid://E2` 当成路径发出去
+    #[test]
+    fn stored_image_lead_decodes_by_scheme() {
+        let by_id = Image::from_stored("fileid://E2A1B3C4").expect("fileid 前应还原成标识");
+        assert_eq!(by_id.file_id(), Some("E2A1B3C4"));
+        assert_eq!(by_id.url(), None);
+
+        let by_url = Image::from_stored("https://x/a.png").expect("http 前缀是直链");
+        assert_eq!(by_url.url(), Some("https://x/a.png"));
+        assert!(Image::from_stored("http://x/a.png").is_some());
+
+        let by_path = Image::from_stored("D:/arona/a.png").expect("剩下的是本机路径");
+        assert_eq!(by_path.path(), Some("D:/arona/a.png"));
+
+        assert!(Image::from_stored("").is_none(), "空串是无图，不是空图");
+    }
+
+    /// 字节那条路要一路带到消息段里：框架转 base64 发出，全程不落机器人硬盘
+    #[test]
+    fn generated_image_bytes_reach_the_segment() {
+        let image = Image::from_bytes([0xFF, 0xD8, 0x01]);
+        assert!(image.file_id().is_none() && image.url().is_none());
+        let MessageSegment::Image { data, .. } = image.segment() else {
+            panic!("from_bytes 出来的该是字节段");
+        };
+        assert_eq!(data.as_deref(), Some(&[0xFF, 0xD8, 0x01][..]));
+        // 一句 `OutgoingMessage::from(image)` 就能发
+        let message: OutgoingMessage = image.clone().into();
+        assert_eq!(message.segments.len(), 1);
     }
 }

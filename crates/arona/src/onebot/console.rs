@@ -173,12 +173,21 @@ fn format_segment(segment: &MessageSegment) -> String {
         }
         MessageSegment::Forward { title, .. } => format!("[合并转发:{title}]"),
         MessageSegment::Raw { kind, .. } => format!("[{kind}]"),
-        MessageSegment::Image { url, file, data } => {
+        MessageSegment::Image {
+            url,
+            file,
+            data,
+            file_id,
+        } => {
             if data.is_some() {
                 "[arona:image,url=base64://...]".to_string()
             } else {
                 match media_hint(url, file) {
-                    hint if hint.is_empty() => "[arona:image]".to_string(),
+                    // 三个槽都没内容时才轮到 file_id：控制台那行要看得出这条到底是哪张图
+                    hint if hint.is_empty() => match file_id.as_deref() {
+                        Some(id) if !id.is_empty() => format!("[arona:image,file_id={id}]"),
+                        _ => "[arona:image]".to_string(),
+                    },
                     hint => format!("[arona:image,{hint}]"),
                 }
             }

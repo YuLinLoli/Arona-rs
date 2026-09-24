@@ -15,6 +15,10 @@ pub enum MessageSegment {
         url: Option<String>,
         file: Option<String>,
         data: Option<Vec<u8>>,
+        /// 实现端给的图片标识：入站时它带回来（OneBot v11 的 `file_id`，部分实现写成
+        /// `substitute`），出站时框架照原样带上，同一张图就能复用已上传的那份而不重传。
+        /// 只有给过它的那个实现端认得，别家不认时按 `url`/`file` 那一路发（框架优先前者）。
+        file_id: Option<String>,
     },
     /// QQ 表情（实现端给的表情号）
     Face(String),
@@ -144,6 +148,7 @@ impl OutgoingMessage {
                 url: None,
                 file: Some(file.into()),
                 data: None,
+                file_id: None,
             }],
             revoke_after_millis: None,
         }
@@ -155,6 +160,21 @@ impl OutgoingMessage {
                 url: None,
                 file: None,
                 data: Some(data),
+                file_id: None,
+            }],
+            revoke_after_millis: None,
+        }
+    }
+
+    /// 复用实现端已经有的那张图（它给过的 `file_id`，mirai 的 `chain += Image`）：
+    /// 不再传字节，也不占一次上传。只有给过这个 id 的实现端认得它。
+    pub fn image_reuse(file_id: impl Into<String>) -> OutgoingMessage {
+        OutgoingMessage {
+            segments: vec![MessageSegment::Image {
+                url: None,
+                file: None,
+                data: None,
+                file_id: Some(file_id.into()),
             }],
             revoke_after_millis: None,
         }

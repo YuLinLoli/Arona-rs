@@ -93,10 +93,25 @@ pub fn segment_to_json(segment: &MessageSegment) -> Value {
         }),
         // 不认识的段原样拼回去：实现端加的新类型不该因为框架落后一版就消失
         MessageSegment::Raw { kind, data } => json!({ "type": kind, "data": data }),
-        MessageSegment::Image { url, file, data } => json!({
-            "type": "image",
-            "data": { "file": media_value(url, file, data.as_deref()) },
-        }),
+        MessageSegment::Image {
+            url,
+            file,
+            data,
+            file_id,
+        } => {
+            let id = file_id.as_deref().filter(|value| !value.is_empty());
+            let mut media = media_value(url, file, data.as_deref());
+            if media.is_empty() {
+                // 只给了 file_id 时把同一个值也写进 file 槽：NapCat 按 data.file_id 读这张
+                // 已上传的图，LLOWeb 按 data.file（可填 substitute）读，双写才两边都认
+                media = id.unwrap_or_default().to_string();
+            }
+            let mut segment = json!({ "type": "image", "data": { "file": media } });
+            if let Some(id) = id {
+                segment["data"]["file_id"] = json!(id);
+            }
+            segment
+        }
     }
 }
 
@@ -167,6 +182,9 @@ pub fn format_image(image: &MessageSegment) -> String {
         MessageSegment::Image {
             file: Some(file), ..
         } => format!("[arona:image,file={file}]"),
+        MessageSegment::Image {
+            file_id: Some(id), ..
+        } => format!("[arona:image,file_id={id}]"),
         _ => "[arona:image]".to_string(),
     }
 }
@@ -347,7 +365,15 @@ fn parse_segment(element: &Value) -> Option<MessageSegment> {
             .map(MessageSegment::Reply),
         "image" => {
             let (url, file, data) = media_parts(str_field("url"), str_field("file"));
-            Some(MessageSegment::Image { url, file, data })
+            // 先剔掉空串再退到 substitute：实现端常常两个键都给、其中一个是空的
+            let usable = |key: &str| str_field(key).filter(|value| !value.is_empty());
+            let file_id = usable("file_id").or_else(|| usable("substitute"));
+            Some(MessageSegment::Image {
+                url,
+                file,
+                data,
+                file_id,
+            })
         }
         "face" => Some(MessageSegment::Face(str_field("id").unwrap_or_default())),
         "record" | "voice" => Some(MessageSegment::Record {
@@ -549,7 +575,14 @@ pub fn decode_cq_message(raw: &str) -> Vec<MessageSegment> {
             },
             "image" => {
                 let (url, file, data) = media_parts(text_field("url"), text_field("file"));
-                Some(MessageSegment::Image { url, file, data })
+                let usable = |key: &str| text_field(key).filter(|value| !value.is_empty());
+                let file_id = usable("file_id").or_else(|| usable("substitute"));
+                Some(MessageSegment::Image {
+                    url,
+                    file,
+                    data,
+                    file_id,
+                })
             }
             "face" => Some(MessageSegment::Face(text_field("id").unwrap_or_default())),
             "reply" | "quote" => text_field("id")
@@ -1054,10 +1087,17 @@ mod tests {
             { "type": "image", "data": { "file": "base64:///9g=" } },
         ]));
         let segments = extract_segments(&event);
-        let MessageSegment::Image { url, file, data } = &segments[0] else {
+        let MessageSegment::Image {
+            url,
+            file,
+            data,
+            file_id,
+        } = &segments[0]
+        else {
             panic!("应为图片段：{segments:?}");
         };
         assert!(url.is_none() && file.is_none(), "url={url:?} file={file:?}");
+        assert!(file_id.is_none());
         assert_eq!(data.as_deref(), Some(&[0xFF, 0xD8][..]));
 
         // 解不动的字符串原样留在 file 槽，不猜成字节
@@ -1070,6 +1110,94 @@ mod tests {
         };
         assert!(data.is_none());
         assert_eq!(file.as_deref(), Some("base64://@@@"));
+    }
+
+    /// 复用已上传的那张图：出站只有 `file_id` 时 `file` 槽也要填上同一个值。
+    /// NapCat 按 `data.file_id` 读这张图，LLOWeb 按 `data.file`（可填 substitute）读，
+    /// 只写一边另一家就发出一张空图。
+    #[test]
+    fn outbound_file_id_writes_both_slots() {
+        let json = segment_to_json(&MessageSegment::Image {
+            url: None,
+            file: None,
+            data: None,
+            file_id: Some("E2A1B3C4".to_string()),
+        });
+        assert_eq!(
+            json,
+            json!({ "type": "image", "data": { "file": "E2A1B3C4", "file_id": "E2A1B3C4" } })
+        );
+    }
+
+    /// 直链还在时按直链发（各家都认），`file_id` 只是顺带捎上；都没给时不该凭空多出一个键
+    #[test]
+    fn outbound_url_still_wins_and_absent_id_adds_nothing() {
+        let both = segment_to_json(&MessageSegment::Image {
+            url: Some("https://x/a.png".to_string()),
+            file: None,
+            data: None,
+            file_id: Some("E2A1".to_string()),
+        });
+        assert_eq!(both["data"]["file"], json!("https://x/a.png"));
+        assert_eq!(both["data"]["file_id"], json!("E2A1"));
+
+        let plain = segment_to_json(&MessageSegment::Image {
+            url: Some("https://x/a.png".to_string()),
+            file: None,
+            data: None,
+            file_id: None,
+        });
+        assert_eq!(
+            plain,
+            json!({ "type": "image", "data": { "file": "https://x/a.png" } }),
+            "没有标识时不该塞一个 null 进去"
+        );
+    }
+
+    /// 入站：v11 写 `file_id`，也有实现端写 `substitute`，两个名字都要认；空串按没给处理
+    #[test]
+    fn inbound_image_picks_up_the_reuse_id() {
+        for (key, value) in [("file_id", "E2A1"), ("substitute", "SUB9")] {
+            let mut data = serde_json::Map::new();
+            data.insert("url".to_string(), json!("https://x/a.png"));
+            data.insert(key.to_string(), json!(value));
+            let segments = extract_segments(&message_event(json!([
+                { "type": "image", "data": data }
+            ])));
+            let MessageSegment::Image { file_id, .. } = &segments[0] else {
+                panic!("应为图片段：{segments:?}");
+            };
+            assert_eq!(file_id.as_deref(), Some(value), "{key} 应认得");
+        }
+
+        let segments = extract_segments(&message_event(json!([
+            { "type": "image", "data": { "file": "http://i/a.png", "file_id": "" } }
+        ])));
+        let MessageSegment::Image { file_id, .. } = &segments[0] else {
+            panic!("应为图片段：{segments:?}");
+        };
+        assert!(file_id.is_none(), "空串不该被当成一个有效标识");
+
+        // CQ 写法同样要带上，不然 [CQ:image,file_id=…] 那条路丢标识
+        let decoded = decode_cq_message("[CQ:image,file=http://i/a.png,file_id=E2A1]");
+        let MessageSegment::Image { file_id, .. } = &decoded[0] else {
+            panic!("应为图片段：{decoded:?}");
+        };
+        assert_eq!(file_id.as_deref(), Some("E2A1"));
+    }
+
+    /// 控制台里只给过标识的图要看得出"这是复用不是新传"
+    #[test]
+    fn console_shows_a_file_id_only_image() {
+        assert_eq!(
+            format_image(&MessageSegment::Image {
+                url: None,
+                file: None,
+                data: None,
+                file_id: Some("E2A1".to_string()),
+            }),
+            "[arona:image,file_id=E2A1]"
+        );
     }
 
     /// 实现端把引用段写成 `quote` 的也有（NapCat / Lagrange），要和 `reply` 认成同一段
@@ -1260,6 +1388,7 @@ mod tests {
                     url: Some("http://i/1.png".into()),
                     file: None,
                     data: None,
+                    file_id: None,
                 },
             ],
         }]);

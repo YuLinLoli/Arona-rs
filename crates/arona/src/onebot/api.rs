@@ -742,24 +742,30 @@ impl OneBotApi {
 
     // ==================== 群文件 ====================
 
-    /// `upload_group_file` 上传群文件：`file` 可以是本地路径、URL 或 base64
+    /// `upload_group_file` 上传群文件：`file` 可以是本地路径、URL 或 base64。
+    ///
+    /// 返回实现端给的 `file_id`——分享（`MessageSegment::File`）与删除都要认它，之前这个
+    /// 返回值被 `call_ok` 丢掉了，等于逼插件再调一次 `get_group_root_files` 去找回来。
+    /// 实现端没回（各家行为不一，且没回 data 也算成功）时是 `None`。
     pub async fn upload_group_file(
         &self,
         group_id: i64,
         file: &str,
         name: &str,
         folder_id: Option<&str>,
-    ) -> Result<(), OneBotError> {
-        self.call_ok(
-            "upload_group_file",
-            params! {
-                "group_id" => json!(group_id),
-                "file" => json!(file),
-                "name" => json!(name),
-                "folder_id" => opt(&folder_id.map(str::to_string)),
-            },
-        )
-        .await
+    ) -> Result<Option<String>, OneBotError> {
+        let data = self
+            .call(
+                "upload_group_file",
+                params! {
+                    "group_id" => json!(group_id),
+                    "file" => json!(file),
+                    "name" => json!(name),
+                    "folder_id" => opt(&folder_id.map(str::to_string)),
+                },
+            )
+            .await?;
+        Ok(non_empty_field(&data, "file_id"))
     }
 
     /// `get_group_root_files` 群根目录
@@ -907,6 +913,15 @@ fn message_id(data: &Value) -> i64 {
     data.get("message_id")
         .and_then(|v| v.as_i64())
         .unwrap_or_default()
+}
+
+/// 实现端回的一个字符串字段：没回 data、回了 null、回了空串都算 `None`。
+/// `retcode=1`（异步受理）时 data 常常整个缺席，所以这类"要拿住以后再用"的 id 不能假设必有。
+fn non_empty_field(data: &Value, key: &str) -> Option<String> {
+    data.get(key)
+        .and_then(|v| v.as_str())
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
 }
 
 // ==================== 返回值类型 ====================

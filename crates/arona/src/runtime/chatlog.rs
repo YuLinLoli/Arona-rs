@@ -55,6 +55,8 @@ CREATE TABLE IF NOT EXISTS chat_message (
 );
 CREATE INDEX IF NOT EXISTS idx_chat_time ON chat_message(time);
 CREATE INDEX IF NOT EXISTS idx_chat_real ON chat_message(real_id);
+CREATE INDEX IF NOT EXISTS idx_chat_grp ON chat_message(grp, time);
+CREATE INDEX IF NOT EXISTS idx_chat_qq ON chat_message(qq, time);
 "#;
 
 /// 聊天记录库的持有者。挂在 [`Framework`] 实例上而不是进程级 `static`，理由与
@@ -280,6 +282,88 @@ impl ChatLog {
         self.query(|conn| conn.execute("DELETE FROM chat_message WHERE time < ?1", params![cutoff]))
             .unwrap_or(0) as i64
     }
+
+    /// 往前翻某个会话的留档（mirai 的 `group.history` / `user.history`）。
+    /// `before` 传上一页的游标，`None` 表示从最新一条开始；结果按时间**从新到旧**排。
+    ///
+    /// 只读框架自己这份库，不发协议请求：实现端的历史它从没听过，`chatlog.enable=false`
+    /// 时更是空表，所以这条查的是"机器人上线以来见过的话"，不是QQ 服务器上的聊天记录。
+    pub fn recent(
+        &self,
+        scope: HistoryScope,
+        limit: i64,
+        before: Option<HistoryCursor>,
+    ) -> HistoryPage {
+        let limit = limit.clamp(1, HISTORY_LIMIT);
+        // 两个维度都要"精确匹配或不设限"：私聊就是 grp=0 那几条，不能把同一个人在群里
+        // 说的话也捞进来，所以"不限"用 -1 表示，而不是拿 0 当通配（0 正是私聊的 grp 值）。
+        let (grp, qq) = match scope {
+            HistoryScope::Group(group) => (group, -1),
+            HistoryScope::Private(user) => (0, user),
+        };
+        // 游标同样用 -1 当"不限制"的哨兵：0 是个合法时间戳，拿它当哨兵会把第一页判成翻完了。
+        // 同一秒内按 message_id 倒着走，否则同秒的几条会被游标跳过或重复取到。
+        let (at, last_id) = before.map_or((-1, 0), |cursor| (cursor.time, cursor.message_id));
+        let records = self
+            .query(|conn| {
+                let mut statement = conn.prepare(
+                    "SELECT message_id, real_id, grp, qq, from_bot, name, time, text, image
+             FROM chat_message
+             WHERE grp = ?1 AND (?2 < 0 OR qq = ?2)
+               AND (?3 < 0 OR time < ?3 OR (time = ?3 AND message_id < ?4))
+             ORDER BY time DESC, message_id DESC
+             LIMIT ?5",
+                )?;
+                let rows =
+                    statement.query_map(params![grp, qq, at, last_id, limit], row_to_record)?;
+                rows.collect::<rusqlite::Result<Vec<ChatRecord>>>()
+            })
+            .unwrap_or_default();
+        HistoryPage { records }
+    }
+}
+
+/// 单次翻页的条数上限：一句插件不该能把整库拉进内存
+const HISTORY_LIMIT: i64 = 200;
+
+/// 历史翻页的游标：上一页最后（也就是最旧）那条的时间与消息号
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HistoryCursor {
+    pub time: i64,
+    pub message_id: i64,
+}
+
+/// 翻历史的目标会话（mirai 的 `Group` 与 `User` 两档）。
+/// 私聊在库里记成 `grp=0` + 发送者 qq，群内某人说的话要用 [`HistoryScope::Group`] 再自己筛。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HistoryScope {
+    /// 某个群的消息
+    Group(i64),
+    /// 与某个人的私聊
+    Private(i64),
+}
+
+/// 一次 [`ChatLog::recent`] 拿回的那页，按时间从新到旧排
+pub struct HistoryPage {
+    pub records: Vec<ChatRecord>,
+}
+
+impl HistoryPage {
+    /// 翻下一页的游标；空页给 None，据此就能判断"到头了"
+    pub fn cursor(&self) -> Option<HistoryCursor> {
+        self.records.last().map(|record| HistoryCursor {
+            time: record.time,
+            message_id: record.message_id,
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.records.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
 }
 
 fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatRecord> {
@@ -452,10 +536,19 @@ impl ChatLog {
         Some(record)
     }
 
-    /// 还原引用里的图片：本地文件看还在不在，网络直链先探一次活
+    /// 还原引用里的图片：实现端给过图片标识的直接带回去，本地文件看还在不在，网络直链先探一次活
     async fn image_segment(&self, record: &ChatRecord) -> Option<MessageSegment> {
         if record.image.is_empty() {
             return None;
+        }
+        if let Some(id) = record.image.strip_prefix(FILE_ID_SCHEME) {
+            // 这不是一条可探活的 URL：取不取得到只有实现端自己知道，原样带回就是最稳的写法
+            return Some(MessageSegment::Image {
+                url: None,
+                file: None,
+                data: None,
+                file_id: Some(id.to_string()),
+            });
         }
         if is_web(&record.image) {
             return self
@@ -465,12 +558,14 @@ impl ChatLog {
                     url: Some(record.image.clone()),
                     file: None,
                     data: None,
+                    file_id: None,
                 });
         }
         local_alive(&record.image).then(|| MessageSegment::Image {
             url: None,
             file: Some(record.image.clone()),
             data: None,
+            file_id: None,
         })
     }
 
@@ -597,6 +692,9 @@ pub trait ChatLogFace: Send + Sync {
     ) -> BoxFuture<'_, Option<Vec<MessageSegment>>>;
     fn recall_id(&self, message_id: i64) -> i64;
     fn recall(&self, message_id: i64) -> BoxFuture<'_, Result<(), OneBotError>>;
+    /// 追加在**末尾**：vtable 前面那批槽位不能因为加方法而挪位（旧 dll 是按编译期下标调的）
+    fn recent(&self, scope: HistoryScope, limit: i64, before: Option<HistoryCursor>)
+    -> HistoryPage;
 }
 
 impl ChatLogFace for ChatLog {
@@ -656,6 +754,14 @@ impl ChatLogFace for ChatLog {
     }
     fn recall(&self, message_id: i64) -> BoxFuture<'_, Result<(), OneBotError>> {
         Box::pin(ChatLog::recall(self, message_id))
+    }
+    fn recent(
+        &self,
+        scope: HistoryScope,
+        limit: i64,
+        before: Option<HistoryCursor>,
+    ) -> HistoryPage {
+        ChatLog::recent(self, scope, limit, before)
     }
 }
 
@@ -743,18 +849,37 @@ pub async fn recall(message_id: i64) -> Result<(), OneBotError> {
     host().recall(message_id).await
 }
 
+/// 往前翻某个会话的留档（见 [`ChatLog::recent`]）
+pub fn recent(scope: HistoryScope, limit: i64, before: Option<HistoryCursor>) -> HistoryPage {
+    host().recent(scope, limit, before)
+}
+
 // ==================== 小工具 ====================
 
-/// 消息段里第一张图的地址（原链接优先，其次实现端给的本地路径）
+/// 消息段里第一张图的地址（原链接优先，其次实现端给的本地路径，再退到它给的图片标识）。
+/// 只有 `file_id` 时存成 `fileid://<id>`：库里那一列永远是一个可直接还原的字符串，
+/// 而 QQ 的图床直链会过期，`file_id` 反而是三者里最耐用的那个。
 fn first_image(segments: &[MessageSegment]) -> Option<String> {
     segments.iter().find_map(|segment| match segment {
-        MessageSegment::Image { url, file, .. } => url
+        MessageSegment::Image {
+            url, file, file_id, ..
+        } => url
             .clone()
             .or_else(|| file.clone())
+            .or_else(|| {
+                file_id
+                    .as_deref()
+                    .filter(|value| !value.is_empty())
+                    .map(|value| format!("{FILE_ID_SCHEME}{value}"))
+            })
             .filter(|value| !value.is_empty()),
         _ => None,
     })
 }
+
+/// 库里那一列用来标记"这是实现端给的图片标识，不是 URL 也不是本地路径"。
+/// 框架内两处要认它：本模块还原引用时，和 [`crate::bot::Image::from_stored`]。
+pub(crate) const FILE_ID_SCHEME: &str = "fileid://";
 
 /// 记录用文本：图片另存 `image` 列，引用段只是"回复谁"，都不必混进正文
 fn record_text(segments: &[MessageSegment]) -> String {
@@ -845,6 +970,7 @@ mod tests {
                 url: Some("https://x.example/a.png".to_string()),
                 file: Some("/tmp/cache.png".to_string()),
                 data: None,
+                file_id: Some("FD1".to_string()),
             },
         ];
         assert_eq!(
@@ -859,8 +985,31 @@ mod tests {
             url: None,
             file: Some("D:/arona/a.png".to_string()),
             data: None,
+            file_id: None,
         }];
         assert_eq!(first_image(&segments).as_deref(), Some("D:/arona/a.png"));
+    }
+
+    /// 三家实现端里只有 NTQQ 系会顺手给 file_id，且常常只给这个（URL 与路径都空）。
+    /// 库里那一列必须能把它还原回来，否则"图片过期回复"对这类实现端等于失明。
+    #[test]
+    fn inbound_image_with_only_a_file_id_is_kept_recoverable() {
+        let segments = vec![MessageSegment::Image {
+            url: None,
+            file: None,
+            data: None,
+            file_id: Some("E2A1B3C4".to_string()),
+        }];
+        assert_eq!(first_image(&segments).as_deref(), Some("fileid://E2A1B3C4"));
+
+        // 三个槽全空（只给了 base64 或什么都没给）时不该存出一堆前缀空串
+        let empty = vec![MessageSegment::Image {
+            url: Some(String::new()),
+            file: None,
+            data: None,
+            file_id: Some(String::new()),
+        }];
+        assert_eq!(first_image(&empty), None);
     }
 
     #[test]
@@ -902,6 +1051,7 @@ mod tests {
                 url: Some("https://x/a.png".to_string()),
                 file: None,
                 data: None,
+                file_id: None,
             },
             MessageSegment::At(20002),
         ]);
@@ -924,6 +1074,26 @@ mod tests {
         ));
     }
 
+    /// 库里那一列带 `fileid://` 前缀时，还原出来必须是**只带 file_id** 的图片段：
+    /// 既没有可探活的 URL，也不该去文件系统里找一个不存在的路径。
+    #[tokio::test]
+    async fn stored_file_id_restores_without_probing() {
+        let record = ChatRecord {
+            text: "看图".to_string(),
+            image: "fileid://E2A1B3C4".to_string(),
+            ..Default::default()
+        };
+        let segment = ChatLog::default()
+            .image_segment(&record)
+            .await
+            .expect("fileid 前应直接还原，不看网络也不看磁盘");
+        assert!(
+            matches!(&segment, MessageSegment::Image { file_id, url, file, .. }
+                if file_id.as_deref() == Some("E2A1B3C4") && url.is_none() && file.is_none()),
+            "还原结果：{segment:?}"
+        );
+    }
+
     #[test]
     fn restored_quote_reuses_the_stored_image_link() {
         let record = ChatRecord {
@@ -935,6 +1105,7 @@ mod tests {
             url: Some("https://x/a.png".to_string()),
             file: None,
             data: None,
+            file_id: None,
         });
         let segments = restored_segments(&record, alive);
         assert_eq!(segments.len(), 2, "文字头 + 图");
@@ -1085,6 +1256,91 @@ mod tests {
         assert!(find(4100).is_some(), "保留期内的记录不该被清理误伤");
 
         close();
+        let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_file(format!("{}-wal", file.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", file.display()));
+    }
+
+    /// mirai 的 `group.history` 那套语义：按会话翻、从新到旧、游标续页不重不漏、别家会话不串台。
+    /// 用**私有实例**而不是 `open()` 那组自由函数：全局库只有一个 `Connection`，
+    /// 和同模块别的用它的用例并行跑会互相把连接换掉，谁先跑完全看调度。
+    #[test]
+    fn history_pages_backwards_without_gaps_or_overlaps() {
+        let file = std::env::temp_dir().join(format!(
+            "arona-chatlog-hist-{}-{}.db",
+            std::process::id(),
+            now_secs()
+        ));
+        let chatlog = ChatLog::default();
+        assert!(chatlog.open(&file), "临时库应能打开");
+        let now = now_secs();
+        for (id, group, qq, time) in [
+            (5001, 900000001, 20002, now),
+            (5002, 900000001, 20003, now),
+            (5003, 900000001, 20002, now - 10),
+            (5004, 900000002, 20002, now - 1),
+            (5005, 0, 20002, now - 2),
+        ] {
+            chatlog.remember(&ChatRecord {
+                message_id: id,
+                group,
+                qq,
+                time,
+                text: format!("m{id}"),
+                ..Default::default()
+            });
+        }
+
+        let first = chatlog.recent(HistoryScope::Group(900000001), 2, None);
+        assert_eq!(first.len(), 2, "一页两条");
+        assert_eq!(
+            first
+                .records
+                .iter()
+                .map(|record| record.message_id)
+                .collect::<Vec<_>>(),
+            vec![5002, 5001],
+            "从新到旧；同一秒里按 message_id 倒着走"
+        );
+
+        let second = chatlog.recent(HistoryScope::Group(900000001), 2, first.cursor());
+        assert_eq!(second.records[0].message_id, 5003, "游标续上下一页");
+        assert!(
+            chatlog
+                .recent(HistoryScope::Group(900000001), 2, second.cursor())
+                .is_empty(),
+            "翻到头该给空页，cursor() 也随之为 None"
+        );
+        assert_eq!(second.cursor().map(|cursor| cursor.message_id), Some(5003));
+
+        assert_eq!(
+            chatlog
+                .recent(HistoryScope::Private(20002), 10, None)
+                .records
+                .iter()
+                .map(|record| record.message_id)
+                .collect::<Vec<_>>(),
+            vec![5005],
+            "私聊只回 grp=0 那几条，别把同一个人在群里说的话捞进来"
+        );
+        assert_eq!(
+            chatlog
+                .recent(HistoryScope::Group(900000002), 10, None)
+                .len(),
+            1,
+            "别的群不该串进来"
+        );
+
+        // limit 收到上限：一句插件不该能把整库拉进内存
+        assert!(
+            chatlog
+                .recent(HistoryScope::Group(900000001), 100_000, None)
+                .len()
+                <= HISTORY_LIMIT as usize,
+            "翻页条数应被 HISTORY_LIMIT 夹住"
+        );
+
+        chatlog.close();
         let _ = std::fs::remove_file(&file);
         let _ = std::fs::remove_file(format!("{}-wal", file.display()));
         let _ = std::fs::remove_file(format!("{}-shm", file.display()));
