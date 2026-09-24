@@ -230,6 +230,52 @@ impl AronaPlugin for HelloPlugin {
             ])
             .with_permission(Permission::GroupAdmin)
             .with_feature(FEATURE),
+            // 写法三：命令体里直接用自己的 tokio 计时器。dll 静态链接了独立的一份 tokio，
+            // 上下文是 thread-local 的，宿主那份标记点不到这里——框架在 handler 边界按帧
+            // 补装（`runtime::reactor::scoped`），所以插件侧一句 `sleep` 不需要任何绕法。
+            CommandRegistration::new(
+                vec!["/示例延时".into()],
+                "命令体里睡几秒再回话，验证插件自己那份 tokio 的计时器可用",
+                handler(|_context, arguments| async move {
+                    let secs = arguments
+                        .first()
+                        .and_then(|raw| raw.parse::<u64>().ok())
+                        .unwrap_or(2)
+                        .min(30);
+                    tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+                    Some(OutgoingMessage::text(format!(
+                        "睡了 {secs} 秒。这条回话用的是插件自己那份 tokio 的计时器。"
+                    )))
+                }),
+            )
+            .with_feature(FEATURE),
+            // 联网走框架的预制方法：dll 里不必链接 reqwest，连接池和 hyper 自己派生的后台任务
+            // 都跑在宿主那份 runtime 上，插件只管把 URL 递过去、等一只 oneshot 回话。
+            CommandRegistration::new(
+                vec!["/示例联网".into()],
+                "请框架代发一次 GET，插件不自带 HTTP 客户端",
+                handler(|_context, arguments| async move {
+                    let url = arguments
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| "http://127.0.0.1:9002/ping".to_string());
+                    Some(
+                        match arona::runtime::http::get(&url, &[] as &[(&str, &str)]).await {
+                            Ok(text) => {
+                                let head: String = text.chars().take(120).collect();
+                                OutgoingMessage::text(format!(
+                                    "框架代发成功，响应 {} 字节：{head}",
+                                    text.len()
+                                ))
+                            }
+                            Err(reason) => {
+                                OutgoingMessage::text(format!("框架代发失败：{reason}"))
+                            }
+                        },
+                    )
+                }),
+            )
+            .with_feature(FEATURE),
         ]);
 
         // 事件钩子：按**子类**订阅，且绑在功能开关上——这个群关掉「示例」时它一起停。

@@ -759,6 +759,41 @@ api.delete_msg(message_id).await?;
 返回值结构体都用 `serde(default)` + `rest` 收未知字段：实现端少回某字段不会失败，多回的字段也拿得到。
 `Option` 入参传 `None` 时**不会**塞进 JSON，免得实现端把 `null` 当成有效值。
 
+### 14.1 出站 HTTP：用框架的客户端，别自带 reqwest
+
+插件要访问普通网页或第三方 API（不是 OneBot 动作）时用 `arona::runtime::http`：
+
+```rust
+use std::time::Duration;
+
+// GET 一段文本
+let text = arona::runtime::http::get(url, &[("referer", referer)]).await?;
+// GET 一段二进制（头像、攻略图）
+let bytes = arona::runtime::http::get_bytes(url, &[] as &[(&str, &str)]).await?;
+// 表单 POST / JSON POST
+let reply = arona::runtime::http::post_form(url, &[] as &[(&str, &str)], &[("id", "12")]).await?;
+let echo  = arona::runtime::http::post_json(url, &[] as &[(&str, &str)], r#"{"a":1}"#).await?;
+// 要超时、要自定义正文类型就走 Request
+let raw = arona::runtime::http::send(
+    arona::runtime::http::Request::get(url)
+        .with_header("x-game", "ba")
+        .with_timeout(Duration::from_secs(8)),
+)
+.await?;
+```
+
+一律返回 `Result<_, String>`：非 2xx、连不上、超时都算失败，原因里带着 URL，`?` 和 `match` 都顺手。
+未指定超时用的是宿主的 60 秒。
+
+**为什么不让插件自己 `reqwest::Client`**：dll 把 reqwest/hyper/tokio 静态链接成了第二份，而 hyper
+会自己 `tokio::spawn` 后台任务（补连接、空闲驱逐）——框架只能给"自己投出去的任务"逐帧补装上下文，
+管不到第三方库内部派生的那些。实测结果是插件**开着连接池**发请求就炸 `there is no reactor running`，
+而且炸在池子的锁里，之后每个请求都跟着废掉。走这条路的请求由**宿主那份**客户端发出、跑在宿主的常驻
+runtime 上，连接池和 keepalive 全开也不会炸；插件的 `Cargo.toml` 因此不必带 `reqwest`，dll 还小一圈。
+原理与实证见 §22。
+
+宿主自己（以及从没被装载过的单元测试）没有这道边界，同一套函数直接落到本地客户端，写法一个字都不用改。
+
 ## 15. 新增一个插件
 
 插件是**独立仓库、独立 crate**：不进框架的 workspace，也不需要框架侧改任何文件。
@@ -790,7 +825,8 @@ api.delete_msg(message_id).await?;
    ```
 
    宏负责导出四个 C 符号（`arona_plugin_abi` / `arona_plugin_toolchain` / `arona_plugin_host` /
-   `arona_plugin_new`），框架靠它们完成握手、把宿主的进程实例与日志出口交进 dll，再取出实例。
+   `arona_plugin_new`），框架靠它们完成握手、把宿主的进程实例、日志出口和 HTTP 代发通道交进 dll，
+   再取出实例。
    **插件不要写 `main`、也不提供任何可执行入口**——
    插件只能被框架装载、不能独立运行，这点与 mirai 一致。
 4. 构建并投放：
@@ -806,7 +842,7 @@ api.delete_msg(message_id).await?;
 装载成功的标志是这三行日志：
 
 ```
-[Arona] 插件 ABI 握手通过: 布局 2，契约 1.0.0
+[Arona] 插件 ABI 握手通过: 布局 3，契约 1.0.0
 [Arona] 已装载动态插件: HelloPlugin 0.1.0 (hello_plugin.dll)
 [Arona] 插件已启动: HelloPlugin v0.1.0
 ```
@@ -1117,7 +1153,7 @@ mirai 的插件和框架在同一个 ClassLoader 树里，`MiraiInstance` 只有
 **静态链接成了自己的第二份**，于是 `Framework::global()`、日志文件句柄、tokio 句柄这些进程级状态
 天生有两套，插件写进自己那套宿主永远看不见——表现为"命令登记了却没人路由"这种最难查的静默失效。
 
-装载器在握手通过之后、造实例之前，把宿主真正在跑的三样东西交给插件（`export_arona_plugin!` 生成的
+装载器在握手通过之后、造实例之前，把宿主真正在跑的四样东西交给插件（`export_arona_plugin!` 生成的
 `arona_plugin_host` 符号，接管失败直接拒载）：
 
 | 交出去的东西 | 插件侧的效果 |
@@ -1125,43 +1161,36 @@ mirai 的插件和框架在同一个 ClassLoader 树里，`MiraiInstance` 只有
 | 宿主的进程默认实例 | `arona::quartz::*`、`arona::container::instance()`、`arona::plugin::manager()` 等自由函数全部落到宿主那套注册表 |
 | 宿主的日志出口 | `arona::runtime::log::info(..)` 进同一个日志文件、同一个 GUI 实时日志，来源标注仍按 `[插件名:动作]` |
 | 宿主登记的 tokio 句柄 | 在 GUI 主线程上装配插件时（面板里关掉再打开），`ctx.spawn` / 定时任务照样投得出去 |
+| 宿主的 HTTP 代发通道 | `arona::runtime::http::*`（§14.1）把请求递给宿主那份 reqwest，插件不必自带客户端 |
 
 所以**插件写起来和同仓静态编译时一样**：能用 `ctx` 就用 `ctx`（下面那条禁令的真实含义），
 偶尔用到进程级自由函数也不会静默失效。接管由宏与装载器完成，插件代码里没有任何对应的手续。
 
-#### 但 `tokio::` 直接调用还是要绕一下
+#### 两份 tokio：哪些调用能直接用
 
 tokio 也被静态链接成了两份，而"当前在哪个运行时里"这个上下文是**线程局部**的——宿主只能在
-它自己那份 tokio 的 thread-local 上打标记，dll 那份天生是空的。框架因此在投递任务时套了一层
-`poll_fn`，**每轮询一帧**就按任务自己那份 tokio 短暂补装一次上下文（`EnterGuard` 不是 `Send`，
-跨 `await` 持有它会连任务一起变得不能发送），于是：
+它自己那份 tokio 的 thread-local 上打标记，dll 那份天生是空的。框架因此在**每一个由宿主亲自 poll
+的插件回调边界**（命令、类型化命令、兜底、事件钩子、出站钩子）和**每一个 `ctx.spawn` 投出去的
+任务**上套了一层 `poll_fn`，**每轮询一帧**就按任务自己那份 tokio 短暂补装一次上下文（`EnterGuard`
+不是 `Send`，跨 `await` 持有它会连任务一起变得不能发送）。于是：
 
-- **`ctx.spawn` / `ctx.spawn_as` / `arona::quartz` 的任务体里**：`tokio::time::sleep`、`tokio::select!`
-  这些都能正常用（当前这一帧刚被点亮）。要写会等待、会发请求的逻辑，走这条路。
-- **命令与钩子的 async 体里**：那段 future 由宿主直接 poll，宿主的补装覆盖不到它，
-  直接 `tokio::time::sleep(..)` 有概率炸「there is no reactor running」。需要延时或重试就把那截
-  挪进 `ctx.spawn_as("动作名", async { .. })`，或者用框架预制的服务方法（§14 的收发接口、
-  `arona::services::*`）——它们在宿主侧执行，用的就是宿主那份 tokio。
+- **命令与钩子的 async 体里**：`tokio::time::sleep`、`tokio::select!` 直接写。示例插件的
+  `/示例延时` 就是在 dll 里睡三秒再回话，那条链路是端到端验过的。
+- **`ctx.spawn` / `ctx.spawn_as` / `arona::quartz` 的任务体里**：同样点亮，要等待要重试的逻辑
+  随时可以写在里面。
 
-##### 依赖库自己 `tokio::spawn` 的那一类
+补装只发生在**框架投出去、或者框架亲自 poll 的任务**上。第三方库自己 `tokio::spawn` 的常驻后台
+任务不在这条链上，它第二次醒来时脚下那份 tokio 又空了。实测的一例：`reqwest` 0.12（hyper-util
+0.1.20）**开着连接池**时，会把"后台补连接""空闲驱逐"交给 `TokioExecutor::execute` → dll 那份
+`tokio::spawn` → panic；panic 发生在池子的锁里，于是紧接着每次 `checkout` 都炸 `PoisonError`，
+整条出站链路废掉。
 
-补装只发生在**框架投出去的任务**上。第三方库自己 `tokio::spawn` 的常驻后台任务不在这条链上，
-它第二次醒来时脚下那份 tokio 又空了。实测的一例：`reqwest` 0.12（hyper-util 0.1.20）**开着连接池**
-时，会把"后台补连接""空闲驱逐"交给 `TokioExecutor::execute` → dll 那份 `tokio::spawn` → panic；
-panic 发生在池子的锁里，于是紧接着每次 `checkout` 都炸 `PoisonError`，整条出站链路废掉。插件侧
-一行配置就绕开了：
-
-```rust
-reqwest::Client::builder()
-    .timeout(Duration::from_secs(60))
-    .pool_max_idle_per_host(0) // 关池：hyper 走「直接连接」那条路，不再派生后台任务
-    .build()?;
-```
-
-代价是每个请求多一次 TCP+TLS 握手。判断自己是不是踩了这类坑：panic 栈上有
-`tokio::task::spawn::spawn` 与某个第三方库的 `execute`，而**你的代码一帧都不在栈上**。
-除了关掉库的后台任务，另一条路是别自带这套依赖——凡"进程级只该有一份"的东西
-（连接池、全局定时器、驱动线程）都优先用框架暴露的方法拿，宿主那份 tokio 是常驻点亮的。
+这类坑不该靠插件侧调参数去绕。`Client::builder().pool_max_idle_per_host(0)`（关池，让 hyper 走
+"直接连接"那条路，不再派生后台任务）是能绕过，代价是每个请求多一次 TCP+TLS 握手，而且只对
+试过的这一版 reqwest 有效。所以框架把 HTTP 收成了一道预制方法（§14.1）：请求由宿主那份客户端
+发出，跑在宿主常驻点亮的 runtime 上，插件不必带 `reqwest`。判断自己是不是踩了这类坑：panic 栈上
+有 `tokio::task::spawn::spawn` 与某个第三方库的 `execute`，而**你的代码一帧都不在栈上**。结论一样：
+凡"进程级只该有一份"的东西（连接池、全局定时器、驱动线程）都优先用框架暴露的方法拿。
 
 ### 握手核对的五项
 
@@ -1203,9 +1232,10 @@ reqwest::Client::builder()
   `runtime::priority` 等——不在此列，它们不碰注册表。）
 - **不要裸 `tokio::spawn`**：用 `ctx.spawn(..)` / `ctx.spawn_as(..)`，否则停用时收不掉它。
   确实需要 runtime 句柄时走 `arona::runtime::reactor`，那是刻意留在进程级的那一份。
-- **命令与钩子的 async 体里不要直接碰 `tokio::`**（`time::sleep`、`select!`、自带的 `reqwest` 都算）：
-  dll 那份 tokio 的线程局部上下文没人在那里点亮，表现为**偶发**的「there is no reactor running」。
-  要等待要发请求，挪进 `ctx.spawn_as(..)` 的后台任务，或用框架预制的服务方法——上一小节写了原理。
+- **不要自带 HTTP 客户端**：出站请求走 `arona::runtime::http`（§14.1）。dll 里那份 reqwest 只要
+  开着连接池，就会在 hyper 自己派生的后台任务上炸「there is no reactor running」，上一小节的
+  实测写着原因。命令与钩子的 async 体里 `tokio::time::sleep`、`select!` 这些**可以**直接写，
+  框架在回调边界按帧补装过上下文；不行的只有库自己 `spawn` 出去的那一类。
 - **不要 `std::panic::set_hook`、不要 `std::process::exit`、不要改全局 locale/时区**：
   你和宿主活在同一个进程里。框架确实在每个入口都 `catch_unwind`（§20），但那是兜底，不是许可。
 - **不要假设自己会最后一个退出**：停用只是回收资源，模块常驻。

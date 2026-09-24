@@ -8,6 +8,8 @@ pub mod crash;
 pub mod dispatcher;
 /// 管理员权限申请（Windows UAC 提权）
 pub mod elevate;
+/// 框架内置的 HTTP 出口：插件请宿主代发，自己不必带 reqwest
+pub mod http;
 pub mod log;
 pub mod message;
 pub mod paths;

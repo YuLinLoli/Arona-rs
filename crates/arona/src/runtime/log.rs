@@ -323,6 +323,7 @@ pub(crate) fn host_bridge() -> &'static HostBridge {
         log: relay,
         framework: host_framework,
         runtime: crate::runtime::reactor::host_handle,
+        http: crate::runtime::http::host_submit,
     })
 }
 

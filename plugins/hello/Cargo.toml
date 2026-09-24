@@ -16,6 +16,9 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 # 插件只依赖框架本体，gui 由 host 决定；把 default-features 关掉才不会把 eframe 拖进来
 arona = { path = "../../crates/arona", version = "1.0.0", default-features = false }
+# 直接 tokio::time::sleep 的那条示例命令要用它：真实插件多半也自带 tokio，
+# 而 dll 里这份 tokio 与宿主那份是两套 thread-local 上下文，框架负责在回调边界补装
+tokio = { workspace = true }
 serde = { workspace = true }
 
 [dev-dependencies]

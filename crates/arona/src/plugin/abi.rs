@@ -6,7 +6,7 @@
 //! 全局静态量（`Framework::global()`、日志 sink、任务表）。若插件用裸 `tokio::spawn`
 //! 或自行 `arona::plugin::manager()`，写的就是 dll 自己那份表，宿主看不见——静默失效。
 //! 因此本框架的契约是：装载 dll 后，宿主第一时间把自己的**进程默认实例、日志出口、
-//! tokio 句柄**通过 [`HostBridge`] 交回插件（[`export_arona_plugin!`] 生成的
+//! tokio 句柄、HTTP 代发入口**通过 [`HostBridge`] 交回插件（[`export_arona_plugin!`] 生成的
 //! `arona_plugin_host` 符号），插件里那一份静态状态当场改指宿主。此后插件无论走
 //! [`PluginContext`](super::PluginContext) 还是走 `arona::quartz::*` 这类自由函数，
 //! 读写的都是宿主真正在跑的那套表——跨边界传递的 `Arc<dyn AronaPlugin>`
@@ -34,7 +34,10 @@ use std::ffi::c_void;
 use std::os::raw::c_char;
 
 /// 本模块约定的符号布局版本。签名有任何改动都要抬它，宿主只接受相等的 dll。
-pub const ABI_LAYOUT: u32 = 2;
+///
+/// 2 = 上行通道 [`HostBridge`] 带日志/默认实例/tokio 句柄三项；
+/// 3 = 再多一项：宿主代发 HTTP（[`HostBridge::http`]）。
+pub const ABI_LAYOUT: u32 = 3;
 
 /// 装载器名（写进 `plugins/<id>/plugin.yml` 的 `loader:` 与 GUI 插件列表）
 pub const DYNAMIC_LOADER: &str = "dynamic";
@@ -107,8 +110,66 @@ pub fn check_abi(packed: u64, toolchain: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// 一段字节：指针 + 长度，不靠 NUL 结尾。
+///
+/// 这样既没有"正文里不许出现 0 字节"这种约束，宿主也不必像读 C 字符串那样扫过末尾——
+/// 长度由插件自己报，读越界最多是它自己的内存出事，牵不到宿主身上。
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct HttpText {
+    pub ptr: *const u8,
+    pub len: usize,
+}
+
+/// 一对键值（请求头或表单项）
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct HttpPair {
+    pub name: HttpText,
+    pub value: HttpText,
+}
+
+/// 插件请宿主代发的一次 HTTP 请求（面向插件的封装见 [`crate::runtime::http`]）。
+///
+/// 各段字节只指向插件自己内存里的那份值，**只需在本次调用期间有效**：宿主在返回之前
+/// 就把它们拷成自己的值，插件随后即可释放。
+/// 字段顺序与类型本身就是 ABI 的一部分，改动必须抬 [`ABI_LAYOUT`]。
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct HttpCall {
+    /// 0 = GET，1 = POST
+    pub method: u8,
+    /// 0 = 不带正文，1 = 表单项（`form`），2 = 原始正文（`body` + `content_type`）
+    pub body_kind: u8,
+    pub url: HttpText,
+    /// 空数组时给空指针，`header_count` 为 0
+    pub headers: *const HttpPair,
+    pub header_count: usize,
+    pub form: *const HttpPair,
+    pub form_count: usize,
+    /// `body_kind = 2` 时的正文与其 content-type，其余情况给空片段
+    pub body: HttpText,
+    pub content_type: HttpText,
+    /// 超时毫秒数；0 表示用宿主的默认值
+    pub timeout_ms: u64,
+}
+
+/// 宿主代发完成后回调插件：`error_len` 非 0 即为失败原因，成功时响应字节在
+/// `body`/`body_len` 里。`user` 原样带回插件提交时给的那个指针。
+///
+/// 两段缓冲**只在这次调用期间有效**，插件要用得当场拷走。宿主保证**每次提交恰好回调一次**
+/// （解析失败、运行时还没起来这类就地报错也一样补一次回调），插件因此可以把 `user`
+/// 当作一次性凭据，在回调里连同自己那份上下文一起销毁。
+pub type HttpDone = extern "C" fn(
+    user: *mut c_void,
+    error: *const u8,
+    error_len: usize,
+    body: *const u8,
+    body_len: usize,
+);
+
 /// 宿主交给插件的**上行通道**：插件 dll 里静态链接的那份框架状态是空的，
-/// 装载时把宿主真正在跑的三样东西接过来，插件里的自由函数才不落空表。
+/// 装载时把宿主真正在跑的东西接过来，插件里的自由函数才不落空表。
 ///
 /// 字段顺序与签名就是 ABI 的一部分，改动必须抬 [`ABI_LAYOUT`]。
 #[repr(C)]
@@ -122,10 +183,13 @@ pub struct HostBridge {
     pub framework: extern "C" fn() -> *const c_void,
     /// 宿主登记的 tokio 句柄（`*const Handle`），没有则返回空指针
     pub runtime: extern "C" fn() -> *const c_void,
+    /// 请宿主的 HTTP 客户端代发一次请求（面向插件的封装见 [`crate::runtime::http`]）。
+    /// 无论成功、失败还是当场就把请求描述判废了，`done` 都会被调用**恰好一次**。
+    pub http: extern "C" fn(call: *const HttpCall, done: HttpDone, user: *mut c_void),
 }
 
 /// [`export_arona_plugin!`] 生成的 `arona_plugin_host` 的实现：把插件里的
-/// 进程默认实例、日志出口、tokio 句柄一次性改指宿主。必须在造实例之前调用。
+/// 进程默认实例、日志出口、tokio 句柄、HTTP 代发入口一次性改指宿主。必须在造实例之前调用。
 ///
 /// 返回 0 表示接管完成；非 0 表示失败（宿主据此拒载），因为「各持一份状态」的插件
 /// 只是安静地失效，比装载失败更难查。
@@ -146,6 +210,7 @@ pub unsafe fn attach_host(bridge: *const HostBridge) -> u8 {
         }
         crate::runtime::reactor::adopt_host((bridge.runtime)());
     }
+    crate::runtime::http::attach_host(bridge.http);
     crate::runtime::log::attach_host(bridge);
     HOST_ACCEPTED
 }
@@ -213,10 +278,19 @@ mod tests {
     /// `HostBridge` 要跨 dll 边界传给插件，字段数量与顺序本身就是 ABI 的一部分：
     /// 布局漂了（多一个字段、忘了 `repr(C)`）宿主就会按错位的方式取函数指针。
     #[test]
-    fn host_bridge_is_exactly_three_function_pointers() {
+    fn host_bridge_is_exactly_four_function_pointers() {
         use std::mem::{align_of, size_of};
-        assert_eq!(size_of::<HostBridge>(), 3 * size_of::<usize>());
+        assert_eq!(size_of::<HostBridge>(), 4 * size_of::<usize>());
         assert_eq!(align_of::<HostBridge>(), align_of::<usize>());
+    }
+
+    /// 请求描述也是 ABI：两个 u8 凑满一个字，其余字段各占一个字。
+    /// 少一个、多一个或者漂了 `repr(C)`，宿主读到的就是错位的数据。
+    #[test]
+    fn http_call_is_twelve_words() {
+        use std::mem::size_of;
+        assert_eq!(size_of::<HttpCall>(), 12 * size_of::<usize>());
+        assert_eq!(size_of::<HttpPair>(), 4 * size_of::<usize>());
     }
 
     /// 空通道必须被拒收：接管失败还继续装配，插件就会把状态写进自己那份空表里，
