@@ -20,7 +20,9 @@ plugins/hello/             # 示例插件：name=hello-plugin, crate-type=["cdyl
 编译出 `xxx_plugin.dll` 后由用户放进运行目录的 `plugins/`，框架启动时扫描装载（§22）。
 
 版本约定：框架与 host 同为 `1.0.0`，插件版本号各自演进。
-**插件接口的破坏性改动抬 `arona::plugin::FRAMEWORK_API_VERSION`**（与 crate 版本号无关），见 §6。
+**插件接口的破坏性改动抬 `arona::plugin::FRAMEWORK_API_VERSION`**（与 crate 版本号无关），见 §6；
+**插件会读的那个类型换了布局**（`Framework`、`CommandContext`、`EventBody`、`BodyFilter`、`OneBotApi`
+这些，加字段/加变体/改字段类型）另抬 `arona::plugin::abi::ABI_LAYOUT`（当前 `5`），见 §22。
 
 运行期的落盘目录由框架统一规定（见 §7），插件不自己挑地方：
 
@@ -99,7 +101,7 @@ arona-host ──depends──▶ arona（框架）──启动时扫描──�
 | `PermissionService` / `MiraiPermission` | `Permission::{Anyone,GroupAdmin,GroupOwner}` + `GroupRole`（`ctx.with_permission(..)`，身份优先读 `sender.role`，回查带缓存） | `runtime/dispatcher.rs` |
 | `MiraiInstance.new { .. }`（构造选项） | `Framework::builder().panic_disable_threshold(..).build()` / `Framework::with_options(..)` | `framework.rs` |
 | `broadcastAndDumpInterceptedExceptions`（插件异常不冒泡到宿主） | 框架调用的插件入口全被兜住：命令/兜底、入站与出站钩子过 `guarded()`，生命周期回调与定时任务各自 `catch_unwind`，三处记账在同一张健康度面板上；连续 panic 达阈值自动停用该插件 | `plugin/health.rs` |
-| `GroupMessageEvent` / `FriendMessageEvent` / `NudgedEvent` 事件族 | `EventBody`（强类型事件体，notice/request 另带 `NoticeInfo`/`RequestInfo` 细节：动作、操作者、禁言时长、处理凭据）+ `BodyFilter` 子类型订阅：`ctx.on_group_message(..)`、`ctx.listen_where(&[BodyFilter::..], ..)` | `onebot/hooks.rs` |
+| `GroupMessageEvent` / `FriendMessageEvent` / `NudgedEvent` 事件族 | `EventBody`（强类型事件体，notice/request/meta 另带 `NoticeInfo`/`RequestInfo`/`MetaInfo` 细节：动作、操作者、禁言时长、处理凭据、生命周期状态）+ `BodyFilter` 子类型订阅（私聊分好友/临时会话，元事件分连接状态）：`ctx.on_group_message(..)`、`ctx.listen_where(&[BodyFilter::..], ..)` | `onebot/hooks.rs` |
 | `MessageChain` / `Element`（At、Image、Source、QuoteReply、Face、FlashMessage…） | `MessageSegment` 15 段（文本/@/@全体/引用/图片/表情/语音/视频/文件/戳一戳/位置/json/xml/合并转发/未知段原样保留），收发双向同一套类型 | §19 |
 | `AbstractMessage.source()` / `quoteReply`（引用的那条消息还能不能拿到） | 框架全包：`CommandContext::{quoted, segments, message_id, time}` 让引用对命令可见，协议层引用不到的旧消息由框架的聊天记录库还原（`context.reply_with_quote`），撤回按存下来的 id 换算（`context.recall`） | `runtime/dispatcher.rs` + `runtime/chatlog.rs`（§21） |
 | `Bot` / `Group` / `Member` / `Friend` / `Temp` / `MessageSource`（先拿对象，再往对象上说话） | `arona::bot::{Bot, Group, Member, Friend, MessageSource}`：`ctx.bot().group(123).send_text(..)`、`member.mute(600).await`、`member.send_temp(..)`、`ctx.source()?.recall().await`。句柄只装一个所属 `Framework` 实例的引用，不缓存连接也不缓存资料 | `bot/mod.rs`（§14.2） |
@@ -123,33 +125,25 @@ arona-host ──depends──▶ arona（框架）──启动时扫描──�
 
 ### 上面那张表没盖到的地方（从 mirai 移植时按这个对照）
 
-同名能力都在，形状有几处不一样。下面这些不是"还没做"就是"刻意不做"，写插件前值得过一遍：
+只剩两处，而且都是**刻意不做**：
 
 1. **一台机器人一个进程**。mirai 的 `BotFactory.newBot(qq, password)` 能在一个 JVM 里跑多账号；
    一个 `Framework` 实例只持**一个** OneBot 应用（`OnebotOutlet::application`）。多 QQ 号的做法是
    多份运行目录起多个宿主进程，插件因此不存在"跨账号操作"这回事。
-2. **句柄不缓存资料，对象图不落内存**。mirai 的 `bot.groups` / `group.members` / `member.nameCard`
-   是内存里随事件更新的缓存，读它们零网络；这里每个资料都是现查实现端的 `async` 调用
-   （`group.info()`、`member.info()`）。要零网络就自己用 `ctx.spawn` + 事件维护一份缓存，
-   或经 §11 的服务容器让几个插件共用那一份。框架不替插件隐式发请求。
-3. **没有 `group.history` 那种可分页的历史**。这里的聊天记录库（§21）只按 `message_id` 点查，
-   没有"按群/按人翻最近 N 条"的出口。补它要在 `chatlog.db` 上加索引与分页查询，属于新增能力。
-4. **图片不是可复用对象**。mirai `Image.upload()` 给的 `Image` 带 `imageId`，同一张图能塞进多条
-   消息不重传；这里出站是 `MessageSegment::Image { file | url | data }`，每发一次实现端处理一次。
-   （群文件另有 `upload_group_file`，那是另一件事。）
-5. **连接生命周期不在插件手里**。mirai 的 `bot.login()/logout()/close()` 与 `OtherClient`（多端设备）
-   没有对应项；插件只读 `bot.is_online()`，断开由宿主重连。刻意如此：插件关掉唯一那条连接，
-   同进程的别的插件就全瞎了。
-6. **事件不是一事件一 class**。mirai 有 `FriendMessageEvent` / `TempMessageEvent` / `NudgedEvent` 这一族，
-   这里是 OneBot 的四类 `post_type` + `EventBody`/`NoticeKind` 归位（§9）。临时会话里的消息在
-   mirai 是独立事件，在这里是 `PrivateMessage { sub_type: "group" }`。移植时按 `BodyFilter` 找，别按类名找。
-7. **闪图一类段型没有专名**。§19 那 15 段没有 flash 的对应项；实现端给出框架不认的段时落成
-   `MessageSegment::Raw { kind, data }`，**收发都不丢**，但语义要插件自己判。
-8. **`Bot::of(隔离实例)` 上 `api()` 不隔离**。`OneBotApi` 是零宽类型，取连接时读的是**进程默认实例**
-   上的 `OnebotOutlet`。宿主与 dll（经 `adopt_host` 认领宿主实例）拿到的都是同一条真实连接，
-   所以插件侧不存在这个问题；只有测试里 `Bot::of(&另一套实例)` 时 `bot.api()` 仍落到默认实例，
-   而 `bot.send()` / `bot.recall()` / `bot.message()` 读的是 self 这套（`bot/mod.rs` 顶部注释写明）。
-   要彻底隔离得把连接出口做成 `OneBotApi` 的字段，目前没做。
+2. **连接生命周期不在插件手里**。mirai 的 `bot.login()/logout()/close()` 与 `OtherClient`（多端设备）
+   没有对应项；插件只能**读**状态——`bot.is_online()`，或者订阅框架在连接翻转为在线/离线时合成的
+   那条 lifecycle 元事件（§9：`BodyFilter::meta(MetaKind::Lifecycle, "connect" | "disable")`），
+   断开由宿主自己重连。刻意如此：插件关掉唯一那条连接，同进程的别的插件就全瞎了。
+
+**曾经列在这里、现在已经补齐的几处**（留一句"当初为什么差"，方便对照旧资料）：
+
+| 当初的缺口 | 现在对应什么 | 还差多少 |
+| --- | --- | --- |
+| 句柄不缓存资料，读成员要现查实现端 | `group.member_info(id)` 与 `member.info()` 走实例上的 `PeerCache`：同一个人在同一个群里 60 秒内只打一次网络，`group.forget_member(id)` 立即作废；`bot.user(id)` 那份陌生人资料留 10 分钟 | 只对齐到"按需读一次"这个粒度，**没有**做 mirai 那种整张对象图常驻内存——多实现端下没人能保证那份缓存不出错 |
+| 没有 `group.history` 那种可分页的历史 | `group.history(20)` / `group.history_before(20, cursor)`（`Friend` 上同名），游标到头给 `None`（§14.2、§21） | 只读框架自己记的档，不是实现端的全量历史 |
+| 图片不是可复用对象 | `arona::bot::Image`：`from_file_id` / `from_url` / `from_file` / `from_bytes`，`image.segment()` 或 `OutgoingMessage::from(image)`，`file_id()` 能把实现端给的回执号接着用第二次（§19） | 上传动作还是实现端在做，框架不代管一份图库 |
+| 事件不是一事件一 class | 仍按 `BodyFilter` 找而不是按类名找，但私聊能按子类型分档了：`BodyFilter::private("friend")` 只看好友消息、`private("group")` 只看临时会话，v11 的字符串写法与 CQ 的数字写法（`0`/`1`/`2`）都认（§9） | 事件类本身没有，一家 OneBot 只有一个 `EventContext` |
+| `Bot::of(隔离实例)` 上 `api()` 不隔离 | `OneBotApi` 现在持有所属 `Framework` 实例（`OneBotApi::of(&实例)`，`global()` 是进程默认实例那一份）。`Bot::api()`、`PluginContext::api()`、`EventContext::api()`、`CommandContext::api()` 一律落在**构造它的那套实例**上，`recall` / `reply_with_quote` 也跟着走实例上的 `chatlog_api()` | `arona::runtime::chatlog::*` 那批自由函数仍读进程默认实例（§22 末尾的遗留清单） |
 
 ## 4. 生命周期（`arona::run` → `run_bot` 的真实顺序）
 
@@ -447,17 +441,20 @@ fn configure(&self, ctx: &PluginContext) -> Result<(), String> {
 }
 ```
 
-`EventContext` 提供：`kind`、归位后的强类型 `body`（`EventBody::{GroupMessage,PrivateMessage,Notice,Request,Meta,Other}`）、
+`EventContext` 提供：`kind`、归位后的强类型 `body`（`EventBody::{GroupMessage,PrivateMessage,Notice,Request,Meta,Other}`，
+其中 `Notice(.., NoticeInfo)` / `Request(.., RequestInfo)` / `Meta(.., MetaInfo)` 各带一份细节）、
 原始 `event`、`text`、`command_text`（剥掉"@机器人/引用/图片"等召唤前缀、用来匹配命令的那份文本）、
-`segments`（§19 的全部消息段）、`api: OneBotApi`（§14），
+`segments`（§19 的全部消息段）、`api()`（§14 的动作出口，**绑的是投递这条事件的那套实例**）、`bot()`（§14.2 的对象模型入口），
 以及 `user_id()/group_id()/is_group()/is_private()/message_id()/field(key)/field_str(key)`、
-`target()`、`reply(text)`、`reply_message(OutgoingMessage)`、`recall(message_id)`。
+`target()`、`reply(text)`、`reply_message(OutgoingMessage)`、`reply_with_quote(OutgoingMessage)`、`recall(message_id)`（后两条见 §21）。
 发送者侧另有 `sender_name()`（群名片优先，退回昵称）、`sender_role()`（`Option<GroupRole>`，§8 的权限枚举）、
 `sender_is_admin()`、`quoted()`（这条消息引用了哪条：`command_text` 里已剥掉引用段，值在这里）——
 全部读事件自带的 `sender`/`segments`，不发协议请求，实现端没给就是 `None`。
 
-`BodyFilter` 的档位：`All`、`Kind(EventKind)`（大类）、`GroupMessage` / `PrivateMessage`、
-`Notice(NoticeKind)`、`NoticeAction(NoticeKind, String)`、`Request(RequestKind)`、`Meta(MetaKind)`。
+`BodyFilter` 的档位：`All`、`Kind(EventKind)`（大类）、`GroupMessage` / `PrivateMessage` /
+`PrivateSubType(String)`、`Notice(NoticeKind)`、`NoticeAction(NoticeKind, String)`、`Request(RequestKind)`、
+`Meta(MetaKind)`、`MetaState(MetaKind, String)`。后两档各有一个带子类型的构造器（`private(..)` / `meta(..)`），
+构造器传空串就退化成整类，所以**优先用构造器而不是手写枚举**。
 
 同一个 `notice_type` 下的不同动作在 QQ 上是完全不同的事，所以子类之外还有一层细节：
 
@@ -487,6 +484,41 @@ ctx.listen_where(
     event_handler(|e| Box::pin(async move { /* 审核并 set_group_add_request(e.body 里的 flag) */ HookFlow::Pass })),
 );
 ```
+
+私聊与元事件还能再窄一档，对应 mirai 的 `FriendMessageEvent` / `TempMessageEvent` 和那族连接状态事件：
+
+```rust
+use arona::onebot::hooks::{BodyFilter, MetaKind, event_handler, ListenerPriority};
+use arona::onebot::HookFlow;
+
+// 私聊按子类型分档：只用 BodyFilter::PrivateMessage 的话，临时会话也会一起收进来
+ctx.listen_where(
+    &[BodyFilter::private("friend")],   // "group" = 从群里发起的临时会话，另有 "other"
+    ListenerPriority::Normal,
+    event_handler(|e| Box::pin(async move { /* 只有好友消息进这一档 */ HookFlow::Pass })),
+);
+
+// 机器人上下线：框架在传输层 0↔1 翻转时合成一条 lifecycle 元事件
+ctx.listen_where(
+    &[BodyFilter::meta(MetaKind::Lifecycle, "connect")],   // "disable" 是掉线那一侧
+    ListenerPriority::Normal,
+    event_handler(|e| Box::pin(async move {
+        // body 显示成「元事件:生命周期(connect)」，来源标识在 e.event.raw["url"]
+        HookFlow::Pass
+    })),
+);
+```
+
+这两档都不额外发请求，但来路不一样，值得分清：
+
+- `private(..)` 比的是事件自带的 `sub_type`。v11 的字符串写法（`friend`/`group`/`other`）与
+  部分实现端的数字写法（`0`/`1`/`2`）按**同族**判定，`group` 与 `temp` 也算同族，
+  所以宿主不替你猜"这家到底怎么标临时会话"，插件也不用自己写两套比较。
+- lifecycle 那条**完全由框架合成**：正向 WS 连上与读循环退出、反向 WS 的首条与最后一条 socket、
+  反向 HTTP 心跳 `get_status` 的成败翻转。反向 WS 挂多条 socket 时只在 0↔N 之间各报一次，
+  不会每接一条就刷屏。它**只投钩子，绝不回播给实现端**——`broadcast_except` 那条路是给
+  多实现端同步真实事件用的，把合成事件塞进去等于对别家客户端撒谎。
+  因此"此刻在不在线"仍以 `bot.is_online()` 为准，这条事件的用处是**掉线后重连上了要补投什么**。
 
 `NoticeKind` 覆盖 `group_upload/group_decrease/group_increase/group_admin/group_ban/group_recall/poke/nudge/群名片/群头衔/notify`。
 NapCat、LLOneBot、Lagrange 把戳一戳、名片与头衔变更都塞进 `notice_type="notify"`，真正的类型写在内层
@@ -762,7 +794,7 @@ fn stop(&self, _ctx: &PluginContext) {
 框架把 OneBot v11 的动作封成 `arona::onebot::api::OneBotApi`，插件与 GUI 用同一份能力：
 
 ```rust
-let api = ctx.api();                              // = OneBotApi::global()，每次现取首个可用连接
+let api = ctx.api();                              // 绑本插件所属那套实例，每次动作现取该实例的首个可用连接
 let members = api.get_group_member_list(group_id).await?;
 api.send(MessageTarget::Group(group_id), OutgoingMessage::text("老师")).await?;
 api.delete_msg(message_id).await?;
@@ -771,8 +803,11 @@ api.delete_msg(message_id).await?;
 `CommandContext` 与 `EventContext` 上都有 `api()`，命令与钩子里直接 `ctx.api()` 就行。
 **这条通道在插件 dll 里是真通的**：连接池挂在 `Framework` 实例上（`Framework::onebot()`），
 dll 认领了宿主实例，所以动作落在宿主真正那条连接上，不必宿主侧替你转发（判据见 §22）。
+出口本身只多揣着一个实例引用：`OneBotApi::of(&实例)` 给指定那套，`global()` 给进程默认那套，
+`ctx.api()` / `bot.api()` 给**构造这个句柄的那套**——多实例宿主与测试里不会串到别家连接上。
 
-不要缓存 `OneBotApi` 之外的连接对象：`onebot.yml` 热重载后旧连接已销毁，而 `global()` 每次现取。
+`OneBotApi` 里不存连接，所以攥着它跨一次 `onebot.yml` 热重载没问题，下一次动作自然取到新连接；
+要别缓存的是 `Arc<dyn OneBotConnection>` 那一层连接对象，热重载之后旧的已经销毁了。
 这里所有发送方法都是**协议层直连**：不出站钩子（§9.1）、不打印、不拆合并转发、不带自动撤回。
 要走框架那条完整的出站路（含 §9.1 钩子、控制台打印、合并转发拆分、`revoke_after_millis` 自动撤回、
 出站记账），用 `arona::runtime::services::send_message(..)` 或 §14.2 的对象模型。
@@ -847,6 +882,10 @@ mirai 的手感是"先拿到一个对象，再往对象上说话"，而不是到
 | `bot.groups` | `bot.groups().await` | `get_group_list` |
 | `bot.getFriend(id)` / `bot.friends` | `bot.friend(id)` / `bot.friends().await` | 前者同样不查网络，所以没有昵称与备注 |
 | `group.members` / `group[id]` | `group.members().await` / `group.member(id).await` | 后者会查一次实现端，确认这个人真在群里 |
+| `member.nameCard`（读内存里的缓存，零网络） | `group.member_info(id).await` / `member.info().await` | 走实例上的 `PeerCache`：同一个人在同一个群里 60 秒内只打一次网络，`group.forget_member(id)` 立即作废；`bot.user(id)` 那份陌生人资料留 10 分钟。身份门控（§8 的 `group_role()`）读的是同一份，所以"先判身份再取昵称"只花一次往返 |
+| `bot[qq]` 的陌生人/好友资料 | `bot.user(id).await` | 同上，NTQQ 系实现端这个动作偏慢，所以缓存给到 10 分钟 |
+| `group.history`（可分页的历史） | `group.history(20)` / `group.history_before(20, cursor)` | 读的是 §21 那份框架留档，`HistoryPage::cursor()` 给 `None` 表示翻到头了；`Friend` 上同名 |
+| `Image.upload()` 回来的 `Image`（同一张图不重传） | `arona::bot::Image`：`from_file_id` / `from_url` / `from_file` / `from_bytes` / `from_segment` / `from_stored` | 见 §19。OneBot 没有"先传上去换 id"这一步，能复用的 `file_id` 只可能来自入站消息或框架留档 |
 | —— | `group.member_of(id)` | 只拿句柄不查网络，紧接着要禁言/踢人时省一次往返 |
 | `subject.sendMessage(chain)` | `group.send(msg).await` / `friend.send_text("…").await` | 走框架的出站通道（§9.1 钩子、打印、拆分、自动撤回、记账），**不是**协议层旁路 |
 | `subject.sendMessage(..)` 返回 `MessageSource` | 同上，返回 `MessageReceipt`，再 `receipt.source()` → `Option<MessageSource>` | mirai 那一步直接给凭据；这里发出去的东西先给回执（`message_id`/`real_id`），`.source()` 换成能撤回、能引用的凭据。一个号都没给时是 `None` |
@@ -859,7 +898,7 @@ mirai 的手感是"先拿到一个对象，再往对象上说话"，而不是到
 | `group.publishAnnouncement(..)` | `group.set_notice(content, image, pinned).await` | |
 | `Temp` 会话 | `member.temp_target()` / `member.send_temp(msg).await` | 对应 `MessageTarget::Temp`，见下 |
 | `source.markRead()` | `source.mark_read().await` | 实现端不支持时返回 `Failed`，消息本身不受影响 |
-| `bot.callApi(..)` | `ctx.api()` | §14 那张全量动作表，本模块没包到的动作走它 |
+| `bot.callApi(..)` | `ctx.api()` / `bot.api()` | §14 那张全量动作表，本模块没包到的动作走它。出口**绑的是构造这个句柄的那套实例**（`OneBotApi::of(&实例)`），所以多实例宿主与测试里各套句柄拿到的是自己那套的连接与 `self_id` |
 
 ```rust
 use arona::bot::Bot;
@@ -872,11 +911,22 @@ bot.friend(10001).send_text("单独说一下").await;
 // 对方不是好友时裸私聊常被实现端拒发，临时会话（带来源群号）才是那条正路
 bot.group(123456).member_of(10001).send_temp(OutgoingMessage::text("在吗")).await;
 
-// 查：资料都现取，句柄本身不缓存任何东西
+// 查：句柄自己不存东西，但读回来的资料会落在实例的缓存上，60 秒内同一个人不再打网络
 let group = bot.group(123456);
-let name = group.info().await?.group_name;
-for member in group.members().await? {
+let name = group.info().await?.group_name;             // 群名不缓存，每次现查
+for member in group.members().await? {                 // get_group_member_list 全量
     println!("{} {}", member.user_id, member.display());
+}
+let card = group.member_info(10001).await?.display();  // 首次现查，第二次起命中缓存
+group.forget_member(10001);                            // 刚改完名片就要读回来，别等 60 秒
+
+// 历史：读的是 §21 那份框架留档，游标为 None 就是翻到头了
+let page = group.history(20);
+for record in &page.records {
+    println!("{}: {}", record.name, record.text);
+}
+if let Some(cursor) = page.cursor() {
+    let older = group.history_before(20, cursor);      // 接着往前翻
 }
 
 // 管：mirai 的 member.mute(600) 一对一
@@ -1121,6 +1171,14 @@ GUI 相关的落地细节（改动前务必先读）：
 （同机部署用的"图片按文件直传"）且文件确实存在时才改成 `file:///…` URI，免去一次大图 base64，
 实现端按原始文件上传因此不被压缩。中文与空格路径按 RFC 8089 百分号编码，Windows 盘符冒号保持原样。
 
+`arona::bot::Image`（§14.2）是图片段那一行的**可复用句柄**：`Image::from_segment(&segment)` 把收到的
+几种线索原样取出来（直链、本机路径、字节、`file_id`，在这一步不猜该用哪个、也不丢），`image.segment()`
+挂回要发的消息，`OutgoingMessage::from(image)` 是它的简写。它不含连接状态、是 `Clone` 的，可以放心放进
+插件自己的缓存长期持有。**框架没有 mirai 的 `Image.upload()` 那一步**：v11 没有"先传上去换个 id 回来"
+的标准动作，发图时由实现端自己上传，所以能复用的 `file_id` 只可能来自入站消息或 §21 的留档
+（`Image::from_stored`，认 `fileid://<id>`、http(s) 直链与本地路径三种写法）。同一张图第二次发可以带上
+同一个 `file_id`，至于实现端是否因此省下重传，框架不替它保证——要确定性不重传就自己留 `from_file` 那条路。
+
 出站构造：`OutgoingMessage::{new, text, at, at_all, quoted, image_file, image_data, record_file,
 video_file, json_card, xml_card, forward}`，再加 `.with_revoke(毫秒)` 让框架发完自动撤回。
 `ctx.reply(..)` / `context.reply_message(..)` / `api.send(target, msg)` 都吃它。
@@ -1217,6 +1275,11 @@ context.recall(message_id).await;
 
 `reply_with_quote` 在触发消息本身没有引用时等同于 `reply_message`，所以命令实现里可以无条件用它。
 `EventContext` 上另有同名的 `reply_with_quote` / `recall`（钩子里回消息、钩子里撤回）。
+
+第三个入口在对象模型上，读的是同一张表：`group.history(20)` / `group.history_before(20, cursor)`
+（`Friend` 上同名，`Member` 没有——临时会话本来就归到那个人所属的群）。`HistoryPage::cursor()` 给 `None`
+即翻到头，`ChatRecord` 里的 `image` 列直接交给 `Image::from_stored` 就能再发一次（§19）。
+分页只在本地做：库里默认只留 2 天（见下面的清理项），所以它**不是**实现端的全量历史。
 
 框架侧还做了什么：
 
@@ -1318,16 +1381,30 @@ dll 把 `arona` **连同它的全部依赖**静态链接成了第二份，所以
 | --- | --- | --- |
 | `arona::runtime::services::sender_ready` / `send_message` / `data_root` | 状态是实例上的 `RuntimeServices`（`Framework::runtime_services()`），自由函数只是它的门面 | 宿主 `set_message_sender` 只写到宿主那份，插件这份恒 `None`：定时任务与事件钩子里**主动**发的消息永久不成立，返回默认回执、消息原地丢弃且不带错误。框架自带的示例插件就中招 —— `plugins/hello` 的「每日问好」与「进群欢迎语」两条都是这条路径，写成 `let _ = send_message(..)` 连失败都看不见 |
 | `arona::config::settings::*`（框架那份 `groups`/`managers`） | 状态是实例上的 `Settings`（`Framework::settings()`），`init` 之后连热重载监听都跟着实例走 | 插件那份 `file` 恒为 `None`：读出来是默认值（`/config` 列出空的管理员表），写则报「配置文件尚未初始化」。插件自己的 `config/<插件>/arona.yml` 一直不受影响，那条本来就走在实例上 |
-| `arona::onebot::api::OneBotApi::*`（全部 OneBot 动作） | 连接与 `self_id` 是实例上的 `OnebotOutlet`（`Framework::onebot()`），`api.rs` 每次调用现从所属实例取连接；`connection::GLOBAL_REGISTRY` 那道进程级 `OnceCell` 已删 | 动作对象本身拿得到（`OneBotApi` 是零宽类型，不持状态），但登记表是 dll 自己那份空的 → 每一次动作都只回 `NoConnection`。插件里 `get_login_info`、`get_group_member_list`、`delete_msg` 全废，而且**不 panic**，只是永远"没有可用的 OneBot 连接" |
+| `arona::onebot::api::OneBotApi::*`（全部 OneBot 动作） | 连接与 `self_id` 是实例上的 `OnebotOutlet`（`Framework::onebot()`），`OneBotApi` 自己就**持着所属实例**（`OneBotApi::of(&实例)`，`global()` 是进程默认那一份），每次调用现取该实例的首个可用连接；`connection::GLOBAL_REGISTRY` 那道进程级 `OnceCell` 已删 | 动作对象本身拿得到（当年的 `OneBotApi` 是零宽类型，不持状态），但登记表是 dll 自己那份空的 → 每一次动作都只回 `NoConnection`。插件里 `get_login_info`、`get_group_member_list`、`delete_msg` 全废，而且**不 panic**，只是永远"没有可用的 OneBot 连接" |
 | `arona::runtime::chatlog::*`（引用还原与撤回） | 设置、库句柄、打开失败标记都收在实例上的 `ChatLog`（`Framework::chatlog()`），而**插件侧只能经 `Framework::chatlog_api()` 那层 `Arc<dyn ChatLogFace>` 用它**——见下一小节 | 这一处两道关都没过，症状也最阴，见下面两段 |
 
 第①道搬进实例不新增 ABI 通道、**插件源码一行不改**，重编 dll 即可；代价是这几处对插件**彻底可用**
 了：插件里 `arona::config::settings::init(...)` 现在真的会去重载宿主那份 arona.yml（示例：插件的
 "恢复备份"流程就靠它），所以别把它当调试工具随手调。
 
-**但 `Framework` 换了字段布局就必须抬 `ABI_LAYOUT`（本轮 3 → 4）**：`HostBridge::framework`
+**但只要插件会读的那个类型换了布局，就必须抬 `ABI_LAYOUT`**：`HostBridge::framework`
 交出去的是擦成 `*const c_void` 的实例指针，dll 按**它自己编译期的字段偏移**读这个结构体，
 插一个字段就会让旧 dll 读错位置——那是未定义行为，不是"握手失败"。所以旧 dll 一律拒载。
+抬过的两次：`3 → 4` 是 `Framework` 多出 `chatlog_api` 一项；`4 → 5` 是插件会直接读的那几个类型
+（`EventBody::Meta` 多带一个 `MetaInfo`、`BodyFilter` 多两档、`CommandContext` 末尾多一个 `framework`、
+`OneBotApi` 由零宽单元类型变成持有实例引用的结构体）。**宿主侧的四个导出符号一个字都没改，
+也算改 ABI**——这条最容易漏。同理，给跨镜像 `trait` 追加方法（vtable 变长）也要抬。
+
+#### 还欠着的两处（不影响插件正常写法，但排查时值得知道）
+
+1. `arona::runtime::chatlog::*` 那批**自由函数**仍然读进程默认实例上的库。`EventContext` 与
+   `CommandContext` 上的 `recall` / `reply_with_quote`、`arona::bot` 那几个走留档的方法都已经改成
+   走**所属实例**的 `chatlog_api()`，插件正常用法没有串台问题；只有直接调那几个自由函数、又跑在
+   隔离实例上（写框架自己的测试）时才会看到"读到的不是这一套的库"。
+2. 正向 WS 被宿主**主动** `stop()` 时**不报** `disable`：那条路径要 `abort()` 掉任务，尾部代码根本不执行，
+   补发只会引出竞态和重复事件。插件把"掉线"当作重连补投的信号来用就够，别把它当作"宿主已经关了"的凭据；
+   要当前真相就读 `bot.is_online()`。
 
 这四处曾经的症状都是**实测确认**而非推断，而且是同一进程内的对照实验：同一个示例插件 dll，
 `/你好`、`/示例延时`、`/示例联网` 三条回话都成功到了实现端（走 `CommandContext`），而它事件钩子里
@@ -1379,7 +1456,7 @@ dll 把 `arona` **连同它的全部依赖**静态链接成了第二份，所以
 > user_id: 100 }；ctx.source()=1017；引用窗口=7 分钟`；`group_increase` 那条探针也回到「探针通过」。
 > 顺带收掉一个旧账：**上一轮 bluearchive 卡在 `initializing database…` 不动、CPU 完全空闲，
 > 是同一个 UB 的另一种表现**（它 `await` 的那一步再也没返回，比崩掉更难查）。装上 trait 出口之后
-> 两个插件同场启动，握手报「布局 4」，预热流程一路走完。
+> 两个插件同场启动，握手报的是当轮那个布局号（那轮是 4，本轮已抬到 5），预热流程一路走完。
 >
 > 还有一条经验给排查用：**同一次 `cargo build --release --workspace` 里出宿主与各插件**，
 > 这样 `arona` 只编一份、两边的字段布局必然同源。分两条命令编出来的宿主与 dll 万一 feature 集
@@ -1415,7 +1492,7 @@ tokio 也被静态链接成了两份，而"当前在哪个运行时里"这个上
 
 | 项 | 来源 | 不一致的后果 |
 | --- | --- | --- |
-| 符号布局版本 | `arona::plugin::abi::ABI_LAYOUT` | 四个导出符号的签名变过，新旧不可混用 |
+| 符号布局版本 | `arona::plugin::abi::ABI_LAYOUT`（当前 5） | 四个导出符号的签名、或**插件会读的那个类型**（`Framework`、`CommandContext`、`EventBody`、`BodyFilter`、`OneBotApi`）换了布局，新旧不可混用 |
 | 框架契约版本 | `FRAMEWORK_API_VERSION`（主版本相等 + 框架次版本不低于插件要求） | 插件用到了宿主还没有的接口 |
 | rustc 版本与 host 三件套 | 两边各自 `rustc -vV` 的 `release` / `host` 两行 | `dyn Trait` 胖指针布局、泛型单态化产物可能对不上 |
 | 目标三元组 + profile + CRT 链接方式 | `TARGET` / `PROFILE` / `crt-static` | debug 与 release 混编会炸；两套 MSVC 运行库会各自分配释放内存 |
@@ -1444,12 +1521,13 @@ tokio 也被静态链接成了两份，而"当前在哪个运行时里"这个上
 ### 发布插件时必须写明的三件事
 
 ```
-适用于 Arona-rs 1.0.0（框架契约 1.0.0）
+适用于 Arona-rs 1.0.0（框架契约 1.0.0，符号布局 5）
 构建工具链：rustc 1.98.0，x86_64-pc-windows-msvc，--release，crt-static
 下载后放进 <框架运行目录>/plugins/<你的id>/，重启框架
 ```
 
-第二行的版本号要和 `rust-toolchain.toml` 里那一行对得上。第三件事别偷懒写成"任意 rustc
+第二行的版本号要和 `rust-toolchain.toml` 里那一行对得上。符号布局号抄 `arona::plugin::abi::ABI_LAYOUT`
+当轮的值：它和工具链版本号一样是"差一个就不该混用"，而宿主报的永远是它自己那一份。第三件事别偷懒写成"任意 rustc
 都能用"——那不是宽松，是把干净的拒载推迟成随机的崩溃。
 真要跨编译器版本，得走进程外通信（子进程 + JSON-RPC）或 wasm 组件模型，
 那是与本框架这套契约不同的另一条路。
