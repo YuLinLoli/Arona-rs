@@ -9,8 +9,9 @@
 //!
 //! 一个插件会用到的接口都在这里各演示一遍：
 //! - `install`：登记一个分群功能开关 + 一块强类型配置（落在 `config/hello/arona.yml`）
-//! - `configure`：四条命令（参数类型化、身份门控、自己回话与交给框架回话两种写法）、
-//!   一个进群欢迎钩子、一个出站改写钩子
+//! - `configure`：一批命令（参数类型化、身份门控、自己回话与交给框架回话两种写法，外加
+//!   对象模型与钩子投递的几条自检探针）、三个事件钩子（进群欢迎、连接状态、只收好友的私聊分流）、
+//!   一个出站改写钩子
 //! - `start`：一个每日定时任务
 //! - `on_config_reload`：配置改完重排任务
 //! - `stop`：什么都不做——回收本来就是框架的事
@@ -18,8 +19,11 @@
 mod config;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 
-use arona::onebot::hooks::{BodyFilter, HookFlow, NoticeKind, event_handler, outbound_handler};
+use arona::onebot::hooks::{
+    BodyFilter, EventBody, HookFlow, MetaKind, NoticeKind, event_handler, outbound_handler,
+};
 use arona::plugin::{AronaPlugin, PluginContext, PluginMeta, PluginRegistrar};
 use arona::runtime::args::arg;
 use arona::runtime::config::Feature;
@@ -37,6 +41,13 @@ const FEATURE: &str = "hello";
 
 /// 每日问好的任务名（重复登记时框架按这个名字替换）
 const GREET_JOB: &str = "HelloDailyGreeting";
+
+/// 下面两个钩子的记账：连接状态事件与好友私聊各命中了几次。
+/// 这是**插件自己的**进程内状态，不是宿主状态——纯 Rust 的静态量本来就落在 dll 那份内存里，
+/// 也正是这一条让 `/示例连接` 能把"钩子到底有没有被投递"变成一句可读回的证据。
+static CONNECTS: AtomicU8 = AtomicU8::new(0);
+static DISCONNECTS: AtomicU8 = AtomicU8::new(0);
+static FRIEND_HITS: AtomicU8 = AtomicU8::new(0);
 
 pub struct HelloPlugin;
 
@@ -495,6 +506,21 @@ impl AronaPlugin for HelloPlugin {
                 }),
             )
             .with_feature(FEATURE),
+            // 连接状态与私聊分流两条钩子的证据：钩子本身不回话（连接抖动时刷群没意义），
+            // 由这条命令把计数读回来。跑端到端时看一眼就知道合成事件有没有真的投进插件。
+            CommandRegistration::new(
+                vec!["/示例连接".into(), "/连接事件".into()],
+                "报出本插件收到的连接事件与好友私聊命中次数",
+                handler(|_, _| async move {
+                    Some(OutgoingMessage::text(format!(
+                        "连接事件：connect ×{}；disable ×{}；好友私聊命中 ×{}",
+                        CONNECTS.load(Ordering::Relaxed),
+                        DISCONNECTS.load(Ordering::Relaxed),
+                        FRIEND_HITS.load(Ordering::Relaxed),
+                    )))
+                }),
+            )
+            .with_feature(FEATURE),
         ]);
 
         // 事件钩子：按**子类**订阅，且绑在功能开关上——这个群关掉「示例」时它一起停。
@@ -519,6 +545,48 @@ impl AronaPlugin for HelloPlugin {
                 ]);
                 // notice 事件未必带 message_type，目标显式给群号，别依赖 reply 的回退判定
                 let _ = send_message(MessageTarget::Group(group_id), message).await;
+                HookFlow::Pass
+            }),
+        );
+
+        // 连接状态：宿主在传输层"零↔一"翻转时**合成**一条 lifecycle 元事件，只投钩子、不进命令分发。
+        // 这里只记账不回话——连接抖动时刷群毫无意义。要把当前真相问出来就读 `bot.is_online()`，
+        // 别把事件流当凭据（正向 WS 被宿主主动 stop() 时不补 disable，原因写在开发规范 §22）。
+        ctx.listen_feature(
+            FEATURE,
+            &[BodyFilter::meta(MetaKind::Lifecycle, "")],
+            ListenerPriority::default(),
+            event_handler(|context| async move {
+                if let EventBody::Meta(MetaKind::Lifecycle, info) = &context.body {
+                    if info.state.as_deref() == Some("connect") {
+                        CONNECTS.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        DISCONNECTS.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                HookFlow::Pass
+            }),
+        );
+
+        // 私聊按 sub_type 分流（mirai 的 FriendMessage / TempMessage 那一族）：这一档只收好友，
+        // 临时会话（sub_type=group）与陌生人（other）根本不会投递进来，所以命中数就是硬判据。
+        ctx.listen_feature(
+            FEATURE,
+            &[BodyFilter::private("friend")],
+            ListenerPriority::default(),
+            event_handler(|context| async move {
+                let user_id = context.user_id();
+                if user_id <= 0 {
+                    return HookFlow::Pass;
+                }
+                FRIEND_HITS.fetch_add(1, Ordering::Relaxed);
+                let _ = send_message(
+                    MessageTarget::Private(user_id),
+                    OutgoingMessage::text(
+                        "这条来自只订阅好友私聊的钩子；临时会话与陌生人的私聊不会走到这里。",
+                    ),
+                )
+                .await;
                 HookFlow::Pass
             }),
         );
