@@ -5,8 +5,6 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 pub struct RuntimeServices {
-    /// 是否独立模式（本移植版恒为 true）
-    pub is_standalone: bool,
     /// 数据根目录
     pub data_root: RwLock<Option<PathBuf>>,
     /// 全局消息发送器（活动推送等主动消息使用，取当前首个可用连接）
@@ -17,7 +15,6 @@ static SERVICES: OnceCell<RuntimeServices> = OnceCell::new();
 
 fn instance() -> &'static RuntimeServices {
     SERVICES.get_or_init(|| RuntimeServices {
-        is_standalone: true,
         data_root: RwLock::new(None),
         message_sender: RwLock::new(None),
     })

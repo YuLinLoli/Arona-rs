@@ -3,4 +3,4 @@
 pub mod arona;
 pub mod onebot;
 pub mod plugin_config;
-pub mod standalone;
+pub mod settings;

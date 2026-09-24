@@ -11,7 +11,7 @@ use crate::framework::Framework;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-/// 独立模式服务描述（对应 StandaloneServiceInfo）
+/// 服务描述（对应原版 StandaloneServiceInfo）
 pub struct ServiceInfo {
     pub id: i32,
     pub name: &'static str,

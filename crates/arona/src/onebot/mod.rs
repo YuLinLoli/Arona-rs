@@ -16,7 +16,7 @@ pub mod ws_reverse;
 
 pub use api::{MessagePayload, OneBotApi, OneBotError};
 pub use application::OneBotApplication;
-pub use business::StandaloneBusinessHandler;
+pub use business::BusinessHandler;
 pub use connection::{ConnectionRegistry, OneBotConnection};
 pub use hooks::{EventContext, EventKind, HookFlow, subscribe};
 pub use message_sender::{DeferredMessageSender, OneBotMessageSender};

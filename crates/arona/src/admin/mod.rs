@@ -2,7 +2,7 @@
 //! 负责：群列表/群成员查询（走 OneBot API）、分群功能开关与黑名单读写、
 //! OneBot 连接配置读写与热重载。
 use crate::config::onebot::{self, ConnectionType, OneBotConfig};
-use crate::config::standalone;
+use crate::config::settings;
 use crate::onebot::application;
 use crate::onebot::model::OneBotActionResponse;
 use crate::onebot::protocol;
@@ -121,7 +121,7 @@ pub fn plugin_list() -> Vec<PluginInfo> {
 
 /// 全局启用/停用一个插件（按 id）：写配置文件后立即协调生命周期（停用 stop()、启用补 configure+start）
 pub fn set_plugin_enabled(plugin: &str, enabled: bool) -> Result<String, String> {
-    standalone::set_plugin_enabled(plugin, enabled)?;
+    settings::set_plugin_enabled(plugin, enabled)?;
     Ok(format!(
         "插件 {plugin} 已{}（写入 {}）",
         if enabled { "启用" } else { "禁用" },
@@ -131,7 +131,7 @@ pub fn set_plugin_enabled(plugin: &str, enabled: bool) -> Result<String, String>
 
 /// 某个群里启用/停用插件（按 id；只影响该群的路由，不动插件后台任务）
 pub fn set_group_plugin_enabled(group_id: i64, plugin: &str, enabled: bool) -> Result<(), String> {
-    standalone::set_group_plugin_enabled(group_id, plugin, enabled)
+    settings::set_group_plugin_enabled(group_id, plugin, enabled)
 }
 
 /// 某个群禁用的插件 id 列表（GUI「群管理」页画开关用）
@@ -179,7 +179,7 @@ fn check_response(response: OneBotActionResponse) -> Result<Value, String> {
 pub async fn group_list() -> Result<Vec<GroupInfo>, String> {
     let data = call_api("get_group_list", json!({}), 10_000).await?;
     let remote = data.as_array().cloned().unwrap_or_default();
-    let config = standalone::config();
+    let config = settings::config();
     let all_groups = config.groups.is_empty();
     let mut infos: Vec<GroupInfo> = Vec::new();
     for item in remote {
@@ -313,29 +313,29 @@ pub fn role_name(role: &str) -> &'static str {
 // ==================== 分群功能 / 黑名单 ====================
 
 pub fn set_group_enabled(group_id: i64, enabled: bool) -> Result<(), String> {
-    standalone::set_group_enabled(group_id, enabled)
+    settings::set_group_enabled(group_id, enabled)
 }
 
 pub fn set_group_feature(group_id: i64, feature: &str, enabled: bool) -> Result<(), String> {
-    standalone::set_group_feature(group_id, feature, enabled)
+    settings::set_group_feature(group_id, feature, enabled)
 }
 
 /// 整组开启/关闭某个群的一批功能（GUI「功能开关」按插件折叠时的组头开关）
 pub fn set_group_features(group_id: i64, features: &[&str], enabled: bool) -> Result<(), String> {
-    standalone::set_group_features(group_id, features, enabled)
+    settings::set_group_features(group_id, features, enabled)
 }
 
 pub fn set_group_blacklist(group_id: i64, user_id: i64, blacklisted: bool) -> Result<(), String> {
-    standalone::set_group_blacklist(group_id, user_id, blacklisted)
+    settings::set_group_blacklist(group_id, user_id, blacklisted)
 }
 
 pub fn set_global_blacklist(user_id: i64, blacklisted: bool) -> Result<(), String> {
-    standalone::set_global_blacklist(user_id, blacklisted)
+    settings::set_global_blacklist(user_id, blacklisted)
 }
 
 /// 清空某个群的功能开关与群内黑名单
 pub fn clear_group_setting(group_id: i64) -> Result<(), String> {
-    standalone::clear_group_setting(group_id)
+    settings::clear_group_setting(group_id)
 }
 
 /// 本地图片改用 file:// 直传开关。
@@ -365,7 +365,7 @@ pub fn set_send_image_as_file(enabled: bool) -> Result<String, String> {
 
 /// arona.yml 路径（GUI 展示用）
 pub fn arona_file() -> String {
-    standalone::config_file()
+    settings::config_file()
         .map(|path| path.display().to_string())
         .unwrap_or_else(|| "未初始化".to_string())
 }
@@ -528,7 +528,7 @@ mod tests {
     #[tokio::test]
     async fn onebot_reload_rebinds_reverse_listener() {
         use crate::onebot::application::OneBotApplication;
-        use crate::onebot::business::StandaloneBusinessHandler;
+        use crate::onebot::business::BusinessHandler;
         use crate::onebot::connection::ConnectionRegistry;
         use std::sync::Arc;
 
@@ -537,7 +537,7 @@ mod tests {
         let registry = Arc::new(ConnectionRegistry::new());
         // 框架自测：连接热重载与命令无关，命令表按归属登记在进程级，这里给个空句柄即可
         let dispatcher = Arc::new(crate::runtime::dispatcher::CommandDispatcher::new());
-        let business = Arc::new(StandaloneBusinessHandler::new(
+        let business = Arc::new(BusinessHandler::new(
             OneBotConfig::default(),
             crate::framework::Framework::global_arc(),
             dispatcher,
@@ -586,7 +586,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         let file = dir.join("onebot.yml");
         let _ = std::fs::remove_file(&file);
-        // 进程内只允许设置一次；指向临时目录，避免动到真实的 arona-standalone/onebot.yml
+        // 进程内只允许设置一次；指向临时目录，避免动到真实的 config/onebot.yml
         paths::set_onebot_file(file.clone());
         crate::runtime::config::set_send_image_as_file(false);
 

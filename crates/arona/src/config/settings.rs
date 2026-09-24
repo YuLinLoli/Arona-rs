@@ -1,5 +1,5 @@
-//! 独立模式 arona 业务配置持有者（对应原版 standalone/StandaloneAronaConfig）
-//! 负责加载框架那份 config/arona.yml、监听文件变更自动热重载、为 /config 指令提供读写能力。
+//! 框架那份业务配置的持有者（对应原版 standalone/StandaloneAronaConfig）
+//! 负责加载框架的 config/arona.yml、监听文件变更自动热重载、为 /config 指令提供读写能力。
 //! 插件自己的配置在 config/<插件>/arona.yml，由 [`super::plugin_config`] 管。
 
 use super::arona::AronaConfig;

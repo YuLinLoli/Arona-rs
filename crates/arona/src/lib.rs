@@ -23,7 +23,7 @@ pub mod runtime;
 pub mod services;
 
 use crate::onebot::application::OneBotApplication;
-use crate::onebot::business::StandaloneBusinessHandler;
+use crate::onebot::business::BusinessHandler;
 use crate::onebot::connection::ConnectionRegistry;
 use crate::onebot::message_sender::DeferredMessageSender;
 use std::path::PathBuf;
@@ -199,7 +199,7 @@ pub(crate) async fn run_bot(
     plugin::install_all()?;
 
     // 先加载业务配置（含热更新；首次会从旧 onebot.yaml 迁移 groups/managers 及已登记的插件配置区），再加载协议配置。
-    if let Err(err) = config::standalone::init(arona_config_file.clone()) {
+    if let Err(err) = config::settings::init(arona_config_file.clone()) {
         report_config_problem(
             &arona_config_file,
             "arona.yml 加载失败",
@@ -231,7 +231,7 @@ pub(crate) async fn run_bot(
     plugin::start_all()?;
 
     let registry = Arc::new(ConnectionRegistry::new());
-    let business = Arc::new(StandaloneBusinessHandler::new(
+    let business = Arc::new(BusinessHandler::new(
         onebot_config.clone(),
         framework::Framework::global_arc(),
         Arc::new(runtime::dispatcher::CommandDispatcher::new()),
@@ -253,7 +253,7 @@ pub(crate) async fn run_bot(
     });
     runtime::services::set_message_sender(sender);
 
-    runtime::console::print_rule_line("Arona standalone started");
+    runtime::console::print_rule_line("Arona 框架已启动");
     runtime::console::print_rule_line(&format!("Config: {}", config_file.to_string_lossy()));
     runtime::console::print_rule_line(&format!(
         "Arona 业务配置: {}",
@@ -282,6 +282,6 @@ pub(crate) async fn run_bot(
     application.stop();
     plugin::stop_all();
     quartz::pause_all();
-    runtime::console::print_rule_line("Arona standalone stopped");
+    runtime::console::print_rule_line("Arona 框架已停止");
     Ok(())
 }

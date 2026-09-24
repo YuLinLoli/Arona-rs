@@ -1,7 +1,7 @@
 //! OneBot 应用（对应原版 OneBotApplication）
 //! 支持热重载：修改 onebot.yml 后调用 reload 会停止全部连接/服务并按新配置重新启动。
 use crate::config::onebot::{ConnectionConfig, ConnectionType, OneBotConfig};
-use crate::onebot::business::StandaloneBusinessHandler;
+use crate::onebot::business::BusinessHandler;
 use crate::onebot::connection::{ConnectionCore, ConnectionRegistry, OneBotConnection};
 use crate::onebot::http_api::HttpApiServer;
 use crate::onebot::http_reverse::{HttpReverseConnection, HttpReverseState};
@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 pub struct OneBotApplication {
     config: RwLock<OneBotConfig>,
-    pub business: Arc<StandaloneBusinessHandler>,
+    pub business: Arc<BusinessHandler>,
     pub registry: Arc<ConnectionRegistry>,
     connections: Mutex<Vec<Arc<dyn OneBotConnection>>>,
     http_servers: Mutex<Vec<Arc<HttpApiServer>>>,
@@ -21,7 +21,7 @@ pub struct OneBotApplication {
 impl OneBotApplication {
     pub fn new(
         config: OneBotConfig,
-        business: Arc<StandaloneBusinessHandler>,
+        business: Arc<BusinessHandler>,
         registry: Arc<ConnectionRegistry>,
     ) -> OneBotApplication {
         // 图片发送方式(内嵌 base64 / file:// 直传)存在 onebot.yml，启动时同步到运行期开关

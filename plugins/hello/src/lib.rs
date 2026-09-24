@@ -268,9 +268,7 @@ impl AronaPlugin for HelloPlugin {
                                     text.len()
                                 ))
                             }
-                            Err(reason) => {
-                                OutgoingMessage::text(format!("框架代发失败：{reason}"))
-                            }
+                            Err(reason) => OutgoingMessage::text(format!("框架代发失败：{reason}")),
                         },
                     )
                 }),

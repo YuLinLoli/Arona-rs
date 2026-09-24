@@ -238,9 +238,9 @@ impl Framework {
         crate::runtime::log::error(format!(
             "插件 {plugin} 连续 {threshold} 次 panic，已隔离停用（回收它登记的全部资源）"
         ));
-        // 落盘只在进程默认实例上做：config/standalone 是进程级资源，隔离实例不该碰真实配置
+        // 落盘只在进程默认实例上做：config/settings 是进程级资源，隔离实例不该碰真实配置
         if self.is_process_default() {
-            if let Err(problem) = crate::config::standalone::set_plugin_enabled(plugin, false) {
+            if let Err(problem) = crate::config::settings::set_plugin_enabled(plugin, false) {
                 crate::runtime::log::debug(format!("停用状态未能写入 arona.yml: {problem}"));
             }
         }

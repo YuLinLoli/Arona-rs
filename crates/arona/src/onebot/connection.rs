@@ -1,5 +1,5 @@
 //! OneBot 连接抽象（对应原版 OneBotConnection / AbstractOneBotConnection）
-use crate::onebot::business::StandaloneBusinessHandler;
+use crate::onebot::business::BusinessHandler;
 use crate::onebot::model::{OneBotAction, OneBotActionResponse, ParsedPayload};
 use crate::onebot::protocol;
 use crate::runtime::message::BoxFuture;
@@ -140,11 +140,11 @@ pub trait OneBotConnection: Send + Sync {
 /// 共享的连接核心：pending 表 + 业务处理器
 pub struct ConnectionCore {
     pub pending: Arc<Pending>,
-    pub business: Arc<StandaloneBusinessHandler>,
+    pub business: Arc<BusinessHandler>,
 }
 
 impl ConnectionCore {
-    pub fn new(business: Arc<StandaloneBusinessHandler>) -> ConnectionCore {
+    pub fn new(business: Arc<BusinessHandler>) -> ConnectionCore {
         ConnectionCore {
             pending: Arc::new(Pending::new()),
             business,

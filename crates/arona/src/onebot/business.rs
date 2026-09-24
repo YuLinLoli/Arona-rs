@@ -1,6 +1,6 @@
 //! 业务事件处理器（对应原版 StandaloneBusinessHandler）
 use crate::config::onebot::OneBotConfig;
-use crate::config::standalone;
+use crate::config::settings;
 use crate::framework::Framework;
 use crate::onebot::connection::{ConnectionRegistry, OneBotConnection};
 use crate::onebot::console;
@@ -28,7 +28,7 @@ impl HandlerState {
     }
 }
 
-pub struct StandaloneBusinessHandler {
+pub struct BusinessHandler {
     config: RwLock<OneBotConfig>,
     /// 本处理器所属的框架实例：事件钩子与门控都读它，不绕回进程默认实例
     framework: Arc<Framework>,
@@ -38,14 +38,14 @@ pub struct StandaloneBusinessHandler {
     pub state: Arc<HandlerState>,
 }
 
-impl StandaloneBusinessHandler {
+impl BusinessHandler {
     pub fn new(
         config: OneBotConfig,
         framework: Arc<Framework>,
         dispatcher: Arc<CommandDispatcher>,
         registry: Arc<ConnectionRegistry>,
-    ) -> StandaloneBusinessHandler {
-        StandaloneBusinessHandler {
+    ) -> BusinessHandler {
+        BusinessHandler {
             config: RwLock::new(config),
             framework,
             dispatcher,
@@ -205,7 +205,7 @@ impl StandaloneBusinessHandler {
                             self_id,
                             &format!("机器人已被移出群 {group_id}，正在从 groups 配置中移除"),
                         );
-                        standalone::remove_group_if_present(group_id);
+                        settings::remove_group_if_present(group_id);
                     }
                 } else {
                     console::print_notice(
@@ -307,7 +307,7 @@ impl StandaloneBusinessHandler {
         let data = match action.action.as_str() {
             "get_status" => json!({ "online": true, "good": true }),
             "get_version_info" => {
-                json!({ "app_name": "arona", "app_version": "standalone", "protocol_version": "11" })
+                json!({ "app_name": "arona", "app_version": env!("CARGO_PKG_VERSION"), "protocol_version": "11" })
             }
             "get_login_info" => {
                 let config = self.config();
@@ -380,7 +380,7 @@ mod tests {
         let user_id = 20_001_i64;
         let marker = "打印时序回归标记-0x5f3759df";
         let registry = Arc::new(ConnectionRegistry::new());
-        let handler = StandaloneBusinessHandler::new(
+        let handler = BusinessHandler::new(
             OneBotConfig::default(),
             // 分发句柄是无状态的，命令由插件按归属登记在命令表里；
             // 框架测试只验证「收到消息先打印」的时序，不需要任何命令。
