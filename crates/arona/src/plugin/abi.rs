@@ -179,7 +179,9 @@ pub struct HostBridge {
     /// `message` 是不带来源的正文，`source` 是 dll 这一侧的线程局部来源（可为空指针）。
     /// 三者都是 NUL 结尾 UTF-8；来源以宿主为准，宿主没标注时才用它兜底。
     pub log: extern "C" fn(level: *const c_char, message: *const c_char, source: *const c_char),
-    /// 宿主的进程默认实例（`*const Framework`，擦成 `c_void`）
+    /// 宿主的进程默认实例（`*const Framework`，擦成 `c_void`）。挂在实例上的状态
+    /// （注册表、插件配置文件、框架那份 arona.yml、主动发消息的出口）都跟着这一份走，
+    /// 所以新增状态只要放在 `Framework` 上就不必再抬 [`ABI_LAYOUT`]。
     pub framework: extern "C" fn() -> *const c_void,
     /// 宿主登记的 tokio 句柄（`*const Handle`），没有则返回空指针
     pub runtime: extern "C" fn() -> *const c_void,

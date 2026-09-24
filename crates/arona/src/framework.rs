@@ -19,8 +19,14 @@
 //!
 //! 刻意留在进程级的是**真正只有一份的进程资源**：日志、目录约定（`runtime::paths`）、
 //! OneBot 连接与控制台。它们是宿主进程的属性，不是插件契约的注册表。
+//!
+//! 反过来，凡是**插件也会经自由函数碰到**的状态都必须挂在这里，不能另起 `static`：
+//! 框架配置的持有者（[`Framework::settings`]）与主动发消息的出口
+//! （[`Framework::runtime_services`]）就是这么被收进来的——动态插件 dll 静态链接了自己
+//! 那份框架代码，只有跟着实例走才会随 [`Framework::adopt_host`] 一起接到宿主上。
 use crate::config::arona::SectionRegistry;
 use crate::config::plugin_config::ConfigStore;
+use crate::config::settings::Settings;
 use crate::container::ServiceContainer;
 use crate::onebot::hooks::HookRegistry;
 use crate::plugin::health::HealthBoard;
@@ -28,6 +34,7 @@ use crate::plugin::manager::{LoaderRegistry, PluginManager};
 use crate::quartz::Scheduler;
 use crate::runtime::config::Gating;
 use crate::runtime::dispatcher::CommandRegistry;
+use crate::runtime::services::RuntimeServices;
 use crate::services::ServiceManager;
 use std::sync::{Arc, OnceLock};
 
@@ -43,6 +50,8 @@ pub struct Framework {
     services: Arc<ServiceManager>,
     sections: Arc<SectionRegistry>,
     configs: Arc<ConfigStore>,
+    settings: Arc<Settings>,
+    runtime_services: Arc<RuntimeServices>,
     jobs: Arc<Scheduler>,
     loaders: Arc<LoaderRegistry>,
     plugins: Arc<PluginManager>,
@@ -140,6 +149,8 @@ impl Framework {
             services: Arc::default(),
             sections: sections.clone(),
             configs: Arc::new(ConfigStore::new(sections, plugins.clone())),
+            settings: Arc::default(),
+            runtime_services: Arc::default(),
             jobs: Arc::default(),
             loaders: Arc::default(),
             plugins: plugins.clone(),
@@ -151,6 +162,8 @@ impl Framework {
         health.attach(&framework);
         // 定时任务表同理：处理器 panic 时要记到归属插件名下，而不是让调度循环静默消失
         framework.jobs().attach(&framework);
+        // arona.yml 的持有者同理：重载之后要把配置落到**它所属这一套**门控/健康度上
+        framework.settings().attach(&framework);
         framework
     }
 
@@ -195,7 +208,7 @@ impl Framework {
         GLOBAL.set(unsafe { Arc::from_raw(host) }).is_ok()
     }
 
-    /// 本实例是否就是进程默认实例（只有它可以写进程级的配置文件）
+    /// 本实例是否就是进程默认实例（只有它背后那份 arona.yml 是真实配置文件）
     fn is_process_default(&self) -> bool {
         std::ptr::eq(self, Framework::global())
     }
@@ -238,7 +251,7 @@ impl Framework {
         crate::runtime::log::error(format!(
             "插件 {plugin} 连续 {threshold} 次 panic，已隔离停用（回收它登记的全部资源）"
         ));
-        // 落盘只在进程默认实例上做：config/settings 是进程级资源，隔离实例不该碰真实配置
+        // 落盘只在进程默认实例上做：隔离实例那份 Settings 没绑定任何真实文件，不该去动磁盘
         if self.is_process_default() {
             if let Err(problem) = crate::config::settings::set_plugin_enabled(plugin, false) {
                 crate::runtime::log::debug(format!("停用状态未能写入 arona.yml: {problem}"));
@@ -280,6 +293,16 @@ impl Framework {
     /// 插件配置文件（`config/<id>/arona.yml`）的加载状态
     pub fn configs(&self) -> &Arc<ConfigStore> {
         &self.configs
+    }
+
+    /// 框架自己那份 `config/arona.yml` 的持有者（加载、热重载监听、`/config` 读写）
+    pub fn settings(&self) -> &Arc<Settings> {
+        &self.settings
+    }
+
+    /// 运行期服务引用：数据根目录与主动发消息的出口
+    pub fn runtime_services(&self) -> &Arc<RuntimeServices> {
+        &self.runtime_services
     }
 
     /// 定时任务表

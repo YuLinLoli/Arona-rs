@@ -873,7 +873,7 @@ runtime 上，连接池和 keepalive 全开也不会炸；插件的 `Cargo.toml`
 ```bash
 cargo run -p arona-host                  # 默认打开管理面板 GUI
 cargo run -p arona-host -- --nogui       # 纯命令行模式（黑窗口）
-cargo run -p arona-host -- --test-notify # 20 秒后跑一次每日推送，便于联调（它走的是插件主动发消息那条路，§22 的已知缺口表正好压在这上面）
+cargo run -p arona-host -- --test-notify # 20 秒后跑一次每日推送，便于联调（它走的是插件**主动**发消息那条路，正好用来验 §22 那两处状态是不是真的接进了宿主）
 cargo build -p arona-host --no-default-features   # 精简命令行版
 cargo build-plugin                       # 编示例插件：target/release/hello_plugin.dll
 ```
@@ -1171,25 +1171,27 @@ mirai 的插件和框架在同一个 ClassLoader 树里，`MiraiInstance` 只有
 （`quartz`、`container`、`plugin::manager`、`config::plugin_config` 走 `Framework::global().configs()`）
 全部正确，因为交出去的就是宿主那个实例；另起 `static` 的，插件里就是独立的一份空表，
 而 `get_or_init` 让它**不 panic、只是静默失效** —— 比崩掉难查得多。框架里所有 `static` 已按这条
-判据逐个核过一遍，落在插件可见范围内的缺口只有下表两处（`runtime::config::*` 看起来像进程级，
-其实 `gating()` 就是 `Framework::global().gating()`，所以 `groups()` / `bot_id()` 这些在插件里是通的）。
+判据逐个核过一遍，插件可见范围内原本有两处不合规，**现已收进实例**（下一小节）；
+`runtime::config::*` 看起来像进程级，其实 `gating()` 就是 `Framework::global().gating()`，
+所以 `groups()` / `bot_id()` 这些一直是通的。
 
-#### 已知还没接过去的两处进程级状态
+#### 曾经静默失效的两处（已收进 `Framework` 实例）
 
-| 入口 | 插件里的真实行为 | 症状 |
+| 入口 | 现在的形态 | 曾经的症状 |
 | --- | --- | --- |
-| `arona::runtime::services::sender_ready` / `send_message` | 宿主在启动流程里 `set_message_sender`，只写到宿主那份；插件这份恒为 `None` | 定时任务与事件钩子里**主动**发的消息**永久不成立**：`sender_ready()` 恒 `false`，`send_message()` 返回默认回执，消息原地丢弃且不带错误。框架自带的示例插件就中招 —— `plugins/hello` 的「每日问好」与「进群欢迎语」两条都是这条路径，写成 `let _ = send_message(..)` 连失败都看不见。命令的回话不受影响（走宿主传进来的 `CommandContext`） |
-| `arona::config::settings::*`（框架那份 `groups`/`managers`） | `settings::init` 只在宿主启动流程里调用，插件那份 `file` 恒为 `None` | 读出来是默认值（`/config` 列出空的管理员表），写则报「配置文件尚未初始化」。插件自己的 `config/<插件>/arona.yml` **不受影响**，那条走实例 |
+| `arona::runtime::services::sender_ready` / `send_message` / `data_root` | 状态是实例上的 `RuntimeServices`（`Framework::runtime_services()`），自由函数只是它的门面 | 宿主 `set_message_sender` 只写到宿主那份，插件这份恒 `None`：定时任务与事件钩子里**主动**发的消息永久不成立，返回默认回执、消息原地丢弃且不带错误。框架自带的示例插件就中招 —— `plugins/hello` 的「每日问好」与「进群欢迎语」两条都是这条路径，写成 `let _ = send_message(..)` 连失败都看不见 |
+| `arona::config::settings::*`（框架那份 `groups`/`managers`） | 状态是实例上的 `Settings`（`Framework::settings()`），`init` 之后连热重载监听都跟着实例走 | 插件那份 `file` 恒为 `None`：读出来是默认值（`/config` 列出空的管理员表），写则报「配置文件尚未初始化」。插件自己的 `config/<插件>/arona.yml` 一直不受影响，那条本来就走在实例上 |
 
-这两处在插件侧目前**没有替代写法**（`PluginContext` 上没有发送消息的入口）。所以"插件命令能回话、
-单测全绿"都不能证明主动推送链路可用 —— 得真驱动一次主动消息才算验过，§17 的 `--test-notify`
-就是为此留的（它延迟跑一次每日推送，正好压在上面第一行那条判据上）。框架侧把这两份状态收进
-`Framework` 实例之后本表清空，届时不再需要插件配合改代码。
+搬进实例不需要新增 ABI 通道、没有抬 `ABI_LAYOUT`、**插件源码一行不改**，重编 dll 即可。
+代价是这两处对插件**彻底可用**了：插件里 `arona::config::settings::init(...)` 现在真的会去
+重载宿主那份 arona.yml（示例：插件的"恢复备份"流程就靠它），所以别把它当调试工具随手调。
 
-上面两行都是**实测确认**而非推断，而且是同一进程内的对照实验：同一个示例插件 dll，`/你好`、
-`/示例延时`、`/示例联网` 三条回话都成功到了实现端（走 `CommandContext`），而它事件钩子里那条
-主动 `send_message` 一条都没到；`--test-notify` 在启动 20 秒后（宿主侧发送器早已备好）照样报
+这两处曾经的症状都是**实测确认**而非推断，而且是同一进程内的对照实验：同一个示例插件 dll，
+`/你好`、`/示例延时`、`/示例联网` 三条回话都成功到了实现端（走 `CommandContext`），而它事件钩子里
+那条主动 `send_message` 一条都没到；`--test-notify` 在启动 20 秒后（宿主侧发送器早已备好）照样报
 「消息发送器尚未就绪」。同进程、同 dll、相隔十几秒 —— 时序与网络都解释不了，只能是两份内存。
+**修好之后要复跑同一条链才算数**：假 OneBot 会下发一条 `group_increase` 并在 23 秒时按
+`sent.log` 的新增部分打印「探针通过 / 探针失败」，只看命令能回话不足以宣布主动消息链路可用。
 
 #### 两份 tokio：哪些调用能直接用
 
@@ -1273,9 +1275,11 @@ tokio 也被静态链接成了两份，而"当前在哪个运行时里"这个上
   `runtime::priority` 等——不在此列，它们不碰注册表。）
   注意"接管了默认实例"不等于"所有自由函数都通"：判据是上一小节那条 —— **状态挂在实例上才通，
   另起 `static` 的就是插件自己那份空表**。
-- **目前还别指望 `arona::runtime::services::send_message` 与 `arona::config::settings::*`**：
-  这两处正是上面说的"另起 `static`"，dll 里各持一份空的，主动消息会被静默丢弃、框架配置的读写
-  会报「配置文件尚未初始化」。详见上一小节的已知缺口表，以及怎么用 `--test-notify` 验到它。
+- **`arona::runtime::services::send_message` 与 `arona::config::settings::*` 在插件里是真通的**：
+  这两处以前各持一份进程级 `static`，dll 里那份是空的，主动消息会被静默丢弃、写配置会报
+  「配置文件尚未初始化」；现在它们住在 `Framework` 实例上，随上行通道一起被接管（上一小节）。
+  也正因为通了，`settings::init` 这类写盘入口对插件**不再无害** —— 它重载的是宿主那份 arona.yml。
+  验这条链路必须真驱动一次主动消息（假 OneBot 的 `group_increase` 探针），只看命令能不能回话不算。
 - **不要裸 `tokio::spawn`**：用 `ctx.spawn(..)` / `ctx.spawn_as(..)`，否则停用时收不掉它。
   确实需要 runtime 句柄时走 `arona::runtime::reactor`，那是刻意留在进程级的那一份。
 - **不要自带 HTTP 客户端**：出站请求走 `arona::runtime::http`（§14.1）。dll 里那份 reqwest 只要
