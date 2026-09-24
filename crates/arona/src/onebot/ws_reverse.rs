@@ -14,7 +14,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use futures_util::{SinkExt, StreamExt};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tokio::task::JoinHandle;
@@ -29,9 +29,17 @@ pub struct WsReverseState {
     pub core: Arc<ConnectionCore>,
     pub clients: Mutex<Vec<UnboundedSender<Message>>>,
     pub stopped: AtomicBool,
+    /// 当前握着的客户端 socket 数：反向 WS 是"实现端来连我们"，0↔非 0 才是连接状态翻转，
+    /// 中间那条断开不该让插件以为整个连接没了
+    pub live_clients: AtomicU64,
 }
 
 impl WsReverseState {
+    /// 给插件的 lifecycle 事件当来源标识用（反向 WS 是"实现端来连我们"，这里写的是我们监听的地址）
+    fn endpoint(&self) -> String {
+        format!("ws://{}:{}{}", self.host, self.port, self.path)
+    }
+
     pub fn new(endpoint: &ConnectionConfig, core: Arc<ConnectionCore>) -> Arc<WsReverseState> {
         Arc::new(WsReverseState {
             id: next_conn_id(),
@@ -47,6 +55,7 @@ impl WsReverseState {
             core,
             clients: Mutex::new(Vec::new()),
             stopped: AtomicBool::new(false),
+            live_clients: AtomicU64::new(0),
         })
     }
 }
@@ -191,6 +200,12 @@ async fn handle_socket(socket: WebSocket, state: Arc<WsReverseState>) {
         clients.push(tx);
     }
     log::info(format!("[OneBot reverse WS] 客户端已连接: {}", state.id));
+    if state.live_clients.fetch_add(1, Ordering::SeqCst) == 0 {
+        state
+            .core
+            .business
+            .notify_lifecycle("connect", &state.endpoint());
+    }
     // 独立写任务：大图(base64)等大负载写 socket 时不再堵住读循环，
     // 否则「收消息 + 打印日志」会跟着一起卡住。
     let writer = tokio::spawn(async move {
@@ -234,8 +249,16 @@ async fn handle_socket(socket: WebSocket, state: Arc<WsReverseState>) {
         }
     }
     writer.abort();
-    let mut clients = state.clients.lock().unwrap();
-    clients.retain(|c| !c.is_closed());
+    {
+        let mut clients = state.clients.lock().unwrap();
+        clients.retain(|c| !c.is_closed());
+    }
+    if state.live_clients.fetch_sub(1, Ordering::SeqCst) == 1 {
+        state
+            .core
+            .business
+            .notify_lifecycle("disable", &state.endpoint());
+    }
     log::info("[OneBot reverse WS] 客户端断开");
 }
 

@@ -17,6 +17,8 @@ pub struct HttpReverseState {
     pub heartbeat_interval_ms: u64,
     pub core: Arc<ConnectionCore>,
     pub stopped: AtomicBool,
+    /// 上一次心跳有没有打到实现端：反向 HTTP 没有长连接，"连上/断了"只能看心跳的成败
+    pub online: AtomicBool,
 }
 
 impl HttpReverseState {
@@ -28,6 +30,7 @@ impl HttpReverseState {
             heartbeat_interval_ms: endpoint.heartbeat_interval,
             core,
             stopped: AtomicBool::new(false),
+            online: AtomicBool::new(false),
         })
     }
 }
@@ -134,7 +137,14 @@ impl OneBotConnection for HttpReverseConnection {
                 let proxy = HttpReverseProxy {
                     state: state.clone(),
                 };
-                let _ = proxy.send(action).await;
+                let reachable = proxy.send(action).await.is_some();
+                // 心跳打不通就等于掉线：反向 HTTP 没有长连接，这是唯一能观察到状态翻转的地方
+                if state.online.swap(reachable, Ordering::SeqCst) != reachable {
+                    state.core.business.notify_lifecycle(
+                        if reachable { "connect" } else { "disable" },
+                        &state.url,
+                    );
+                }
             }
         }));
     }

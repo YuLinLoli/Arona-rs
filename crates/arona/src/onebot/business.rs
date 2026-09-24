@@ -73,6 +73,45 @@ impl BusinessHandler {
         *self.config.write().unwrap() = config;
     }
 
+    /// 传输层连上/断开时合成的 lifecycle 元事件：**只投插件钩子，不回播给其它实现端**。
+    ///
+    /// 框架可以在一条连接上同时挂多个实现端，`on_event` 开头那道 `broadcast_except` 是给
+    /// 它们同步真实事件用的；把框架自己造的事件塞进去等于对着别家的客户端撒谎。
+    /// `endpoint` 只作展示（日志与插件自查），不参与匹配。
+    pub fn notify_lifecycle(&self, state: &str, endpoint: &str) {
+        let self_id = self.self_id();
+        let time = chrono::Local::now().timestamp();
+        let mut raw = serde_json::Map::new();
+        raw.insert("time".into(), json!(time));
+        raw.insert("self_id".into(), json!(self_id));
+        raw.insert("post_type".into(), json!("meta_event"));
+        raw.insert("meta_event_type".into(), json!("lifecycle"));
+        // v11 把状态写在 sub_type，部分实现端另写一份 state：插件按哪个读都能命中
+        raw.insert("sub_type".into(), json!(state));
+        raw.insert("state".into(), json!(state));
+        raw.insert("url".into(), json!(endpoint));
+        let event = OneBotEvent {
+            time,
+            self_id,
+            post_type: "meta_event".into(),
+            notice_type: None,
+            message_type: None,
+            sub_type: Some(state.into()),
+            message_id: None,
+            user_id: None,
+            operator_id: None,
+            group_id: None,
+            raw_message: None,
+            message: None,
+            sender: None,
+            raw: Value::Object(raw),
+        };
+        let hooks = self.framework.hooks().clone();
+        tokio::spawn(async move {
+            hooks.dispatch(&event).await;
+        });
+    }
+
     /// 收到事件
     pub fn on_event(&self, event: OneBotEvent, connection: Arc<dyn OneBotConnection>) {
         self.registry.broadcast_except(&event.raw, connection.id());
@@ -526,5 +565,94 @@ mod tests {
         cached_member(&peers, 20001, 100);
         BusinessHandler::handle_notice(10001, &peers, &notice("group_ban", 20001, 100, None));
         assert!(peers.members().get(&(20001, 101)).is_some());
+    }
+
+    /// 只把 payload 收下来的连接：用来钉「合成事件没有回播给实现端」
+    #[derive(Default)]
+    struct Recorder {
+        sent: Mutex<Vec<String>>,
+    }
+
+    impl OneBotConnection for Recorder {
+        fn id(&self) -> u64 {
+            2
+        }
+
+        fn send<'a>(
+            &'a self,
+            _action: OneBotAction,
+        ) -> BoxFuture<'a, Option<OneBotActionResponse>> {
+            Box::pin(std::future::pending::<Option<OneBotActionResponse>>())
+        }
+
+        fn send_raw(&self, payload: &str) {
+            self.sent.lock().unwrap().push(payload.to_string());
+        }
+
+        fn start(&self) {}
+        fn stop(&self) {}
+    }
+
+    /// 连接状态翻转要变成插件能订阅的一条 lifecycle 元事件，而且只投钩子：
+    /// 把自己造的事件回播给实现端，等于对着别家客户端撒谎。
+    #[tokio::test]
+    async fn lifecycle_flips_reach_hooks_without_reaching_the_implementation() {
+        use crate::framework::Framework;
+        use crate::onebot::hooks::{
+            BodyFilter, EventContext, HookFlow, ListenerPriority, MetaKind, event_handler,
+        };
+
+        let framework = Framework::new();
+        let registry = Arc::new(ConnectionRegistry::new());
+        let recorder = Arc::new(Recorder::default());
+        registry.register(recorder.clone());
+        let handler = BusinessHandler::new(
+            OneBotConfig::default(),
+            framework.clone(),
+            Arc::new(crate::runtime::dispatcher::CommandDispatcher::new()),
+            registry,
+        );
+
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        for state in ["connect", "disable"] {
+            let sink = seen.clone();
+            framework.hooks().subscribe_where(
+                "LifecycleProbePlugin",
+                &[BodyFilter::meta(MetaKind::Lifecycle, state)],
+                ListenerPriority::default(),
+                event_handler(move |ctx: Arc<EventContext>| {
+                    let sink = sink.clone();
+                    Box::pin(async move {
+                        assert_eq!(ctx.body.display_name(), format!("元事件:生命周期({state})"));
+                        sink.lock().unwrap().push(
+                            ctx.event.raw["url"]
+                                .as_str()
+                                .unwrap_or_default()
+                                .to_string(),
+                        );
+                        HookFlow::Pass
+                    })
+                }),
+            );
+        }
+
+        handler.notify_lifecycle("connect", "ws://127.0.0.1:9001");
+        handler.notify_lifecycle("disable", "ws://127.0.0.1:9001");
+        // 合成事件是 spawn 出去的，等两条钩子都跑到
+        for _ in 0..200 {
+            if seen.lock().unwrap().len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            vec!["ws://127.0.0.1:9001".to_string(); 2],
+            "两种状态各命中自己那一档，并带上来源标识"
+        );
+        assert!(
+            recorder.sent.lock().unwrap().is_empty(),
+            "框架合成的事件不该发给实现端"
+        );
     }
 }

@@ -24,6 +24,8 @@ pub struct RunState {
     pub core: Arc<ConnectionCore>,
     pub session_tx: Mutex<Option<UnboundedSender<Message>>>,
     pub stopped: AtomicBool,
+    /// 当前是否握着一条活 socket：只在 0↔1 翻转时给插件发 lifecycle，重连过程中的每次失败不发
+    pub online: AtomicBool,
     /// 读循环的唤醒信号：stop() 时用它立刻打断 select!（Notify 会保存一次许可，不会丢事件）
     pub stop_notify: tokio::sync::Notify,
 }
@@ -39,6 +41,7 @@ impl RunState {
             core,
             session_tx: Mutex::new(None),
             stopped: AtomicBool::new(false),
+            online: AtomicBool::new(false),
             stop_notify: tokio::sync::Notify::new(),
         })
     }
@@ -212,6 +215,9 @@ async fn run_forward(state: Arc<RunState>) {
         };
         fail_count = 0;
         log::info(format!("[OneBot WS] 已连接: {}", state.url));
+        if !state.online.swap(true, Ordering::SeqCst) {
+            state.core.business.notify_lifecycle("connect", &state.url);
+        }
         let (mut sink, mut stream) = ws.split();
         let (tx, mut rx) = unbounded_channel::<Message>();
         *state.session_tx.lock().unwrap() = Some(tx);
@@ -284,6 +290,9 @@ async fn run_forward(state: Arc<RunState>) {
         }
         writer.abort();
         *state.session_tx.lock().unwrap() = None;
+        if state.online.swap(false, Ordering::SeqCst) {
+            state.core.business.notify_lifecycle("disable", &state.url);
+        }
         if !state.stopped.load(Ordering::SeqCst) {
             tokio::time::sleep(std::time::Duration::from_millis(
                 state.reconnect_interval_ms,

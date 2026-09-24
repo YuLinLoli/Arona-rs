@@ -271,6 +271,17 @@ pub struct RequestInfo {
     pub via: Option<String>,
 }
 
+/// `meta_event` 事件的细节。
+///
+/// v11 把 lifecycle 的状态写在 `sub_type`（connect / enable / disable），心跳的间隔写在
+/// `interval`，而部分实现端另写一份 `state`。只看 `meta_event_type` 分不出"连上了"和
+/// "断了"，所以把这一层取值一起归位——它也是框架自己合成连接状态事件时用的字段。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MetaInfo {
+    /// 生命周期状态：connect / enable / disable（心跳等非 lifecycle 元事件为 None）
+    pub state: Option<String>,
+}
+
 /// 强类型的事件体（对应 mirai 的 `GroupMessageEvent`/`NudgeEvent` 这一族）。
 ///
 /// 插件不再靠 `field_str("notice_type") == Some("group_increase")` 这种字符串比较分支，
@@ -287,7 +298,7 @@ pub enum EventBody {
     },
     Notice(NoticeKind, NoticeInfo),
     Request(RequestKind, RequestInfo),
-    Meta(MetaKind),
+    Meta(MetaKind, MetaInfo),
     /// 框架没认出大类的事件（实现端自定义 post_type）
     Other {
         post_type: String,
@@ -338,7 +349,13 @@ impl EventBody {
                 )
             }
             "meta_event" | "meta" => {
-                EventBody::Meta(MetaKind::parse(raw_str(event, "meta_event_type")))
+                let state = detail(event, &["state", "sub_type"]);
+                EventBody::Meta(
+                    MetaKind::parse(raw_str(event, "meta_event_type")),
+                    MetaInfo {
+                        state: (!state.is_empty()).then_some(state),
+                    },
+                )
             }
             other => EventBody::Other {
                 post_type: other.to_string(),
@@ -355,7 +372,7 @@ impl EventBody {
             }
             EventBody::Notice(..) => Some(EventKind::Notice),
             EventBody::Request(..) => Some(EventKind::Request),
-            EventBody::Meta(_) => Some(EventKind::Meta),
+            EventBody::Meta(..) => Some(EventKind::Meta),
             EventBody::Other { .. } => None,
         }
     }
@@ -389,7 +406,10 @@ impl EventBody {
                 Some(via) => format!("申请:{}({})", kind.display_name(), via),
                 None => format!("申请:{}", kind.display_name()),
             },
-            EventBody::Meta(kind) => format!("元事件:{}", kind.display_name()),
+            EventBody::Meta(kind, info) => match &info.state {
+                Some(state) => format!("元事件:{}({})", kind.display_name(), state),
+                None => format!("元事件:{}", kind.display_name()),
+            },
             EventBody::Other { post_type, .. } => format!("其他:{post_type}"),
         }
     }
@@ -460,6 +480,10 @@ pub enum BodyFilter {
     NoticeAction(NoticeKind, String),
     Request(RequestKind),
     Meta(MetaKind),
+    /// 元事件子类 + 状态（[`MetaInfo::state`]）：
+    /// `BodyFilter::meta(MetaKind::Lifecycle, "connect")` 只收"连接建立"，
+    /// 掉线是 "disable"。框架在传输层 0↔1 翻转时合成的就是这一族。
+    MetaState(MetaKind, String),
 }
 
 impl BodyFilter {
@@ -469,6 +493,14 @@ impl BodyFilter {
             return BodyFilter::Notice(kind);
         }
         BodyFilter::NoticeAction(kind, action.trim().to_ascii_lowercase())
+    }
+
+    /// 元事件子类；`state` 非空时只收该状态（如 `("lifecycle", "connect")`）
+    pub fn meta(kind: MetaKind, state: &str) -> BodyFilter {
+        if state.is_empty() {
+            return BodyFilter::Meta(kind);
+        }
+        BodyFilter::MetaState(kind, state.trim().to_ascii_lowercase())
     }
 
     /// 这个过滤器是否收该事件
@@ -490,7 +522,13 @@ impl BodyFilter {
             BodyFilter::Request(kind) => {
                 matches!(body, EventBody::Request(found, _) if found == kind)
             }
-            BodyFilter::Meta(kind) => matches!(body, EventBody::Meta(found) if found == kind),
+            BodyFilter::Meta(kind) => matches!(body, EventBody::Meta(found, _) if found == kind),
+            BodyFilter::MetaState(kind, state) => matches!(
+                body,
+                EventBody::Meta(found, info)
+                    if found == kind
+                        && info.state.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(state))
+            ),
         }
     }
 
@@ -506,6 +544,9 @@ impl BodyFilter {
             }
             BodyFilter::Request(kind) => format!("申请:{}", kind.display_name()),
             BodyFilter::Meta(kind) => format!("元事件:{}", kind.display_name()),
+            BodyFilter::MetaState(kind, state) => {
+                format!("元事件:{}({})", kind.display_name(), state)
+            }
         }
     }
 }
@@ -1781,6 +1822,63 @@ mod tests {
             BodyFilter::notice(NoticeKind::GroupDecrease, "").display_name(),
             "通知:成员退群",
             "空动作就是整类"
+        );
+    }
+
+    /// 连接状态的写法：v11 把 lifecycle 的状态写在 `sub_type`，实现端常另写一份 `state`，
+    /// 两种都得归到 [`MetaInfo::state`]，插件才不必自己比字符串
+    #[test]
+    fn lifecycle_state_lands_in_the_body() {
+        for key in ["sub_type", "state"] {
+            let mut raw = json!({ "post_type": "meta_event", "meta_event_type": "lifecycle" });
+            raw[key] = json!("connect");
+            let body = EventBody::from_event(&raw_event(raw));
+            assert!(
+                matches!(
+                    &body,
+                    EventBody::Meta(MetaKind::Lifecycle, info)
+                        if info.state.as_deref() == Some("connect")
+                ),
+                "{key} 写法都得归到 MetaInfo::state：{body:?}"
+            );
+            assert_eq!(body.display_name(), "元事件:生命周期(connect)");
+        }
+
+        // 心跳没有状态，别给它编一个出来
+        let heartbeat = EventBody::from_event(&raw_event(json!({
+            "post_type": "meta_event",
+            "meta_event_type": "heartbeat",
+            "interval": 5000,
+        })));
+        assert!(
+            matches!(&heartbeat, EventBody::Meta(MetaKind::Heartbeat, info) if info.state.is_none())
+        );
+    }
+
+    /// 只订阅"连上了"的钩子不该被掉线叫醒
+    #[test]
+    fn meta_state_filter_narrows_the_lifecycle() {
+        let connect = EventBody::from_event(&raw_event(json!({
+            "post_type": "meta_event", "meta_event_type": "lifecycle", "sub_type": "connect",
+        })));
+        let disable = EventBody::from_event(&raw_event(json!({
+            "post_type": "meta_event", "meta_event_type": "lifecycle", "sub_type": "disable",
+        })));
+        let on_connect = BodyFilter::meta(MetaKind::Lifecycle, "connect");
+        assert!(on_connect.matches(&connect), "connect 应命中");
+        assert!(
+            !on_connect.matches(&disable),
+            "掉线不该叫醒只订阅 connect 的钩子"
+        );
+        assert!(
+            BodyFilter::Meta(MetaKind::Lifecycle).matches(&disable),
+            "整族订阅两种状态都收"
+        );
+        assert_eq!(on_connect.display_name(), "元事件:生命周期(connect)");
+        // 空串退化成整族，和 notice() 一个口径
+        assert_eq!(
+            BodyFilter::meta(MetaKind::Lifecycle, ""),
+            BodyFilter::Meta(MetaKind::Lifecycle)
         );
     }
 
