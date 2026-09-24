@@ -121,6 +121,36 @@ arona-host ──depends──▶ arona（框架）──启动时扫描──�
 这份"一样"是框架换来的：凡是背后连着第三方库状态的能力（聊天记录库、OneBot 动作、HTTP 代发），
 框架都只把**宿主生成的 vtable** 或 `extern "C"` 函数交出去，绝不让 dll 自己动手——§22 那两道关讲的就是这件事。
 
+### 上面那张表没盖到的地方（从 mirai 移植时按这个对照）
+
+同名能力都在，形状有几处不一样。下面这些不是"还没做"就是"刻意不做"，写插件前值得过一遍：
+
+1. **一台机器人一个进程**。mirai 的 `BotFactory.newBot(qq, password)` 能在一个 JVM 里跑多账号；
+   一个 `Framework` 实例只持**一个** OneBot 应用（`OnebotOutlet::application`）。多 QQ 号的做法是
+   多份运行目录起多个宿主进程，插件因此不存在"跨账号操作"这回事。
+2. **句柄不缓存资料，对象图不落内存**。mirai 的 `bot.groups` / `group.members` / `member.nameCard`
+   是内存里随事件更新的缓存，读它们零网络；这里每个资料都是现查实现端的 `async` 调用
+   （`group.info()`、`member.info()`）。要零网络就自己用 `ctx.spawn` + 事件维护一份缓存，
+   或经 §11 的服务容器让几个插件共用那一份。框架不替插件隐式发请求。
+3. **没有 `group.history` 那种可分页的历史**。这里的聊天记录库（§21）只按 `message_id` 点查，
+   没有"按群/按人翻最近 N 条"的出口。补它要在 `chatlog.db` 上加索引与分页查询，属于新增能力。
+4. **图片不是可复用对象**。mirai `Image.upload()` 给的 `Image` 带 `imageId`，同一张图能塞进多条
+   消息不重传；这里出站是 `MessageSegment::Image { file | url | data }`，每发一次实现端处理一次。
+   （群文件另有 `upload_group_file`，那是另一件事。）
+5. **连接生命周期不在插件手里**。mirai 的 `bot.login()/logout()/close()` 与 `OtherClient`（多端设备）
+   没有对应项；插件只读 `bot.is_online()`，断开由宿主重连。刻意如此：插件关掉唯一那条连接，
+   同进程的别的插件就全瞎了。
+6. **事件不是一事件一 class**。mirai 有 `FriendMessageEvent` / `TempMessageEvent` / `NudgedEvent` 这一族，
+   这里是 OneBot 的四类 `post_type` + `EventBody`/`NoticeKind` 归位（§9）。临时会话里的消息在
+   mirai 是独立事件，在这里是 `PrivateMessage { sub_type: "group" }`。移植时按 `BodyFilter` 找，别按类名找。
+7. **闪图一类段型没有专名**。§19 那 15 段没有 flash 的对应项；实现端给出框架不认的段时落成
+   `MessageSegment::Raw { kind, data }`，**收发都不丢**，但语义要插件自己判。
+8. **`Bot::of(隔离实例)` 上 `api()` 不隔离**。`OneBotApi` 是零宽类型，取连接时读的是**进程默认实例**
+   上的 `OnebotOutlet`。宿主与 dll（经 `adopt_host` 认领宿主实例）拿到的都是同一条真实连接，
+   所以插件侧不存在这个问题；只有测试里 `Bot::of(&另一套实例)` 时 `bot.api()` 仍落到默认实例，
+   而 `bot.send()` / `bot.recall()` / `bot.message()` 读的是 self 这套（`bot/mod.rs` 顶部注释写明）。
+   要彻底隔离得把连接出口做成 `OneBotApi` 的字段，目前没做。
+
 ## 4. 生命周期（`arona::run` → `run_bot` 的真实顺序）
 
 `arona::run(args)` 内部按序驱动四阶段——插件不需要、也无法在 `run` 之前登记，装载完全由磁盘决定：
@@ -819,6 +849,7 @@ mirai 的手感是"先拿到一个对象，再往对象上说话"，而不是到
 | `group.members` / `group[id]` | `group.members().await` / `group.member(id).await` | 后者会查一次实现端，确认这个人真在群里 |
 | —— | `group.member_of(id)` | 只拿句柄不查网络，紧接着要禁言/踢人时省一次往返 |
 | `subject.sendMessage(chain)` | `group.send(msg).await` / `friend.send_text("…").await` | 走框架的出站通道（§9.1 钩子、打印、拆分、自动撤回、记账），**不是**协议层旁路 |
+| `subject.sendMessage(..)` 返回 `MessageSource` | 同上，返回 `MessageReceipt`，再 `receipt.source()` → `Option<MessageSource>` | mirai 那一步直接给凭据；这里发出去的东西先给回执（`message_id`/`real_id`），`.source()` 换成能撤回、能引用的凭据。一个号都没给时是 `None` |
 | `message.source()` | `ctx.source()` → `Option<MessageSource>` | 实现端没给 `message_id` 时是 `None`，不编造 |
 | `source.recall()` | `source.recall().await` | 内部按 §21 的库换成实现端认的那个号 |
 | `QuoteReply(source.toQuote())` | `source.quote()` / `source.reply(msg).await` | 前者只给你一个 `MessageSegment::Reply`；后者过窗时自动还原成文字+图 |
@@ -852,6 +883,12 @@ for member in group.members().await? {
 group.mute(10001, 600).await?;
 group.set_card(10001, "改过的名片").await?;
 group.mute_all(true).await?;
+
+// 自己发出去的那条也能立刻撤回
+let receipt = group.send_text("这条是回执实验").await;
+if let Some(mine) = receipt.source() {
+    mine.recall().await.ok();
+}
 
 // 撤与引用：凭据从上下文来
 async fn demo(ctx: &arona::runtime::dispatcher::CommandContext) {

@@ -24,9 +24,11 @@
 //! ```
 //!
 //! 这些句柄都是**轻量的**：只装一个所属 [`Framework`] 实例的引用加几个 id，克隆零成本。
-//! 它们刻意只经实例出口拿状态（`onebot()` / `chatlog()` / `runtime_services()`），
+//! 它们刻意只经实例出口拿状态（`onebot()` / `chatlog_api()` / `runtime_services()`），
 //! 不碰任何进程级 `static`，所以插件 dll 里用它们和宿主里用完全一样——
 //! dll 认领的是宿主那套实例（判据见仓库根 `PLUGIN_DEVELOPMENT.md` §22）。
+//! 碰 sqlite 的那几个方法一律走 `chatlog_api()` 而不是 `chatlog()`，原因见
+//! [`crate::runtime::chatlog::ChatLogFace`]。
 
 use crate::framework::Framework;
 use crate::onebot::api::{
@@ -541,6 +543,17 @@ impl MessageSource {
     }
 }
 
+/// mirai 的 `subject.sendMessage(): MessageSource`：发出去的那条也能直接撤回、引用。
+///
+/// 实现端不给号时（发送器未就绪、被出站钩子拦下）是 `None`——那条消息到底有没有落进
+/// 会话都不确定，此时不该凭"发过"就撤回。NapCat / LLOWeb 只回 `real_id` 的那些按它取。
+impl MessageReceipt {
+    /// 这条回执对应消息的凭据
+    pub fn source(&self) -> Option<MessageSource> {
+        self.message_id.or(self.real_id).map(MessageSource::of)
+    }
+}
+
 /// mirai 的 `message.source()`：从命令上下文取出这条触发消息的凭据
 impl crate::runtime::dispatcher::CommandContext {
     /// 触发本次命令的那条消息的凭据；实现端没给 `message_id` 时是 `None`
@@ -732,5 +745,27 @@ mod tests {
         // 另一套没装配过的实例照原行为给空回执，不会借用这一家的发送器
         let idle = Bot::of(&Framework::new());
         assert_eq!(idle.group(20001).send_text("早").await.message_id, None);
+    }
+
+    /// 回执要能直接变回凭据：mirai 的 `sendMessage()` 返回的就是 `MessageSource`，
+    /// 「发完就撤」不该让插件自己拆字段。只给 `real_id` 的实现端也要认。
+    #[test]
+    fn receipts_become_the_source_of_the_message_they_acknowledge() {
+        let sent = MessageReceipt {
+            message_id: Some(1024),
+            real_id: Some(2048),
+        };
+        assert_eq!(sent.source().expect("给了号就该有凭据").message_id, 1024);
+
+        let only_real = MessageReceipt {
+            message_id: None,
+            real_id: Some(2048),
+        };
+        assert_eq!(only_real.source().expect("real_id 也算号").message_id, 2048);
+
+        assert!(
+            MessageReceipt::default().source().is_none(),
+            "一个号都没给时不该编出凭据"
+        );
     }
 }
