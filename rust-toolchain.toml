@@ -6,3 +6,7 @@
 # 老插件会全部拒载（这是设计意图，不是回归）。
 [toolchain]
 channel = "1.98.0"
+# 这里**故意不写 components**：写了之后每一次 cargo 都会先去补装缺的组件，
+# 补装失败（本机实测：撞上已存在的 bin\cargo-clippy.exe 报 detected conflict）就整条
+# 命令回滚报错，网络不好时还会把工具链留在半装状态。要 rustfmt/clippy 请显式跑一次：
+#   rustup component add rustfmt clippy
