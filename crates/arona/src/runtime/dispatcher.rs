@@ -121,6 +121,10 @@ pub struct CommandContext {
     /// 完整消息段：命令文本剥掉了召唤前缀，段里仍能看到 @、引用与图片
     pub segments: Vec<MessageSegment>,
     pub sender: Arc<dyn MessageSender>,
+    /// 所属框架实例：`api()` / `bot()` / 撤回与引用还原都从这里取连接与聊天记录库，
+    /// 多实例宿主里不会串到进程默认实例那套上去。
+    /// 追加在**末尾**：这是 dll 会读到的跨镜像结构体，字段偏移就是 ABI
+    pub framework: Arc<Framework>,
 }
 
 /// 回查群身份时给实现端的宽限：命令分发是同步等结果的，不能让一条慢 `get_group_member_info`
@@ -138,12 +142,12 @@ impl CommandContext {
     /// 协议层动作出口（mirai 的 `bot.callApi`）：上面 `reply` / `recall` 没覆盖的动作都走它。
     /// 取的是所属实例上的连接池，插件 dll 里调用同样落在宿主真正那条连接。
     pub fn api(&self) -> crate::onebot::api::OneBotApi {
-        crate::onebot::api::OneBotApi::global()
+        crate::onebot::api::OneBotApi::of(&self.framework)
     }
 
     /// mirai 风格的对象模型入口：`context.bot().group(123).send_text("老师")`
     pub fn bot(&self) -> crate::bot::Bot {
-        crate::bot::Bot::current()
+        crate::bot::Bot::of(&self.framework)
     }
 
     pub async fn reply_message(&self, message: OutgoingMessage) -> MessageReceipt {
@@ -159,7 +163,12 @@ impl CommandContext {
     /// 二十分钟前的 id 已经查不到）就用框架的聊天记录库把那条还原成文字加图。
     /// 触发消息本身没有引用时等同于 [`reply_message`](Self::reply_message)。
     pub async fn reply_with_quote(&self, mut message: OutgoingMessage) -> MessageReceipt {
-        if let Some(prefix) = crate::runtime::chatlog::quote_prefix(self.quoted, self.time).await {
+        let prefix = self
+            .framework
+            .chatlog_api()
+            .quote_prefix(self.quoted, self.time)
+            .await;
+        if let Some(prefix) = prefix {
             message.segments.splice(0..0, prefix);
         }
         self.reply_message(message).await
@@ -168,7 +177,7 @@ impl CommandContext {
     /// 撤回一条消息：先按框架的聊天记录库把 id 换成实现端认的那个号，再发 `delete_msg`。
     /// 传任意一个见过的号都行（事件里的 message_id、自己那条回复的回执都算）。
     pub async fn recall(&self, message_id: i64) -> Result<(), crate::onebot::OneBotError> {
-        crate::runtime::chatlog::recall(message_id).await
+        self.framework.chatlog_api().recall(message_id).await
     }
 
     /// 群内身份：先读事件自带的 `sender.role`，没有再走实例上的成员资料缓存
@@ -179,7 +188,7 @@ impl CommandContext {
             return Some(role);
         }
         let group_id = self.group_id?;
-        let bot = crate::bot::Bot::current();
+        let bot = crate::bot::Bot::of(&self.framework);
         let group = bot.group(group_id);
         let info = match tokio::time::timeout(ROLE_LOOKUP_TIMEOUT, group.member_info(self.user_id))
             .await
@@ -1041,6 +1050,7 @@ mod tests {
             quoted: None,
             segments: Vec::new(),
             sender: Arc::new(NullSender),
+            framework: Framework::new(),
         })
     }
 
@@ -1662,6 +1672,7 @@ mod tests {
             quoted: None,
             segments: Vec::new(),
             sender,
+            framework: Framework::new(),
         });
         assert!(registry.dispatch(context).await);
         assert_eq!(

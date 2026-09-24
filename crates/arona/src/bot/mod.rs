@@ -66,13 +66,12 @@ impl Bot {
 
     /// 底层 OneBot 动作出口：本模块没包到的动作走它（`call`/`call_typed` 是万能通道）。
     ///
-    /// 注意 [`OneBotApi`] 是无状态零宽类型，它取连接时读的是**进程默认实例**上的
-    /// [`OnebotOutlet`](crate::onebot::application::OnebotOutlet)。宿主与插件 dll（经
-    /// `adopt_host` 认领了宿主实例）拿到的都是同一条真实连接，所以这里没问题；
-    /// 只有测试里 `Bot::of(&另一套实例)` 时，`api()` 仍会落到默认实例——
-    /// 需要严格隔离时用 [`Bot::send`] / [`Bot::recall`] / [`Bot::message`]，它们读的是 self 这套。
+    /// [`OneBotApi`] 挂在**这套实例**上，取的是 `self.framework` 那份
+    /// [`OnebotOutlet`](crate::onebot::application::OnebotOutlet)：`Bot::of(&另一套实例)`
+    /// 之后动作仍然落在原来那条连接上的问题已经没有了，多实例宿主与测试里插件看到的
+    /// 都是自己这一套的连接、self_id 与缓存。
     pub fn api(&self) -> OneBotApi {
-        OneBotApi::global()
+        OneBotApi::of(&self.framework)
     }
 
     /// 机器人 QQ 号（onebot.yml 的 `self_id`）
@@ -803,7 +802,12 @@ impl crate::onebot::hooks::EventContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::onebot::OneBotConfig;
+    use crate::onebot::model::{OneBotAction, OneBotActionResponse};
+    use crate::onebot::{BusinessHandler, ConnectionRegistry, OneBotApplication, OneBotConnection};
+    use crate::runtime::dispatcher::CommandDispatcher;
     use crate::runtime::message::{BoxFuture, MessageSender};
+    use serde_json::json;
     use std::sync::Mutex;
 
     /// 只用来填满 `CommandContext.sender`：这几个用例不发消息，只想看凭据怎么拼
@@ -897,6 +901,7 @@ mod tests {
             quoted: None,
             segments: Vec::new(),
             sender: Arc::new(SilentSender),
+            framework: Framework::new(),
         };
         let source = context.source().expect("带了 message_id 就该有凭据");
         assert_eq!(source.message_id, 7);
@@ -1078,5 +1083,154 @@ mod tests {
         // 一句 `OutgoingMessage::from(image)` 就能发
         let message: OutgoingMessage = image.clone().into();
         assert_eq!(message.segments.len(), 1);
+    }
+
+    /// 回一包固定资料的假连接，顺手记下每笔动作名——用来数"这一套到底打了几次网络"
+    struct Canned {
+        nickname: &'static str,
+        self_id: i64,
+        seen: Mutex<Vec<String>>,
+    }
+
+    impl OneBotConnection for Canned {
+        fn id(&self) -> u64 {
+            7
+        }
+
+        fn send<'a>(&'a self, action: OneBotAction) -> BoxFuture<'a, Option<OneBotActionResponse>> {
+            let name = action.action.clone();
+            let data = match name.as_str() {
+                "get_login_info" => json!({ "user_id": self.self_id, "nickname": self.nickname }),
+                "get_group_member_info" => json!({
+                    "group_id": action.params["group_id"],
+                    "user_id": action.params["user_id"],
+                    "nickname": "成员甲",
+                }),
+                _ => json!(null),
+            };
+            self.seen.lock().unwrap().push(name.clone());
+            Box::pin(async move {
+                Some(OneBotActionResponse {
+                    status: "ok".to_string(),
+                    retcode: 0,
+                    data: Some(data),
+                    message: None,
+                    wording: None,
+                    echo: Some(name),
+                    raw: json!({}),
+                })
+            })
+        }
+
+        fn send_raw(&self, _payload: &str) {}
+        fn start(&self) {}
+        fn stop(&self) {}
+    }
+
+    /// 造一套"真连着实现端"的隔离实例，返回实例和它那条连接的记账本
+    fn canned_instance(nickname: &'static str, self_id: i64) -> (Arc<Framework>, Arc<Canned>) {
+        let framework = Framework::new();
+        let registry = Arc::new(ConnectionRegistry::new());
+        let canned = Arc::new(Canned {
+            nickname,
+            self_id,
+            seen: Mutex::new(Vec::new()),
+        });
+        registry.register(canned.clone());
+        let config = OneBotConfig {
+            self_id,
+            ..Default::default()
+        };
+        let business = Arc::new(BusinessHandler::new(
+            config.clone(),
+            framework.clone(),
+            Arc::new(CommandDispatcher::new()),
+            registry.clone(),
+        ));
+        framework
+            .onebot()
+            .attach(Arc::new(OneBotApplication::new(config, business, registry)));
+        (framework, canned)
+    }
+
+    /// `api()` 曾每次现取进程默认实例，于是 `Bot::of(&隔离实例)` 的动作会打到别套的连接上，
+    /// self_id 也跟着串台。句柄既然认了实例，出口就必须只从**这一套**取连接。
+    /// 只断言两套各自的结果，刻意不断言全局实例——并行用例可能正往它上面挂连接。
+    #[tokio::test]
+    async fn the_api_handle_follows_the_instance_it_came_from() {
+        let (one, one_conn) = canned_instance("这套的机器人", 10001);
+        let (other, other_conn) = canned_instance("那套的机器人", 20002);
+
+        assert_eq!(Bot::of(&one).self_id(), 10001);
+        assert_eq!(Bot::of(&other).self_id(), 20002);
+        assert_eq!(
+            Bot::of(&one).api().get_login_info().await.unwrap().nickname,
+            "这套的机器人"
+        );
+        assert_eq!(
+            Bot::of(&other)
+                .api()
+                .get_login_info()
+                .await
+                .unwrap()
+                .nickname,
+            "那套的机器人"
+        );
+
+        assert!(
+            Arc::ptr_eq(Bot::of(&one).api().framework(), &one),
+            "api() 该握着自己这一套实例"
+        );
+        assert_eq!(
+            one_conn.seen.lock().unwrap().as_slice(),
+            ["get_login_info".to_string()],
+            "动作只该落在自己的那条连接上"
+        );
+        assert_eq!(
+            other_conn.seen.lock().unwrap().as_slice(),
+            ["get_login_info".to_string()]
+        );
+    }
+
+    /// 成员资料按 [`crate::runtime::peers::PeerCache`] 的读法：同一个人只在首次打网络，
+    /// `forget_member` 作废之后才重新查——这两条都得实测钉住，否则"缓存"只是注释里的承诺。
+    #[tokio::test]
+    async fn member_profile_reaches_the_implementation_only_when_the_cache_is_cold() {
+        let (one, conn) = canned_instance("这套的机器人", 10001);
+        let group = Bot::of(&one).group(20001);
+
+        let hits = || {
+            conn.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|action| action.as_str() == "get_group_member_info")
+                .count()
+        };
+
+        let first = group.member_info(100).await.unwrap();
+        let second = group.member_info(100).await.unwrap();
+        assert_eq!(first.nickname, "成员甲");
+        assert_eq!(second.nickname, first.nickname);
+        assert_eq!(hits(), 1, "第二次读该命中实例上的缓存，不再打网络");
+
+        group.forget_member(100);
+        group.member_info(100).await.unwrap();
+        assert_eq!(hits(), 2, "作废之后该真的重查一次");
+
+        // 缓存挂在实例上：另一套实例冷启动，同样要自己打一次
+        let (other, other_conn) = canned_instance("那套的机器人", 10001);
+        Bot::of(&other).group(20001).member_info(100).await.unwrap();
+        assert_eq!(
+            other_conn
+                .seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|action| action.as_str() == "get_group_member_info")
+                .count(),
+            1,
+            "别家的缓存不该让这一套少跑一次"
+        );
     }
 }

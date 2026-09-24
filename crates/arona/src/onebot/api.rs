@@ -9,10 +9,12 @@
 //! 冷门/新增动作仍有兜底通道：[`OneBotApi::call`] 拿原始 `data`，[`OneBotApi::call_typed`]
 //! 直接把 `data` 反序列化成自己的类型。
 //!
-//! 拿连接：一律走 [`OneBotApi::global`]，每次调用现取进程默认实例上的首个可用连接
+//! 拿连接：出口是**绑在所属框架实例上**的（[`OneBotApi::of`]，多实例与测试用；
+//! [`OneBotApi::global`] 拿进程默认实例那套）。每次调用现取该实例上的首个可用连接
 //! （见 [`OnebotOutlet`](crate::onebot::application::OnebotOutlet)）—— 连接热重载
 //! （改 onebot.yml）之后不会拿着已销毁的连接不放。没有可用连接时返回
 //! [`OneBotError::NoConnection`]，超时返回 [`OneBotError::Timeout`]。
+use crate::framework::Framework;
 use crate::onebot::connection::OneBotConnection;
 use crate::onebot::model::OneBotActionResponse;
 use crate::onebot::protocol;
@@ -154,22 +156,34 @@ where
     })
 }
 
-/// OneBot 动作出口（无状态：每次调用现取可用连接）
-#[derive(Clone, Copy, Debug, Default)]
-pub struct OneBotApi;
+/// OneBot 动作出口（挂在所属框架实例上：每次调用现取那套实例的可用连接）
+#[derive(Clone)]
+pub struct OneBotApi {
+    framework: Arc<Framework>,
+}
 
 impl OneBotApi {
-    /// 全局出口（框架与插件都用这个）
+    /// 进程默认实例上的出口（框架与插件都用它）
     pub fn global() -> OneBotApi {
-        OneBotApi
+        OneBotApi::of(&Framework::global_arc())
+    }
+
+    /// 指定实例上的出口：`Bot::of(&实例).api()` 走的就是这条，多实例宿主与测试用
+    pub fn of(framework: &Arc<Framework>) -> OneBotApi {
+        OneBotApi {
+            framework: framework.clone(),
+        }
+    }
+
+    /// 所属的框架实例：`Bot`、`EventContext` 这些句柄要靠它找回同一套连接与缓存
+    pub fn framework(&self) -> &Arc<Framework> {
+        &self.framework
     }
 
     /// 取当前可用连接：读的是**所属实例**上的 [`OnebotOutlet`](crate::onebot::application::OnebotOutlet)，
     /// 所以插件 dll 里调它也落在宿主那条真实连接上（宿主未连时才是 `None`）。
     fn connection(&self) -> Option<Arc<dyn OneBotConnection>> {
-        crate::framework::Framework::global()
-            .onebot()
-            .first_connection()
+        self.framework.onebot().first_connection()
     }
 
     /// 万能通道：发出动作并取回 `data`（实现端没回 data 时是 `Value::Null`）

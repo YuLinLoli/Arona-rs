@@ -194,6 +194,8 @@ impl Framework {
         // 它们先于 Framework 造出来，所以构造完再回填一次。
         plugins.attach(&framework);
         health.attach(&framework);
+        // 钩子表同理：投递时要给插件上下文带上**这一套**实例的连接与聊天记录库
+        framework.hooks().attach(&framework);
         // 定时任务表同理：处理器 panic 时要记到归属插件名下，而不是让调度循环静默消失
         framework.jobs().attach(&framework);
         // arona.yml 的持有者同理：重载之后要把配置落到**它所属这一套**门控/健康度上

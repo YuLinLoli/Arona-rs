@@ -304,6 +304,7 @@ mod tests {
             quoted: None,
             segments: Vec::new(),
             sender: Arc::new(NullSender),
+            framework: crate::framework::Framework::new(),
         })
     }
 

@@ -414,7 +414,8 @@ impl PluginContext {
     // ==================== OneBot ====================
 
     /// OneBot 动作出口（发/撤/查/管）。每次现取，连接热重载后旧句柄会失效。
+    /// 挂在**本插件所属的那套实例**上：多实例宿主里不会用到别家实例的连接。
     pub fn api(&self) -> OneBotApi {
-        OneBotApi::global()
+        OneBotApi::of(self.framework())
     }
 }

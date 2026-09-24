@@ -41,6 +41,7 @@
 //! 用 [`cancel`](OutboundContext::cancel) 整条拦停，门控与优先级语义和入站一致。
 //! 它挂在框架统一发送口上（命令回复、钩子内 `reply`、主动推送都过），
 //! `OneBotApi` 的直连发送方法不过——那条路留给 GUI 与确实需要绕门的场景。
+use crate::framework::Framework;
 use crate::onebot::api::OneBotApi;
 use crate::onebot::model::OneBotEvent;
 use crate::onebot::protocol;
@@ -49,7 +50,7 @@ use crate::runtime::message::{BoxFuture, MessageSegment, MessageTarget, Outgoing
 pub use crate::runtime::priority::ListenerPriority;
 use serde_json::Value;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock, Weak};
 
 /// 事件大类（对应 OneBot 的 `post_type`）
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -607,14 +608,15 @@ pub struct EventContext {
 
 impl EventContext {
     /// 协议层动作出口（mirai 的 `bot.callApi`）：`reply` / `recall` 没覆盖的动作都走它。
-    /// 取的是所属实例上的连接池，插件 dll 里调用同样落在宿主真正那条连接。
+    /// 就是构造上下文时带来的那一份，绑的是**投递这条事件的实例**上的连接池，
+    /// 插件 dll 里调用同样落在宿主真正那条连接。
     pub fn api(&self) -> crate::onebot::api::OneBotApi {
-        crate::onebot::api::OneBotApi::global()
+        self.api.clone()
     }
 
     /// mirai 风格的对象模型入口：`ctx.bot().group(123).send_text("老师")`
     pub fn bot(&self) -> crate::bot::Bot {
-        crate::bot::Bot::current()
+        crate::bot::Bot::of(self.api.framework())
     }
 
     pub fn user_id(&self) -> i64 {
@@ -733,7 +735,7 @@ impl EventContext {
     /// 先按框架的聊天记录库把 id 换成实现端认的那个号：NapCat / LLOWeb 的 `delete_msg`
     /// 只吃 `real_id`，拿事件里的 message_id 直接去撤会报「消息不存在」。
     pub async fn recall(&self, message_id: i64) -> Result<(), crate::onebot::api::OneBotError> {
-        crate::runtime::chatlog::recall(message_id).await
+        self.api.framework().chatlog_api().recall(message_id).await
     }
 
     /// 引用回复：把这条事件引用的那条消息一起带回去。协议层还引用得到就挂原生 reply 段，
@@ -744,7 +746,13 @@ impl EventContext {
         mut message: OutgoingMessage,
     ) -> Result<Option<i64>, crate::onebot::api::OneBotError> {
         let at = self.event.time;
-        if let Some(prefix) = crate::runtime::chatlog::quote_prefix(self.quoted(), at).await {
+        let prefix = self
+            .api
+            .framework()
+            .chatlog_api()
+            .quote_prefix(self.quoted(), at)
+            .await;
+        if let Some(prefix) = prefix {
             message.segments.splice(0..0, prefix);
         }
         self.reply_message(message).await
@@ -893,6 +901,9 @@ pub struct HookRegistry {
     seq: AtomicU64,
     gating: Arc<Gating>,
     health: Arc<crate::plugin::health::HealthBoard>,
+    /// 所属框架实例：钩子上下文里的 `api()` / `bot()` 要靠它取回**这一套**的连接与缓存。
+    /// 注册表先于 Framework 造出来，所以由 Framework 在建成后回填（见 [`Self::attach`]）。
+    framework: OnceLock<Weak<Framework>>,
 }
 
 impl HookRegistry {
@@ -906,7 +917,20 @@ impl HookRegistry {
             seq: AtomicU64::new(0),
             gating,
             health,
+            framework: OnceLock::new(),
         }
+    }
+
+    pub(crate) fn attach(&self, framework: &Arc<Framework>) {
+        let _ = self.framework.set(Arc::downgrade(framework));
+    }
+
+    /// 所属实例；没回填过（例如手工构造的 `HookRegistry`）时退回进程默认实例
+    fn host(&self) -> Arc<Framework> {
+        self.framework
+            .get()
+            .and_then(Weak::upgrade)
+            .unwrap_or_else(Framework::global_arc)
     }
 
     /// 带优先级的订阅：先按 [`ListenerPriority`]（Monitor -> High -> Normal -> Low -> Lowest），
@@ -1194,7 +1218,7 @@ impl HookRegistry {
             segments: parsed.segments.clone(),
             body,
             event: event.clone(),
-            api: OneBotApi::global(),
+            api: OneBotApi::of(&self.host()),
         });
         // 本次分发内已被隔离停用的插件：它们剩下的钩子直接跳过，但别家照跑
         let action = format!("事件 {}", context.body.display_name());

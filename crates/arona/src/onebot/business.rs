@@ -183,7 +183,9 @@ impl BusinessHandler {
             .and_then(crate::runtime::dispatcher::GroupRole::from_sender);
         // 进出都要留档（出站那半在 onebot::message_sender）：NTQQ 系实现端十几二十分钟前的
         // message_id 协议层就引用不到了，引用回复与撤回只能靠本地这份库
-        crate::runtime::chatlog::record_inbound(&event, &parsed.segments);
+        self.framework
+            .chatlog_api()
+            .record_inbound(&event, &parsed.segments);
         let context = Arc::new(CommandContext {
             user_id,
             group_id: event.group_id,
@@ -196,6 +198,7 @@ impl BusinessHandler {
             quoted,
             segments: parsed.segments.clone(),
             sender,
+            framework: self.framework.clone(),
         });
         let dispatcher = self.dispatcher.clone();
         let hooks = self.framework.hooks().clone();
