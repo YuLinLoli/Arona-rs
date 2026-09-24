@@ -17,21 +17,26 @@
 //! assert!(manager.install_all().is_empty());
 //! ```
 //!
-//! 刻意留在进程级的是**真正只有一份的进程资源**：日志、目录约定（`runtime::paths`）、
-//! OneBot 连接与控制台。它们是宿主进程的属性，不是插件契约的注册表。
+//! 刻意留在进程级的是**真正只有一份、且插件不会经自由函数去读**的进程资源：日志落地
+//! 队列与目录约定（`runtime::paths`）。它们是宿主进程的属性，不是插件契约的注册表。
 //!
 //! 反过来，凡是**插件也会经自由函数碰到**的状态都必须挂在这里，不能另起 `static`：
-//! 框架配置的持有者（[`Framework::settings`]）与主动发消息的出口
-//! （[`Framework::runtime_services`]）就是这么被收进来的——动态插件 dll 静态链接了自己
-//! 那份框架代码，只有跟着实例走才会随 [`Framework::adopt_host`] 一起接到宿主上。
+//! 框架配置的持有者（[`Framework::settings`]）、主动发消息的出口
+//! （[`Framework::runtime_services`]）、OneBot 连接池（[`Framework::onebot`]）与聊天记录库
+//! （[`Framework::chatlog`]）都是这么被收进来的——动态插件 dll 静态链接了自己那份框架代码，
+//! 另起的 `static` 在 dll 里是一份空表，只有跟着实例走才会随 [`Framework::adopt_host`]
+//! 一起接到宿主上。判据：**新状态只要放在 `Framework` 上，就不必新增 ABI 通道、不必抬
+//! `ABI_LAYOUT`，插件也一行都不用改。**
 use crate::config::arona::SectionRegistry;
 use crate::config::plugin_config::ConfigStore;
 use crate::config::settings::Settings;
 use crate::container::ServiceContainer;
+use crate::onebot::application::OnebotOutlet;
 use crate::onebot::hooks::HookRegistry;
 use crate::plugin::health::HealthBoard;
 use crate::plugin::manager::{LoaderRegistry, PluginManager};
 use crate::quartz::Scheduler;
+use crate::runtime::chatlog::{ChatLog, ChatLogFace};
 use crate::runtime::config::Gating;
 use crate::runtime::dispatcher::CommandRegistry;
 use crate::runtime::services::RuntimeServices;
@@ -52,6 +57,12 @@ pub struct Framework {
     configs: Arc<ConfigStore>,
     settings: Arc<Settings>,
     runtime_services: Arc<RuntimeServices>,
+    onebot: Arc<OnebotOutlet>,
+    chatlog: Arc<ChatLog>,
+    /// 同一份库的**跨镜像出口**：插件 dll 里那批 `chatlog::` 自由函数只经它调用。
+    /// 不能让 dll 直接调 [`ChatLog`] 的固有方法——dll 自带一份 bundled sqlite，
+    /// 拿着宿主创建的 `sqlite3*` 句柄调自己那份引擎会当场段错误（见 [`ChatLogFace`]）。
+    chatlog_api: Arc<dyn ChatLogFace>,
     jobs: Arc<Scheduler>,
     loaders: Arc<LoaderRegistry>,
     plugins: Arc<PluginManager>,
@@ -136,6 +147,8 @@ impl Framework {
         ));
         let prefix_match_by_default = options.prefix_match_by_default;
         let command_prefixes = options.command_prefixes.clone();
+        // 同一份库、两个名字：宿主内部按具体类型用，插件侧只能按 trait 对象用
+        let chatlog: Arc<ChatLog> = Arc::default();
         let framework = Arc::new(Framework {
             gating: gating.clone(),
             commands: Arc::new(CommandRegistry::new(
@@ -151,6 +164,9 @@ impl Framework {
             configs: Arc::new(ConfigStore::new(sections, plugins.clone())),
             settings: Arc::default(),
             runtime_services: Arc::default(),
+            onebot: Arc::default(),
+            chatlog: chatlog.clone(),
+            chatlog_api: chatlog,
             jobs: Arc::default(),
             loaders: Arc::default(),
             plugins: plugins.clone(),
@@ -303,6 +319,23 @@ impl Framework {
     /// 运行期服务引用：数据根目录与主动发消息的出口
     pub fn runtime_services(&self) -> &Arc<RuntimeServices> {
         &self.runtime_services
+    }
+
+    /// OneBot 应用与连接池的持有者：所有 OneBot 动作（含插件侧）都从这里取当前可用连接
+    pub fn onebot(&self) -> &Arc<OnebotOutlet> {
+        &self.onebot
+    }
+
+    /// 聊天记录库的持有者：记账、引用还原与按存储 id 撤回的依据
+    /// （宿主内部用这一份具体类型）
+    pub fn chatlog(&self) -> &Arc<ChatLog> {
+        &self.chatlog
+    }
+
+    /// 同一份库的跨镜像出口：插件 dll 侧的 `arona::runtime::chatlog::*` 只走它，
+    /// 好让 sqlite 连接始终由宿主那份引擎操作（原因见 [`ChatLogFace`]）
+    pub fn chatlog_api(&self) -> &Arc<dyn ChatLogFace> {
+        &self.chatlog_api
     }
 
     /// 定时任务表

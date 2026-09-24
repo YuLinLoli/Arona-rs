@@ -274,6 +274,129 @@ impl AronaPlugin for HelloPlugin {
                 }),
             )
             .with_feature(FEATURE),
+            // 接口自检：一次问清「插件这一侧够不够得着宿主那条连接、用的是不是同一个库」。
+            // dll 静态链接了自己那份框架代码，凡是挂在进程级 static 上的宿主状态都接不过来，
+            // 所以这三行结果就是插件可见性的判据（配套说明见 PLUGIN_DEVELOPMENT.md §22）。
+            CommandRegistration::new(
+                vec!["/示例自检".into(), "/api自检".into()],
+                "自检插件侧的 OneBot 动作出口与框架聊天记录库通不通",
+                handler(|context, _| async move {
+                    // 每一步发一条：宿主要是中途没了，实现端收到的最后一条就是崩点的坐标。
+                    // 合并成一条回话时"崩在哪一问"只能靠猜，而这崩法连日志都留不下。
+                    let target = match context.group_id {
+                        Some(group) => MessageTarget::Group(group),
+                        None => MessageTarget::Private(context.user_id),
+                    };
+                    let say = |line: String| async move {
+                        let _ = send_message(target, OutgoingMessage::text(line)).await;
+                    };
+                    let api = arona::onebot::api::OneBotApi::global();
+                    let login = match api.get_login_info().await {
+                        Ok(info) => format!("get_login_info 通（self_id={}）", info.user_id),
+                        Err(err) => format!("get_login_info 不通（{err:?}）"),
+                    };
+                    say(format!("自检 1/4 动作出口：{login}")).await;
+                    // 先让框架发一条、顺带出站记账，再用拿到的 id 回查：查得到才是同一个库
+                    let receipt =
+                        send_message(target, OutgoingMessage::text("自检 2/4 这条马上撤回")).await;
+                    let sent = receipt.message_id.or(receipt.real_id);
+                    let library = match sent {
+                        Some(id) if arona::runtime::chatlog::find(id).is_some() => {
+                            format!("聊天记录库通（id={id} 查得到）")
+                        }
+                        Some(id) => format!("聊天记录库不通（id={id} 查不到）"),
+                        None => "没拿到 message_id，库与撤回都无从判起".to_string(),
+                    };
+                    say(format!(
+                        "自检 3/4 库：{library}；引用窗口读到 {} 分钟",
+                        arona::runtime::chatlog::settings().quote_ttl_minutes
+                    ))
+                    .await;
+                    let recall = match sent {
+                        Some(id) => match arona::runtime::chatlog::recall(id).await {
+                            Ok(()) => "撤回通".to_string(),
+                            Err(err) => format!("撤回不通（{err:?}）"),
+                        },
+                        None => "撤回未测".to_string(),
+                    };
+                    Some(OutgoingMessage::text(format!("自检 4/4 撤回：{recall}")))
+                }),
+            )
+            .with_feature(FEATURE),
+            // 状态可见性探针：把"宿主那份状态在 dll 里够不够得着"按类型拆成三问，逐条播报。
+            // 分条而不是合并成一条，是因为第三问可能当场把进程带走——合并回话就永远拿不到了。
+            CommandRegistration::new(
+                vec!["/示例状态".into(), "/状态探针".into()],
+                "分三问探明插件侧读得到宿主的哪些状态（纯 Rust 字段 / 第三方 C 句柄）",
+                handler(|context, _| async move {
+                    let target = match context.group_id {
+                        Some(group) => MessageTarget::Group(group),
+                        None => MessageTarget::Private(context.user_id),
+                    };
+                    let say = |line: String| async move {
+                        let _ = send_message(target, OutgoingMessage::text(line)).await;
+                    };
+                    // ①②纯 Rust 字段：std 的 RwLock，两边同一份 std 布局，读它不可能出问题
+                    say(format!(
+                        "状态探针 1/3 配置：引用窗口 {} 分钟、启用={}",
+                        arona::runtime::chatlog::settings().quote_ttl_minutes,
+                        arona::runtime::chatlog::enabled()
+                    ))
+                    .await;
+                    say(format!(
+                        "状态探针 2/3 库路径：{:#?}",
+                        arona::runtime::chatlog::file()
+                    ))
+                    .await;
+                    // ③这一步真的执行 SQL：拿的是**宿主打开的那条 sqlite 连接**。
+                    // rusqlite 的 bundled 特性把 sqlite 静态编进各自那份镜像里，
+                    // 跨镜像使用同一个 sqlite3* 句柄是未定义行为——能不能活着回来就是这条判据。
+                    let found = arona::runtime::chatlog::find(1).is_some();
+                    Some(OutgoingMessage::text(format!(
+                        "状态探针 3/3 查库：{}",
+                        if found { "查到 id=1" } else { "没查到，但活着回来了" }
+                    )))
+                }),
+            )
+            .with_feature(FEATURE),
+            // 对象模型自检（PLUGIN_DEVELOPMENT.md §14.2）：mirai 那种"先拿到对象、再往对象上
+            // 说话"的写法在 dll 里必须和宿主里一模一样。Bot/Group/Member 只读实例出口，
+            // 所以这条命令同时是那条判据的活例子——它也是文档里那段示例的编译现场。
+            CommandRegistration::new(
+                vec!["/示例对象".into(), "/对象自检".into()],
+                "用 arona::bot 的对象模型发一条并撤回，顺带报出临时会话目标",
+                handler(|context, _| async move {
+                    let bot = context.bot();
+                    let Some(group) = context.group_id else {
+                        // 私聊里没有群可拼：只报在线状态，不去拼一个不存在的会话
+                        return Some(OutgoingMessage::text(format!(
+                            "在线={}，self_id={}",
+                            bot.is_online(),
+                            bot.self_id()
+                        )));
+                    };
+                    let handle = bot.group(group);
+                    let receipt = handle.send_text("对象模型：这条马上撤回").await;
+                    let line = match receipt.message_id.or(receipt.real_id) {
+                        Some(id) => match handle.bot().recall(id).await {
+                            Ok(()) => format!("group.send_text 通（id={id}）；撤回通"),
+                            Err(err) => format!("group.send_text 通（id={id}）；撤回不通（{err:?}）"),
+                        },
+                        None => "send_text 没拿到 message_id".to_string(),
+                    };
+                    // 成员句柄不查网络，这里只验目标拼得对不对；凭据那段验 ctx.source() 取不取得到
+                    let temp = handle.member_of(context.user_id).temp_target();
+                    let credential = context
+                        .source()
+                        .map(|source| source.message_id)
+                        .unwrap_or_default();
+                    Some(OutgoingMessage::text(format!(
+                        "{line}；临时会话目标={temp:?}；ctx.source()={credential}；引用窗口={} 分钟",
+                        arona::runtime::chatlog::settings().quote_ttl_minutes
+                    )))
+                }),
+            )
+            .with_feature(FEATURE),
         ]);
 
         // 事件钩子：按**子类**订阅，且绑在功能开关上——这个群关掉「示例」时它一起停。

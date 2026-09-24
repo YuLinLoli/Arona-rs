@@ -11,6 +11,8 @@
 pub mod gui;
 
 pub mod admin;
+/// mirai 风格的机器人对象模型（`Bot` / `Group` / `Member` / `Friend` / `MessageSource`）
+pub mod bot;
 pub mod config;
 /// 插件间能力共享容器（对应 mirai 的 `DiContainer`）
 pub mod container;

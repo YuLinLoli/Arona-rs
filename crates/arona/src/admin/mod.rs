@@ -143,9 +143,9 @@ pub fn group_disabled_plugins(group_id: i64) -> Vec<String> {
 
 /// 调用 OneBot API（使用首个可用连接）
 pub async fn call_api(action: &str, params: Value, timeout_ms: u64) -> Result<Value, String> {
-    let connection = application::global()
-        .and_then(|app| app.first_connection())
-        .or_else(|| crate::onebot::connection::global_registry().and_then(|r| r.first()))
+    let connection = crate::framework::Framework::global()
+        .onebot()
+        .first_connection()
         .ok_or_else(|| {
             "当前没有可用的 OneBot 连接，请先在「OneBot 连接」里启用一个连接".to_string()
         })?;

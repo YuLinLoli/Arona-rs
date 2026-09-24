@@ -102,6 +102,7 @@ arona-host ──depends──▶ arona（框架）──启动时扫描──�
 | `GroupMessageEvent` / `FriendMessageEvent` / `NudgedEvent` 事件族 | `EventBody`（强类型事件体，notice/request 另带 `NoticeInfo`/`RequestInfo` 细节：动作、操作者、禁言时长、处理凭据）+ `BodyFilter` 子类型订阅：`ctx.on_group_message(..)`、`ctx.listen_where(&[BodyFilter::..], ..)` | `onebot/hooks.rs` |
 | `MessageChain` / `Element`（At、Image、Source、QuoteReply、Face、FlashMessage…） | `MessageSegment` 15 段（文本/@/@全体/引用/图片/表情/语音/视频/文件/戳一戳/位置/json/xml/合并转发/未知段原样保留），收发双向同一套类型 | §19 |
 | `AbstractMessage.source()` / `quoteReply`（引用的那条消息还能不能拿到） | 框架全包：`CommandContext::{quoted, segments, message_id, time}` 让引用对命令可见，协议层引用不到的旧消息由框架的聊天记录库还原（`context.reply_with_quote`），撤回按存下来的 id 换算（`context.recall`） | `runtime/dispatcher.rs` + `runtime/chatlog.rs`（§21） |
+| `Bot` / `Group` / `Member` / `Friend` / `Temp` / `MessageSource`（先拿对象，再往对象上说话） | `arona::bot::{Bot, Group, Member, Friend, MessageSource}`：`ctx.bot().group(123).send_text(..)`、`member.mute(600).await`、`member.send_temp(..)`、`ctx.source()?.recall().await`。句柄只装一个所属 `Framework` 实例的引用，不缓存连接也不缓存资料 | `bot/mod.rs`（§14.2） |
 | `EventPriority`（Monitor→High→Normal→Low→Lowest） | `ListenerPriority` / `CommandPriority`（同一份 `runtime::priority::Priority`） | `runtime/priority.rs` |
 | `event.intercept()` | `HookFlow::Handled` | `onebot/hooks.rs` |
 | `MessagePreSendEvent`（发出去之前改内容 / 整条拦下） | `OutboundContext`：`ctx.on_outgoing(..)` 订阅，`rewrite(..)` 改写、`cancel()` 拦停；挂在统一发送口上，合并转发拆分与控制台打印之前 | 同上 + `onebot/message_sender.rs` |
@@ -117,6 +118,8 @@ arona-host ──depends──▶ arona（框架）──启动时扫描──�
 以及 **ClassLoader 隔离顺带解决的"全局状态只有一份"这里不成立**——dll 静态链接了自己的那份
 `arona`，所以装载器在造实例前把宿主的进程默认实例、日志出口与 tokio 句柄交回插件
 （§22「宿主的上行通道」）。对插件作者的实际影响：写法与静态编译时完全一样，不用绕路。
+这份"一样"是框架换来的：凡是背后连着第三方库状态的能力（聊天记录库、OneBot 动作、HTTP 代发），
+框架都只把**宿主生成的 vtable** 或 `extern "C"` 函数交出去，绝不让 dll 自己动手——§22 那两道关讲的就是这件事。
 
 ## 4. 生命周期（`arona::run` → `run_bot` 的真实顺序）
 
@@ -735,8 +738,14 @@ api.send(MessageTarget::Group(group_id), OutgoingMessage::text("老师")).await?
 api.delete_msg(message_id).await?;
 ```
 
+`CommandContext` 与 `EventContext` 上都有 `api()`，命令与钩子里直接 `ctx.api()` 就行。
+**这条通道在插件 dll 里是真通的**：连接池挂在 `Framework` 实例上（`Framework::onebot()`），
+dll 认领了宿主实例，所以动作落在宿主真正那条连接上，不必宿主侧替你转发（判据见 §22）。
+
 不要缓存 `OneBotApi` 之外的连接对象：`onebot.yml` 热重载后旧连接已销毁，而 `global()` 每次现取。
 这里所有发送方法都是**协议层直连**：不出站钩子（§9.1）、不打印、不拆合并转发、不带自动撤回。
+要走框架那条完整的出站路（含 §9.1 钩子、控制台打印、合并转发拆分、`revoke_after_millis` 自动撤回、
+出站记账），用 `arona::runtime::services::send_message(..)` 或 §14.2 的对象模型。
 错误统一是 `OneBotError::{NoConnection, Timeout, Failed{..}, BadResponse(_)}`，实现了 `Display`，
 直接 `?` 上抛或 `.map_err(|e| e.to_string())` 写日志都行。
 
@@ -746,7 +755,8 @@ api.delete_msg(message_id).await?;
 | --- | --- |
 | 发消息 | `send(target, OutgoingMessage)`、`send_msg`、`send_private_msg`、`send_group_msg`（消息载荷接受 `&str`/`String`/`OutgoingMessage`/段数组/已拼好的 JSON —— `MessagePayload`） |
 | 读消息 | `get_msg`、`get_forward_msg`、`can_send_private_msg`、`can_send_group_msg` |
-| 删/赞 | `delete_msg`（撤回）、`set_msg_emoji_like`、`send_like` |
+| 删/赞/已读 | `delete_msg`（撤回）、`set_msg_emoji_like`、`send_like`、`mark_msg_as_read` |
+| 语音 | `translate_voice(message_id)` 语音转文字（各家入参不统一，详见方法上的注释） |
 | 资料 | `get_login_info`、`get_stranger_info`、`get_friend_list`、`get_version_info`、`get_status` |
 | 群 | `get_group_info`、`get_group_list`、`get_group_member_info`、`get_group_member_list`、`get_group_honor_info`、`get_group_system_msg`、`get_group_at_all_remain` |
 | 群管 | `set_group_kick`、`set_group_ban`、`set_group_whole_ban`、`set_group_admin`、`set_group_anonymous_ban`、`set_group_name`、`set_group_level`、`set_group_card`、`set_group_special_title`、`set_group_notice`、`get_group_notice` |
@@ -793,6 +803,84 @@ runtime 上，连接池和 keepalive 全开也不会炸；插件的 `Cargo.toml`
 原理与实证见 §22。
 
 宿主自己（以及从没被装载过的单元测试）没有这道边界，同一套函数直接落到本地客户端，写法一个字都不用改。
+
+### 14.2 对象模型：`arona::bot` 里的 `Bot` / `Group` / `Member` / `Friend` / `MessageSource`
+
+mirai 的手感是"先拿到一个对象，再往对象上说话"，而不是到处传 `GroupCode`/`UserOrBot`。
+框架按同一套形状给了 `arona::bot`（实现见 `crates/arona/src/bot/mod.rs`）：一句 `ctx.bot()`
+拿到机器人，之后的取资料、发言、禁言、撤回、引用都挂在对象上。
+
+| mirai (Kotlin) | Arona (Rust) | 说明 |
+| --- | --- | --- |
+| `Bot.getInstance()` | `arona::bot::Bot::current()`，或 `ctx.bot()` | 句柄只装一个所属 `Framework` 实例的引用，克隆零成本 |
+| `bot.getGroupOrFail(id)` | `bot.group(id)` | **不查网络**，只给句柄；群名一类资料用 `group.info().await` 现取 |
+| `bot.groups` | `bot.groups().await` | `get_group_list` |
+| `bot.getFriend(id)` / `bot.friends` | `bot.friend(id)` / `bot.friends().await` | 前者同样不查网络，所以没有昵称与备注 |
+| `group.members` / `group[id]` | `group.members().await` / `group.member(id).await` | 后者会查一次实现端，确认这个人真在群里 |
+| —— | `group.member_of(id)` | 只拿句柄不查网络，紧接着要禁言/踢人时省一次往返 |
+| `subject.sendMessage(chain)` | `group.send(msg).await` / `friend.send_text("…").await` | 走框架的出站通道（§9.1 钩子、打印、拆分、自动撤回、记账），**不是**协议层旁路 |
+| `message.source()` | `ctx.source()` → `Option<MessageSource>` | 实现端没给 `message_id` 时是 `None`，不编造 |
+| `source.recall()` | `source.recall().await` | 内部按 §21 的库换成实现端认的那个号 |
+| `QuoteReply(source.toQuote())` | `source.quote()` / `source.reply(msg).await` | 前者只给你一个 `MessageSegment::Reply`；后者过窗时自动还原成文字+图 |
+| `member.mute(600)` / `unmute()` | `member.mute(600).await` / `member.unmute().await` | 秒；`0` 即解禁 |
+| `member.kick()` / `member.nameCard = ..` | `member.kick(reject_add).await` / `member.set_card("…").await` | |
+| `group.settings.isMuteAll = true` | `group.mute_all(true).await` | |
+| `group.publishAnnouncement(..)` | `group.set_notice(content, image, pinned).await` | |
+| `Temp` 会话 | `member.temp_target()` / `member.send_temp(msg).await` | 对应 `MessageTarget::Temp`，见下 |
+| `source.markRead()` | `source.mark_read().await` | 实现端不支持时返回 `Failed`，消息本身不受影响 |
+| `bot.callApi(..)` | `ctx.api()` | §14 那张全量动作表，本模块没包到的动作走它 |
+
+```rust
+use arona::bot::Bot;
+use arona::runtime::message::{MessageSegment, OutgoingMessage};
+
+// 发：群、好友、临时会话
+let bot = Bot::current();
+bot.group(123456).send_text("老师们好").await;
+bot.friend(10001).send_text("单独说一下").await;
+// 对方不是好友时裸私聊常被实现端拒发，临时会话（带来源群号）才是那条正路
+bot.group(123456).member_of(10001).send_temp(OutgoingMessage::text("在吗")).await;
+
+// 查：资料都现取，句柄本身不缓存任何东西
+let group = bot.group(123456);
+let name = group.info().await?.group_name;
+for member in group.members().await? {
+    println!("{} {}", member.user_id, member.display());
+}
+
+// 管：mirai 的 member.mute(600) 一对一
+group.mute(10001, 600).await?;
+group.set_card(10001, "改过的名片").await?;
+group.mute_all(true).await?;
+
+// 撤与引用：凭据从上下文来
+async fn demo(ctx: &arona::runtime::dispatcher::CommandContext) {
+    if let Some(source) = ctx.source() {
+        source.reply_text("收到，这条是引用回复").await;   // 过窗自动还原成文字+图（§21）
+        source.recall().await.ok();                        // 撤回触发这条
+        let quoted: MessageSegment = source.quote();       // 只想要引用段，自己拼消息
+        ctx.reply_message(OutgoingMessage::new(vec![quoted, MessageSegment::Text("好".into())])).await;
+    }
+}
+```
+
+三条边界值得记住：
+
+1. **`send` 与 `api().send_*` 不是一回事**。对象模型上的 `send` 走框架出站通道，会被 §9.1 的
+   出站钩子改写或拦停、会打控制台、会拆合并转发、会按 `revoke_after_millis` 自动撤回、会记进
+   §21 的库；`ctx.api().send_group_msg(..)` 是协议层直连，这些一概不做。除非确实要绕开钩子，
+   否则发消息一律用前者。
+2. **句柄不代表"已确认存在"**。`bot.group(999999)` 永远成功，哪怕没这个群；真正的判据是
+   `group.info().await` 这类会说话的调用。这么设计是因为实现端取资料都是网络动作，
+   框架不该替你隐式发请求。
+3. **凭据比 mirai 的 `MessageSource` 活得久**。mirai 那份只在内存在，机器人一重启就再也引用不到
+   旧消息；这里的 `source.recall()` / `source.record()` 会回落到框架的聊天记录库，
+   只要那条被记过档就还认得（库里也没有时 `record()` 给 `None`）。
+
+`MessageTarget` 因此有三个变体：`Group(群号)`、`Private(QQ 号)`、
+`Temp { group_id, user_id }`（临时会话）。入站事件里各家实现端都不标临时会话，所以
+**收到的**消息只会是前两种；`Temp` 只在出站时用，`target.group()` 会把它报成来源群，
+门控（§13）与出站记账都按那个群算。
 
 ## 15. 新增一个插件
 
@@ -1077,7 +1165,9 @@ OneBot 实现端的本地缓存认账，NTQQ 系实现（NapCat / LLOWeb / Lagra
 **这两半现在都在框架**（`runtime::chatlog`，实现见 `crates/arona/src/runtime/chatlog.rs`）。留档这件事
 和玩法无关，谁都得依赖它，交给插件各记一份只会互相看不见：A 插件记的库，B 插件读不到。
 
-插件要用的话只有两个方法，都在命令上下文与事件上下文上：
+插件要用的话只有两个方法，都在命令上下文与事件上下文上（同一套东西在 dll 里也真读得到宿主的库：
+连接与库都挂在 `Framework` 实例上，而插件侧一律经宿主那层 `Arc<dyn ChatLogFace>` 用它，
+两道关的来由见 §22；mirai 那种对象写法见 §14.2 的 `MessageSource`）：
 
 ```rust
 // 引用回复：被引用那条还在窗口内就挂原生 reply 段（QQ 上是真引用），
@@ -1167,31 +1257,96 @@ mirai 的插件和框架在同一个 ClassLoader 树里，`MiraiInstance` 只有
 接管由宏与装载器完成，插件代码里没有任何对应的手续。
 
 但"接管了四样"只意味着**这四样以及挂在它们身后的东西**是通的。判断某个进程级自由函数在插件里
-能不能用，只看一条：**它的状态挂在 `Framework` 实例上，还是另有一个 `static`**。挂在实例上的
-（`quartz`、`container`、`plugin::manager`、`config::plugin_config` 走 `Framework::global().configs()`）
-全部正确，因为交出去的就是宿主那个实例；另起 `static` 的，插件里就是独立的一份空表，
-而 `get_or_init` 让它**不 panic、只是静默失效** —— 比崩掉难查得多。框架里所有 `static` 已按这条
-判据逐个核过一遍，插件可见范围内原本有两处不合规，**现已收进实例**（下一小节）；
-`runtime::config::*` 看起来像进程级，其实 `gating()` 就是 `Framework::global().gating()`，
-所以 `groups()` / `bot_id()` 这些一直是通的。
+能不能用，要**过两道关**，缺一道都不算通：
 
-#### 曾经静默失效的两处（已收进 `Framework` 实例）
+**① 状态挂在哪。** 挂在 `Framework` 实例上的才可能通（`quartz`、`container`、`plugin::manager`、
+`config::plugin_config` 走 `Framework::global().configs()`），因为交出去的就是宿主那个实例；
+另起 `static` 的，插件里就是独立的一份空表，而 `get_or_init` 让它**不 panic、只是静默失效**——
+比崩掉难查得多。`runtime::config::*` 看起来像进程级，其实 `gating()` 就是
+`Framework::global().gating()`，所以 `groups()` / `bot_id()` 这些一直是通的。
+
+**② 由哪份代码动手。** 状态搬到实例上只解决了"去哪儿找它"，没解决"用哪份代码操作它"。
+dll 把 `arona` **连同它的全部依赖**静态链接成了第二份，所以插件里 `impl ChatLog` 的固有方法是
+**编译进 dll** 的那一份；让它去动宿主创建的对象里那些第三方库句柄，就是拿宿主的 `sqlite3*`
+调 dll 自己那份 sqlite 引擎——两套引擎各有一批进程级全局，互不相认，**实测当场段错误、整个宿主
+一起没**。天生安全的只有两类：经**宿主生成的 vtable** 调用（`Arc<dyn ..>`，函数指针指向宿主镜像
+里的代码），以及 `extern "C"` 函数（上面那四道通道）。
+
+框架里所有 `static` 已按第①道核过一遍，插件可见范围内共有**四处**不合规，已全部收进实例；
+其中聊天记录库那处随后又被第②道拦下，改成了 trait 出口（见下两小节）。
+
+#### 曾经静默失效的四处（已收进 `Framework` 实例）
 
 | 入口 | 现在的形态 | 曾经的症状 |
 | --- | --- | --- |
 | `arona::runtime::services::sender_ready` / `send_message` / `data_root` | 状态是实例上的 `RuntimeServices`（`Framework::runtime_services()`），自由函数只是它的门面 | 宿主 `set_message_sender` 只写到宿主那份，插件这份恒 `None`：定时任务与事件钩子里**主动**发的消息永久不成立，返回默认回执、消息原地丢弃且不带错误。框架自带的示例插件就中招 —— `plugins/hello` 的「每日问好」与「进群欢迎语」两条都是这条路径，写成 `let _ = send_message(..)` 连失败都看不见 |
 | `arona::config::settings::*`（框架那份 `groups`/`managers`） | 状态是实例上的 `Settings`（`Framework::settings()`），`init` 之后连热重载监听都跟着实例走 | 插件那份 `file` 恒为 `None`：读出来是默认值（`/config` 列出空的管理员表），写则报「配置文件尚未初始化」。插件自己的 `config/<插件>/arona.yml` 一直不受影响，那条本来就走在实例上 |
+| `arona::onebot::api::OneBotApi::*`（全部 OneBot 动作） | 连接与 `self_id` 是实例上的 `OnebotOutlet`（`Framework::onebot()`），`api.rs` 每次调用现从所属实例取连接；`connection::GLOBAL_REGISTRY` 那道进程级 `OnceCell` 已删 | 动作对象本身拿得到（`OneBotApi` 是零宽类型，不持状态），但登记表是 dll 自己那份空的 → 每一次动作都只回 `NoConnection`。插件里 `get_login_info`、`get_group_member_list`、`delete_msg` 全废，而且**不 panic**，只是永远"没有可用的 OneBot 连接" |
+| `arona::runtime::chatlog::*`（引用还原与撤回） | 设置、库句柄、打开失败标记都收在实例上的 `ChatLog`（`Framework::chatlog()`），而**插件侧只能经 `Framework::chatlog_api()` 那层 `Arc<dyn ChatLogFace>` 用它**——见下一小节 | 这一处两道关都没过，症状也最阴，见下面两段 |
 
-搬进实例不需要新增 ABI 通道、没有抬 `ABI_LAYOUT`、**插件源码一行不改**，重编 dll 即可。
-代价是这两处对插件**彻底可用**了：插件里 `arona::config::settings::init(...)` 现在真的会去
-重载宿主那份 arona.yml（示例：插件的"恢复备份"流程就靠它），所以别把它当调试工具随手调。
+第①道搬进实例不新增 ABI 通道、**插件源码一行不改**，重编 dll 即可；代价是这几处对插件**彻底可用**
+了：插件里 `arona::config::settings::init(...)` 现在真的会去重载宿主那份 arona.yml（示例：插件的
+"恢复备份"流程就靠它），所以别把它当调试工具随手调。
 
-这两处曾经的症状都是**实测确认**而非推断，而且是同一进程内的对照实验：同一个示例插件 dll，
+**但 `Framework` 换了字段布局就必须抬 `ABI_LAYOUT`（本轮 3 → 4）**：`HostBridge::framework`
+交出去的是擦成 `*const c_void` 的实例指针，dll 按**它自己编译期的字段偏移**读这个结构体，
+插一个字段就会让旧 dll 读错位置——那是未定义行为，不是"握手失败"。所以旧 dll 一律拒载。
+
+这四处曾经的症状都是**实测确认**而非推断，而且是同一进程内的对照实验：同一个示例插件 dll，
 `/你好`、`/示例延时`、`/示例联网` 三条回话都成功到了实现端（走 `CommandContext`），而它事件钩子里
 那条主动 `send_message` 一条都没到；`--test-notify` 在启动 20 秒后（宿主侧发送器早已备好）照样报
 「消息发送器尚未就绪」。同进程、同 dll、相隔十几秒 —— 时序与网络都解释不了，只能是两份内存。
-**修好之后要复跑同一条链才算数**：假 OneBot 会下发一条 `group_increase` 并在 23 秒时按
+**修好之后要复跑同一条链才算数**：假 OneBot 会下发一条 `group_increase` 并在收尾时按
 `sent.log` 的新增部分打印「探针通过 / 探针失败」，只看命令能回话不足以宣布主动消息链路可用。
+
+> **别拿"读得到东西"当判据 —— 聊天记录库那一段的原文。**
+> 上面第三、四处是同一轮补的，探针就是 `plugins/hello` 的 `/示例自检`：一次问清四样——OneBot 动作
+> 通不通、刚发那条在库里查不查得到、撤回回不回得来、引用窗口读回来是多少分钟。第一次跑出来的是
+> `get_login_info 不通（没有可用的 OneBot 连接）；聊天记录库通（id=… 查得到）；撤回通；引用窗口读到 30 分钟`。
+> 当时据此写的"库这一侧是通的"**结论是错的**：`query()` 懒打开的库路径按**当前工作目录**解析，
+> 宿主和 dll 于是打开了**同一个** `data/arona/chatlog.db`，读得到记录纯属巧合；
+> 而设置（当年的 `SETTINGS`）与连接登记表那两份确实是 dll 自己的空表。
+> 换一个**宿主侧与默认值不同**的观测量才露馅：把宿主的 `quote_ttl_minutes` 配成 7，插件里仍读回 30。
+> 两条经验：① 别用读写结果反推状态是否同一份，判据得看代码形态；② 探针要挑一个
+> 宿主配置与硬默认值**不相等**的量，否则测不出两份内存。
+
+> **收进实例不等于够得着 —— 第②道关的实测原文。**
+> 把 `ChatLog` 搬上实例之后复跑同一条探针，读回来的确实**是宿主那一份**：`quote_ttl_minutes`
+> 读回 7、库路径报出宿主的 `run\data\arona\chatlog.db`。然后**第一次真正执行 SQL 就段错误**，
+> 宿主连同插件在 3 毫秒内一起没了。为了把这个界线钉死，示例插件多了一条 `/示例状态`
+> （别名 `/状态探针`），按类型的性质分三问、**一问一条**发出去（合并成一条回话时崩了就什么都拿不到）：
+>
+> | 探针 | 读的东西 | 结果 |
+> | --- | --- | --- |
+> | 1/3 | `RwLock<ChatLogSettings>`（纯 Rust，std 的类型） | **通**：引用窗口 7 分钟、启用=true |
+> | 2/3 | `RwLock<Option<PathBuf>>`（同上） | **通**：宿主那一份库路径 |
+> | 3/3 | 拿库句柄执行 `SELECT` | **段错误**，进程当场死 |
+>
+> 也就是说：**纯 Rust 字段跨镜像读写完全正常，一碰宿主那份 `rusqlite::Connection` 就崩。**
+> `rusqlite` 的 `bundled` 特性把 sqlite 静态编进了宿主与各 dll，一个进程里躺着好几份互不相认的
+> 引擎；dll 手里那个 `sqlite3*` 是宿主那份引擎创建的，它却调自己这份引擎的 `sqlite3_prepare_v2`。
+> 同一条道理管着 `ChatLog::prober` 里那份 reqwest 客户端。反过来，`get_login_info` 与
+> `send_message` 一直是通的——它们最终落到 `Arc<dyn OneBotConnection>` 这类**宿主生成的 vtable** 上，
+> 代码根本没进 dll。
+>
+> 修法是给这份库加一层 `ChatLogFace`（`Framework::chatlog_api()`，实现体在宿主镜像里），
+> 插件侧那批 `chatlog::` 自由函数签名一个不改、只改成经它转发；async 的那几问也在宿主侧执行，
+> 递回来的只是一个 `BoxFuture`。**给插件用的新接口要碰第三方库的内部状态时，一律走这条形状。**
+> `arona::bot` 里那几个走留档的方法（`Bot::recall` / `Bot::message` / `MessageSource::reply` /
+> `MessageSource::record`）同理，它们本来就是给插件用的，一律取 `chatlog_api()`。
+>
+> 改完复跑同一条探针，一次跑齐（假 OneBot 逐帧记下来的）：
+> `自检 1/4 动作出口：get_login_info 通（self_id=10000）`、
+> `自检 3/4 库：聊天记录库通（id=1023 查得到）；引用窗口读到 7 分钟`、`自检 4/4 撤回：撤回通`；
+> `/示例对象` 报 `group.send_text 通（id=1018）；撤回通；临时会话目标=Temp { group_id: 20001,
+> user_id: 100 }；ctx.source()=1017；引用窗口=7 分钟`；`group_increase` 那条探针也回到「探针通过」。
+> 顺带收掉一个旧账：**上一轮 bluearchive 卡在 `initializing database…` 不动、CPU 完全空闲，
+> 是同一个 UB 的另一种表现**（它 `await` 的那一步再也没返回，比崩掉更难查）。装上 trait 出口之后
+> 两个插件同场启动，握手报「布局 4」，预热流程一路走完。
+>
+> 还有一条经验给排查用：**同一次 `cargo build --release --workspace` 里出宿主与各插件**，
+> 这样 `arona` 只编一份、两边的字段布局必然同源。分两条命令编出来的宿主与 dll 万一 feature 集
+> 不同（宿主带 `gui`、插件 `default-features = false`），错位就会以同样的段错误出现，更难查。
 
 #### 两份 tokio：哪些调用能直接用
 
@@ -1273,8 +1428,10 @@ tokio 也被静态链接成了两份，而"当前在哪个运行时里"这个上
   阶段的 `&PluginRegistrar` 或 `configure`/`start` 阶段的 `&PluginContext`。
   （纯数据类型与无状态构造器——`runtime::message` 的消息段、`runtime::args` 的参数声明、
   `runtime::priority` 等——不在此列，它们不碰注册表。）
-  注意"接管了默认实例"不等于"所有自由函数都通"：判据是上一小节那条 —— **状态挂在实例上才通，
-  另起 `static` 的就是插件自己那份空表**。
+  注意"接管了默认实例"不等于"所有自由函数都通"：判据是上一小节那**两道关**——状态挂在实例上只是
+  第一道，另起 `static` 的就是插件自己那份空表；第二道是**由哪份代码动手**，插件侧要操作宿主创建的
+  对象里那些第三方库句柄（sqlite、reqwest），只能经宿主生成的 vtable（`Arc<dyn ..>`）或 `extern "C"`
+  通道，在 dll 里直接调固有方法就是未定义行为（聊天记录库那一处实测当场段错误，上一小节有全文）。
 - **`arona::runtime::services::send_message` 与 `arona::config::settings::*` 在插件里是真通的**：
   这两处以前各持一份进程级 `static`，dll 里那份是空的，主动消息会被静默丢弃、写配置会报
   「配置文件尚未初始化」；现在它们住在 `Framework` 实例上，随上行通道一起被接管（上一小节）。

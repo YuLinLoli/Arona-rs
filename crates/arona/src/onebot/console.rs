@@ -199,6 +199,9 @@ pub fn print_outgoing(self_id: i64, target: MessageTarget, message: &OutgoingMes
     let address = match target {
         MessageTarget::Group(id) => format!("Group({id})"),
         MessageTarget::Private(id) => format!("Friend({id})"),
+        MessageTarget::Temp { group_id, user_id } => {
+            format!("Temp(Group({group_id})=>Friend({user_id}))")
+        }
     };
     let content: String = message.segments.iter().map(format_segment).collect();
     let line = format!(

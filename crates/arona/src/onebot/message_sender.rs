@@ -139,6 +139,18 @@ fn build_send_params(
             };
             (params, "send_private_msg".to_string())
         }
+        // 临时会话只能走 send_msg：两个号都给，实现端据此判"以同群成员身份单聊"
+        MessageTarget::Temp { group_id, user_id } => {
+            let params = match message {
+                Some(message) => json!({
+                    "group_id": group_id,
+                    "user_id": user_id,
+                    "message": protocol::message_to_json(message),
+                }),
+                None => json!({ "group_id": group_id, "user_id": user_id }),
+            };
+            (params, "send_msg".to_string())
+        }
     }
 }
 
@@ -234,4 +246,37 @@ fn schedule_revoke(
             })
             .await;
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_send_params;
+    use crate::runtime::message::{MessageTarget, OutgoingMessage};
+    use serde_json::json;
+
+    /// 临时会话必须落到 `send_msg`，且群号与 QQ 号一起给：只带 user_id 的裸私聊在多数
+    /// 实现端会因"对方不是好友"直接拒发，动作名拼错就等于这条路根本走不通。
+    #[test]
+    fn temp_conversation_sends_via_send_msg_with_both_ids() {
+        let message = OutgoingMessage::text("在吗");
+        let (params, action) = build_send_params(
+            MessageTarget::Temp {
+                group_id: 20001,
+                user_id: 100,
+            },
+            Some(&message),
+        );
+        assert_eq!(action, "send_msg");
+        assert_eq!(params["group_id"], json!(20001));
+        assert_eq!(params["user_id"], json!(100));
+        assert!(params["message"].is_array(), "消息段要一起带上");
+
+        // 群与私聊仍各自走自己的动作，没被顺手并进 send_msg
+        let (params, action) = build_send_params(MessageTarget::Group(20001), Some(&message));
+        assert_eq!(action, "send_group_msg");
+        assert!(params.get("user_id").is_none(), "群消息不该带 user_id");
+        let (params, action) = build_send_params(MessageTarget::Private(100), Some(&message));
+        assert_eq!(action, "send_private_msg");
+        assert!(params.get("group_id").is_none(), "裸私聊不该带群号");
+    }
 }

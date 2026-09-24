@@ -7,7 +7,7 @@ use crate::onebot::http_api::HttpApiServer;
 use crate::onebot::http_reverse::{HttpReverseConnection, HttpReverseState};
 use crate::onebot::ws_forward::{RunState, WsForwardConnection};
 use crate::onebot::ws_reverse::{WsReverseConnection, WsReverseState};
-use once_cell::sync::OnceCell;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 pub struct OneBotApplication {
@@ -167,13 +167,83 @@ impl OneBotApplication {
     }
 }
 
-/// 全局 OneBot 应用句柄（GUI 管理面板与热重载使用）
-static GLOBAL: OnceCell<Arc<OneBotApplication>> = OnceCell::new();
-
-pub fn set_global(application: Arc<OneBotApplication>) {
-    let _ = GLOBAL.set(application);
+/// OneBot 应用与连接池的持有者，挂在 [`Framework`](crate::framework::Framework) 实例上。
+///
+/// 这里曾经是一枚 `static GLOBAL: OnceCell`。进程级 `static` 对插件是致命的：动态插件 dll
+/// 静态链接了自己一整份框架代码，`OnceCell` 于是各进程镜像里有一份、彼此不通，宿主连上了
+/// 实现端，插件里 `OneBotApi` 的每一次动作仍然只拿得到 `NoConnection`。挂到实例上之后，
+/// dll 经 `Framework::adopt_host` 接到的是宿主这一份，连接、self_id 都是宿主真正在用的。
+#[derive(Default)]
+pub struct OnebotOutlet {
+    application: RwLock<Option<Arc<OneBotApplication>>>,
+    self_id: AtomicI64,
 }
 
+impl OnebotOutlet {
+    /// 认领一份 OneBot 应用（宿主启动时调用；热重载换对象时再次覆盖即可）
+    pub fn attach(&self, application: Arc<OneBotApplication>) {
+        let self_id = application.config().self_id;
+        *self.application.write().unwrap() = Some(application);
+        self.self_id.store(self_id, Ordering::SeqCst);
+    }
+
+    /// 当前挂着的 OneBot 应用（GUI 管理面板与连接热重载用它）
+    pub fn application(&self) -> Option<Arc<OneBotApplication>> {
+        self.application.read().unwrap().clone()
+    }
+
+    /// 连接登记表；没有应用对象时就没有登记簿
+    pub fn registry(&self) -> Option<Arc<ConnectionRegistry>> {
+        self.application().map(|app| app.registry.clone())
+    }
+
+    /// 首个可用连接：所有 OneBot 动作的实际出口
+    pub fn first_connection(&self) -> Option<Arc<dyn OneBotConnection>> {
+        self.application().and_then(|app| app.first_connection())
+    }
+
+    /// 机器人 QQ 号（onebot.yml 的 self_id）
+    pub fn self_id(&self) -> i64 {
+        self.self_id.load(Ordering::SeqCst)
+    }
+
+    /// 此刻是否连着实现端
+    pub fn is_online(&self) -> bool {
+        self.first_connection().is_some()
+    }
+}
+
+/// 发布 OneBot 应用句柄：交给**进程默认实例**的那份 [`OnebotOutlet`]
+pub fn set_global(application: Arc<OneBotApplication>) {
+    crate::framework::Framework::global()
+        .onebot()
+        .attach(application);
+}
+
+/// 当前挂着的 OneBot 应用
 pub fn global() -> Option<Arc<OneBotApplication>> {
-    GLOBAL.get().cloned()
+    crate::framework::Framework::global().onebot().application()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::framework::Framework;
+
+    /// 连接句柄属于实例：插件 dll 里 `OneBotApi` 取的就是它认领的那套 `Framework` 上的
+    /// outlet。换成进程级 `static OnceCell` 后，dll 那份从来没人 `set`，宿主明明连着，
+    /// 插件每次动作却只拿得到 `NoConnection`——这条断言把"没认领就是空"钉住。
+    #[test]
+    fn outlet_only_sees_the_application_its_own_instance_holds() {
+        let one = Framework::new();
+        let other = Framework::new();
+        assert!(
+            !std::ptr::eq(Arc::as_ptr(one.onebot()), Arc::as_ptr(other.onebot())),
+            "两套实例不该共用同一份连接句柄"
+        );
+        assert!(one.onebot().application().is_none(), "新实例一开始谁也没连");
+        assert!(one.onebot().registry().is_none());
+        assert!(!one.onebot().is_online());
+        assert_eq!(one.onebot().self_id(), 0);
+    }
 }

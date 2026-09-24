@@ -37,7 +37,15 @@ use std::os::raw::c_char;
 ///
 /// 2 = 上行通道 [`HostBridge`] 带日志/默认实例/tokio 句柄三项；
 /// 3 = 再多一项：宿主代发 HTTP（[`HostBridge::http`]）。
-pub const ABI_LAYOUT: u32 = 3;
+/// 4 = [`crate::framework::Framework`] 换了字段布局（多出 `chatlog_api` 一项）。
+///
+/// **别以为改了 `HostBridge` 才算改 ABI**：[`HostBridge::framework`] 交出去的是擦成
+/// `*const c_void` 的实例指针，插件 dll 里那份框架代码按**它自己编译期的字段偏移**去读这个
+/// 结构体。往 `Framework` 中间插一个字段、或改动它任何字段的类型，旧 dll 就会读错位置——
+/// 那不是"握手失败"而是未定义行为（实测表现为宿主带崩：dll 拿着宿主创建的 `sqlite3*`
+/// 句柄去调自己那份 bundled sqlite）。所以 `Framework` 的字段序本身就是 ABI 的一部分，
+/// 动它必须抬这个版本号。
+pub const ABI_LAYOUT: u32 = 4;
 
 /// 装载器名（写进 `plugins/<id>/plugin.yml` 的 `loader:` 与 GUI 插件列表）
 pub const DYNAMIC_LOADER: &str = "dynamic";
@@ -181,7 +189,13 @@ pub struct HostBridge {
     pub log: extern "C" fn(level: *const c_char, message: *const c_char, source: *const c_char),
     /// 宿主的进程默认实例（`*const Framework`，擦成 `c_void`）。挂在实例上的状态
     /// （注册表、插件配置文件、框架那份 arona.yml、主动发消息的出口）都跟着这一份走，
-    /// 所以新增状态只要放在 `Framework` 上就不必再抬 [`ABI_LAYOUT`]。
+    /// 所以插件读它们不必新增通道；**但改 `Framework` 的字段布局必须抬 [`ABI_LAYOUT`]**——
+    /// dll 是按自己编译期的偏移读这个结构体的，错位等于未定义行为。
+    ///
+    /// 而且"挂在实例上"只保证 dll **找得到**这份状态，不保证它能亲手操作：dll 里静态链接
+    /// 了自己那套依赖库，所以只能经**宿主生成的 vtable**（`Arc<dyn ..>`，如
+    /// [`Framework::chatlog_api`](crate::framework::Framework::chatlog_api)）或 `extern "C"`
+    /// 函数去用，直接在 dll 里调带第三方句柄的固有方法（rusqlite、reqwest）会当场崩。
     pub framework: extern "C" fn() -> *const c_void,
     /// 宿主登记的 tokio 句柄（`*const Handle`），没有则返回空指针
     pub runtime: extern "C" fn() -> *const c_void,

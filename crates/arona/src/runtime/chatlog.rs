@@ -20,15 +20,16 @@
 //! 能被逐步补进库，而不必等机器人重新听过一遍。过期记录由框架按配置定时清理（见 [`apply`]）。
 
 use crate::config::arona::ChatLogSettings;
+use crate::framework::Framework;
 use crate::onebot::OneBotEvent;
 use crate::onebot::api::{OneBotApi, OneBotError};
 use crate::onebot::protocol;
 use crate::runtime::message::{MessageReceipt, MessageSegment, MessageTarget, OutgoingMessage};
-use once_cell::sync::Lazy;
+use futures_util::future::BoxFuture;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Duration;
 
 /// 清理任务名（框架按它排期；归属为空，插件停用不会带走它）
@@ -56,61 +57,73 @@ CREATE INDEX IF NOT EXISTS idx_chat_time ON chat_message(time);
 CREATE INDEX IF NOT EXISTS idx_chat_real ON chat_message(real_id);
 "#;
 
-static SETTINGS: Lazy<RwLock<ChatLogSettings>> =
-    Lazy::new(|| RwLock::new(ChatLogSettings::default()));
-/// 当前库文件；None 表示还没打开过，下次用到时按默认路径自动打开
-static FILE: Lazy<RwLock<Option<PathBuf>>> = Lazy::new(|| RwLock::new(None));
-static DB: Lazy<Mutex<Option<Connection>>> = Lazy::new(|| Mutex::new(None));
-/// 开库失败过一次就只提示一次：不能每条消息都刷一遍错误日志
-static OPEN_FAILURE_LOGGED: AtomicBool = AtomicBool::new(false);
-
-/// 探图片直链是否还活着用的客户端（还原引用时才用，超时按 5 秒）。
-/// QQ 的图床对没有浏览器 UA 的请求会直接回 403，所以 UA 要带
-static PROBER: Lazy<reqwest::Client> = Lazy::new(|| {
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .user_agent(USER_AGENT)
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
-});
-
-// ==================== 配置 ====================
-
-/// 当前生效的聊天记录配置
-pub fn settings() -> ChatLogSettings {
-    SETTINGS.read().unwrap().clone()
+/// 聊天记录库的持有者。挂在 [`Framework`] 实例上而不是进程级 `static`，理由与
+/// [`OnebotOutlet`](crate::onebot::application::OnebotOutlet) 相同：插件 dll 静态链接了自己
+/// 一份框架代码，`static` 配置在 dll 里读到的永远是默认值——实测过：宿主 arona.yml 把
+/// `quote_ttl_minutes` 改成 7，插件侧仍读到 30。库文件倒是"碰巧"能读到（dll 按当前工作目录
+/// 自己开了同一个 SQLite 文件），但那是走运而非设计：换启动目录、装成服务、用户关掉记录开关，
+/// 三条里任何一条都会让它分叉，而且每个 dll 各开一条连接在同一文件上抢写锁。
+#[derive(Default)]
+pub struct ChatLog {
+    settings: RwLock<ChatLogSettings>,
+    /// 当前库文件；None 表示还没打开过，下次用到时按 [`crate::runtime::paths::chatlog_file`] 自动打开
+    file: RwLock<Option<PathBuf>>,
+    db: Mutex<Option<Connection>>,
+    /// 开库失败过一次就只提示一次：不能每条消息都刷一遍错误日志
+    open_failure_logged: AtomicBool,
+    /// 探图片直链是否还活着用的客户端（还原引用时才建，超时按 5 秒）。
+    /// QQ 的图床对没有浏览器 UA 的请求会直接回 403，所以 UA 要带
+    prober: OnceLock<reqwest::Client>,
 }
 
-/// 是否启用（关掉后既不写库也不还原引用）
-pub fn enabled() -> bool {
-    SETTINGS.read().unwrap().enable
-}
-
-/// 应用配置并校准清理任务（arona.yml 加载与热重载时调用）。
-/// 钩子与记账点恒常生效、在这里现读开关，用户改开配置后不必重启。
-pub fn apply(new_settings: ChatLogSettings) {
-    let purge_interval = new_settings.purge_interval_days;
-    let keep_days = new_settings.keep_days;
-    *SETTINGS.write().unwrap() = new_settings;
-    if !enabled() {
-        crate::runtime::purge::cancel(PURGE_JOB);
-        return;
+impl ChatLog {
+    /// 当前生效的聊天记录配置
+    pub fn settings(&self) -> ChatLogSettings {
+        self.settings.read().unwrap().clone()
     }
-    // 清库是框架的例行维护，不属于任何插件：归属留空，日志顶在 [Arona] 名下
-    crate::runtime::purge::schedule(
-        "",
-        PURGE_JOB,
-        "聊天记录",
-        purge_interval,
-        keep_days,
-        Arc::new(purge),
-    );
-}
 
-/// 删掉超出保留期的聊天记录，回报条数（由框架的清理排期播报）
-pub fn purge() -> i64 {
-    let keep_days = settings().keep_days.max(1);
-    forget_before(now_secs() - keep_days * 86400)
+    /// 是否启用（关掉后既不写库也不还原引用）
+    pub fn enabled(&self) -> bool {
+        self.settings.read().unwrap().enable
+    }
+
+    /// 应用配置并校准清理任务（arona.yml 加载与热重载时调用）。
+    /// 钩子与记账点恒常生效、在这里现读开关，用户改开配置后不必重启。
+    ///
+    /// 清理排期只由**进程默认实例**那份库维护：`quartz` 的登记表是进程级的，隔离实例
+    /// （测试、多实例宿主）跟着排同名任务会互相盖掉排期，而 [`purge`] 清的又始终是默认
+    /// 实例那个文件——等于替别家清库。所以非默认实例只存设置，不碰排期。
+    pub fn apply(&self, new_settings: ChatLogSettings) {
+        let purge_interval = new_settings.purge_interval_days;
+        let keep_days = new_settings.keep_days;
+        *self.settings.write().unwrap() = new_settings;
+        let is_default_instance = std::ptr::eq(
+            Arc::as_ptr(Framework::global().chatlog()),
+            self as *const ChatLog,
+        );
+        if !is_default_instance {
+            return;
+        }
+        if !self.enabled() {
+            crate::runtime::purge::cancel(PURGE_JOB);
+            return;
+        }
+        // 清库是框架的例行维护，不属于任何插件：归属留空，日志顶在 [Arona] 名下。
+        crate::runtime::purge::schedule(
+            "",
+            PURGE_JOB,
+            "聊天记录",
+            purge_interval,
+            keep_days,
+            Arc::new(purge),
+        );
+    }
+
+    /// 删掉超出保留期的聊天记录，回报条数（由框架的清理排期播报）
+    pub fn purge(&self) -> i64 {
+        let keep_days = self.settings().keep_days.max(1);
+        self.forget_before(now_secs() - keep_days * 86400)
+    }
 }
 
 // ==================== 记录 ====================
@@ -135,78 +148,93 @@ pub struct ChatRecord {
     pub image: String,
 }
 
-/// 打开（或换到）指定文件的聊天记录库并建表，返回是否成功。
-/// 运行期一般不必调用：第一次用到时框架会按 [`crate::runtime::paths::chatlog_file`] 自动打开。
-pub fn open(file: &Path) -> bool {
-    if let Some(parent) = file.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let opened = match Connection::open(file) {
-        Ok(conn) => {
-            let _ = conn.pragma_update(None, "journal_mode", "WAL");
-            let _ = conn.pragma_update(None, "busy_timeout", 5000);
-            match conn.execute_batch(SCHEMA) {
-                Ok(()) => Some(conn),
-                Err(err) => {
-                    fail_once(format!("聊天记录建表失败: {err}"));
-                    None
+impl ChatLog {
+    /// 打开（或换到）指定文件的聊天记录库并建表，返回是否成功。
+    /// 运行期一般不必调用：第一次用到时框架会按 [`crate::runtime::paths::chatlog_file`] 自动打开。
+    pub fn open(&self, file: &Path) -> bool {
+        if let Some(parent) = file.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let opened = match Connection::open(file) {
+            Ok(conn) => {
+                let _ = conn.pragma_update(None, "journal_mode", "WAL");
+                let _ = conn.pragma_update(None, "busy_timeout", 5000);
+                match conn.execute_batch(SCHEMA) {
+                    Ok(()) => Some(conn),
+                    Err(err) => {
+                        self.fail_once(format!("聊天记录建表失败: {err}"));
+                        None
+                    }
                 }
             }
+            Err(err) => {
+                self.fail_once(format!("聊天记录库打开失败: {err}"));
+                None
+            }
+        };
+        let Some(conn) = opened else {
+            return false;
+        };
+        *self.file.write().unwrap() = Some(file.to_path_buf());
+        let mut slot = self
+            .db
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(old) = slot.replace(conn) {
+            let _ = old.close();
         }
-        Err(err) => {
-            fail_once(format!("聊天记录库打开失败: {err}"));
-            None
+        true
+    }
+
+    /// 当前用的库文件；None 表示还没开过（下次用到时按路径约定自动开）
+    pub fn file(&self) -> Option<PathBuf> {
+        self.file.read().unwrap().clone()
+    }
+
+    /// 关闭库连接（备份/恢复文件前释放占用用；下次用到时会自动按原路径重开）
+    pub fn close(&self) {
+        let mut slot = self
+            .db
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(conn) = slot.take() {
+            let _ = conn.close();
         }
-    };
-    let Some(conn) = opened else {
-        return false;
-    };
-    *FILE.write().unwrap() = Some(file.to_path_buf());
-    let mut slot = DB.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(old) = slot.replace(conn) {
-        let _ = old.close();
+        *self.file.write().unwrap() = None;
     }
-    true
-}
 
-/// 关闭库连接（备份/恢复文件前释放占用用；下次用到时会自动按原路径重开）
-pub fn close() {
-    let mut slot = DB.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(conn) = slot.take() {
-        let _ = conn.close();
-    }
-    *FILE.write().unwrap() = None;
-}
-
-fn fail_once(message: String) {
-    if !OPEN_FAILURE_LOGGED.swap(true, Ordering::SeqCst) {
-        crate::runtime::log::error(message);
-    }
-}
-
-/// 惰性开库后的同步查询：库没就绪或执行出错时返回 None（记账失败绝不影响收发消息）
-fn query<T>(read: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> Option<T> {
-    if FILE.read().unwrap().is_none() {
-        open(&crate::runtime::paths::chatlog_file());
-    }
-    let guard = DB.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let conn = guard.as_ref()?;
-    match read(conn) {
-        Ok(value) => Some(value),
-        Err(err) => {
-            crate::runtime::log::error(format!("聊天记录读写失败: {err}"));
-            None
+    fn fail_once(&self, message: String) {
+        if !self.open_failure_logged.swap(true, Ordering::SeqCst) {
+            crate::runtime::log::error(message);
         }
     }
-}
 
-/// 记一条消息（同 id 覆盖重记；`real_id` 只补不抹，免得自己的消息回显把撤回依据洗掉）
-pub fn remember(record: &ChatRecord) {
-    let real_id = record.real_id;
-    let from_bot = record.from_bot as i64;
-    let _ = query(|conn| {
-        conn.execute(
-            "INSERT INTO chat_message
+    /// 惰性开库后的同步查询：库没就绪或执行出错时返回 None（记账失败绝不影响收发消息）
+    fn query<T>(&self, read: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> Option<T> {
+        if self.file.read().unwrap().is_none() {
+            self.open(&crate::runtime::paths::chatlog_file());
+        }
+        let guard = self
+            .db
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let conn = guard.as_ref()?;
+        match read(conn) {
+            Ok(value) => Some(value),
+            Err(err) => {
+                crate::runtime::log::error(format!("聊天记录读写失败: {err}"));
+                None
+            }
+        }
+    }
+
+    /// 记一条消息（同 id 覆盖重记；`real_id` 只补不抹，免得自己的消息回显把撤回依据洗掉）
+    pub fn remember(&self, record: &ChatRecord) {
+        let real_id = record.real_id;
+        let from_bot = record.from_bot as i64;
+        let _ = self.query(|conn| {
+            conn.execute(
+                "INSERT INTO chat_message
              (message_id, real_id, grp, qq, from_bot, name, time, text, image)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT(message_id) DO UPDATE SET
@@ -218,39 +246,40 @@ pub fn remember(record: &ChatRecord) {
                time = excluded.time,
                text = excluded.text,
                image = excluded.image",
-            params![
-                record.message_id,
-                real_id,
-                record.group,
-                record.qq,
-                from_bot,
-                record.name,
-                record.time,
-                record.text,
-                record.image
-            ],
-        )
-    });
-}
+                params![
+                    record.message_id,
+                    real_id,
+                    record.group,
+                    record.qq,
+                    from_bot,
+                    record.name,
+                    record.time,
+                    record.text,
+                    record.image
+                ],
+            )
+        });
+    }
 
-/// 按 message_id 或 real_id 查一条记录
-pub fn find(message_id: i64) -> Option<ChatRecord> {
-    query(|conn| {
-        conn.query_row(
-            "SELECT message_id, real_id, grp, qq, from_bot, name, time, text, image
+    /// 按 message_id 或 real_id 查一条记录
+    pub fn find(&self, message_id: i64) -> Option<ChatRecord> {
+        self.query(|conn| {
+            conn.query_row(
+                "SELECT message_id, real_id, grp, qq, from_bot, name, time, text, image
              FROM chat_message WHERE message_id = ?1 OR real_id = ?1",
-            params![message_id],
-            row_to_record,
-        )
-        .optional()
-    })
-    .flatten()
-}
+                params![message_id],
+                row_to_record,
+            )
+            .optional()
+        })
+        .flatten()
+    }
 
-/// 删掉 `time < cutoff` 的记录，返回条数
-pub fn forget_before(cutoff: i64) -> i64 {
-    query(|conn| conn.execute("DELETE FROM chat_message WHERE time < ?1", params![cutoff]))
-        .unwrap_or(0) as i64
+    /// 删掉 `time < cutoff` 的记录，返回条数
+    pub fn forget_before(&self, cutoff: i64) -> i64 {
+        self.query(|conn| conn.execute("DELETE FROM chat_message WHERE time < ?1", params![cutoff]))
+            .unwrap_or(0) as i64
+    }
 }
 
 fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatRecord> {
@@ -269,62 +298,67 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatRecord> {
 
 // ==================== 记账点 ====================
 
-/// 把机器人听到的一条消息记进库（未启用、无 message_id 或空白消息时跳过）。
-/// 调用点在 [`crate::onebot::business`]，群授权与黑名单已经过滤过。
-pub fn record_inbound(event: &OneBotEvent, segments: &[MessageSegment]) {
-    if !enabled() {
-        return;
+impl ChatLog {
+    /// 把机器人听到的一条消息记进库（未启用、无 message_id 或空白消息时跳过）。
+    /// 调用点在 [`crate::onebot::business`]，群授权与黑名单已经过滤过。
+    pub fn record_inbound(&self, event: &OneBotEvent, segments: &[MessageSegment]) {
+        if !self.enabled() {
+            return;
+        }
+        let Some(message_id) = event.message_id else {
+            return;
+        };
+        let text = truncate(&record_text(segments));
+        let image = first_image(segments).unwrap_or_default();
+        if text.is_empty() && image.is_empty() {
+            return;
+        }
+        let qq = event.user_id.unwrap_or_default();
+        let from_bot = qq != 0 && Some(qq) == Some(crate::runtime::config::bot_id());
+        self.remember(&ChatRecord {
+            message_id,
+            real_id: real_id_of(&event.raw),
+            group: event.group_id.unwrap_or_default(),
+            qq,
+            from_bot,
+            name: sender_name(event),
+            time: to_secs(event.time),
+            text,
+            image,
+        });
     }
-    let Some(message_id) = event.message_id else {
-        return;
-    };
-    let text = truncate(&record_text(segments));
-    let image = first_image(segments).unwrap_or_default();
-    if text.is_empty() && image.is_empty() {
-        return;
-    }
-    let qq = event.user_id.unwrap_or_default();
-    let from_bot = qq != 0 && Some(qq) == Some(crate::runtime::config::bot_id());
-    remember(&ChatRecord {
-        message_id,
-        real_id: real_id_of(&event.raw),
-        group: event.group_id.unwrap_or_default(),
-        qq,
-        from_bot,
-        name: sender_name(event),
-        time: to_secs(event.time),
-        text,
-        image,
-    });
-}
 
-/// 把机器人刚发出的一条消息记进库
-pub fn record_outgoing(target: MessageTarget, message: &OutgoingMessage, receipt: &MessageReceipt) {
-    if !enabled() {
-        return;
+    /// 把机器人刚发出的一条消息记进库
+    pub fn record_outgoing(
+        &self,
+        target: MessageTarget,
+        message: &OutgoingMessage,
+        receipt: &MessageReceipt,
+    ) {
+        if !self.enabled() {
+            return;
+        }
+        let Some(message_id) = receipt.message_id else {
+            return;
+        };
+        let text = truncate(&record_text(&message.segments));
+        let image = first_image(&message.segments).unwrap_or_default();
+        if text.is_empty() && image.is_empty() {
+            return;
+        }
+        self.remember(&ChatRecord {
+            message_id,
+            real_id: receipt.real_id.filter(|real| *real != message_id),
+            // 临时会话记在来源群名下：撤回与回查要能在群上下文里找到它
+            group: target.group().unwrap_or_default(),
+            qq: crate::runtime::config::bot_id(),
+            from_bot: true,
+            name: bot_name(),
+            time: now_secs(),
+            text,
+            image,
+        });
     }
-    let Some(message_id) = receipt.message_id else {
-        return;
-    };
-    let text = truncate(&record_text(&message.segments));
-    let image = first_image(&message.segments).unwrap_or_default();
-    if text.is_empty() && image.is_empty() {
-        return;
-    }
-    remember(&ChatRecord {
-        message_id,
-        real_id: receipt.real_id.filter(|real| *real != message_id),
-        group: match target {
-            MessageTarget::Group(group_id) => group_id,
-            MessageTarget::Private(_) => 0,
-        },
-        qq: crate::runtime::config::bot_id(),
-        from_bot: true,
-        name: bot_name(),
-        time: now_secs(),
-        text,
-        image,
-    });
 }
 
 /// 机器人自己的展示名：出站记录要用，取 onebot.yml 的 nickname（热重载后自动跟着变）
@@ -345,20 +379,135 @@ enum QuotePlan {
     Restore,
 }
 
-/// 这次回复该在开头挂什么：真引用段、还原出来的引用，或者什么都不挂。
-/// `quoted` 是用户引用的那条消息 id，`at` 是触发这次回复的消息时间戳（秒或毫秒都可，
-/// 实现端没给时间时传 0，按"现在"算——否则拿 0 去比窗口会永远判成还来得及）。
-pub async fn quote_prefix(quoted: Option<i64>, at: i64) -> Option<Vec<MessageSegment>> {
-    let config = settings();
-    if !config.enable {
-        return None;
+impl ChatLog {
+    /// 这次回复该在开头挂什么：真引用段、还原出来的引用，或者什么都不挂。
+    /// `quoted` 是用户引用的那条消息 id，`at` 是触发这次回复的消息时间戳（秒或毫秒都可，
+    /// 实现端没给时间时传 0，按"现在"算——否则拿 0 去比窗口会永远判成还来得及）。
+    pub async fn quote_prefix(&self, quoted: Option<i64>, at: i64) -> Option<Vec<MessageSegment>> {
+        let config = self.settings();
+        if !config.enable {
+            return None;
+        }
+        let quoted = quoted?;
+        let record = self.lookup(quoted).await?;
+        let at = if at > 0 { to_secs(at) } else { now_secs() };
+        match plan(config.quote_ttl_minutes, record.time, at) {
+            QuotePlan::Attach => Some(vec![MessageSegment::Reply(quoted)]),
+            QuotePlan::Restore => Some(restored_segments(
+                &record,
+                self.image_segment(&record).await,
+            )),
+        }
     }
-    let quoted = quoted?;
-    let record = lookup(quoted).await?;
-    let at = if at > 0 { to_secs(at) } else { now_secs() };
-    match plan(config.quote_ttl_minutes, record.time, at) {
-        QuotePlan::Attach => Some(vec![MessageSegment::Reply(quoted)]),
-        QuotePlan::Restore => Some(restored_segments(&record, image_segment(&record).await)),
+
+    /// 查这条被引用的消息：先查本地库，查不到就去问实现端并回填。
+    /// 公开是因为 mirai 的 `MessageSource.getRecord()` 要的就是这个语义
+    /// （只看 [`ChatLog::find`] 会漏掉机器人上线前发的那批）。
+    pub async fn lookup(&self, message_id: i64) -> Option<ChatRecord> {
+        if let Some(record) = self.find(message_id) {
+            return Some(record);
+        }
+        self.backfill(message_id).await
+    }
+
+    /// `get_msg` 回查并回填：库里没有的旧 id（机器人上线前发的）问一次实现端，
+    /// 问到就记进库，下次同样的引用就不必再走网络。实现端答不上来时给 None。
+    async fn backfill(&self, message_id: i64) -> Option<ChatRecord> {
+        let api = OneBotApi::global();
+        let info = match tokio::time::timeout(Duration::from_secs(3), api.get_msg(message_id)).await
+        {
+            Ok(Ok(info)) => info,
+            // 超时或实现端答不上来：这条消息我们无从还原
+            _ => return None,
+        };
+        let event = OneBotEvent {
+            time: to_secs(info.time),
+            self_id: crate::runtime::config::bot_id(),
+            post_type: "message".to_string(),
+            notice_type: None,
+            message_type: Some(info.message_type.clone()),
+            sub_type: None,
+            message_id: Some(info.message_id),
+            user_id: Some(info.user_id),
+            operator_id: None,
+            group_id: (info.group_id > 0).then_some(info.group_id),
+            raw_message: None,
+            message: Some(info.message.clone()),
+            sender: Some(info.sender.clone()),
+            raw: serde_json::Value::Null,
+        };
+        let segments = protocol::extract_segments(&event);
+        let record = ChatRecord {
+            message_id,
+            real_id: info.real_id.filter(|real| *real != message_id),
+            group: info.group_id,
+            qq: info.user_id,
+            from_bot: info.user_id != 0 && info.user_id == crate::runtime::config::bot_id(),
+            name: sender_name(&event),
+            time: event.time,
+            text: truncate(&record_text(&segments)),
+            image: first_image(&segments).unwrap_or_default(),
+        };
+        self.remember(&record);
+        Some(record)
+    }
+
+    /// 还原引用里的图片：本地文件看还在不在，网络直链先探一次活
+    async fn image_segment(&self, record: &ChatRecord) -> Option<MessageSegment> {
+        if record.image.is_empty() {
+            return None;
+        }
+        if is_web(&record.image) {
+            return self
+                .url_alive(&record.image)
+                .await
+                .then(|| MessageSegment::Image {
+                    url: Some(record.image.clone()),
+                    file: None,
+                    data: None,
+                });
+        }
+        local_alive(&record.image).then(|| MessageSegment::Image {
+            url: None,
+            file: Some(record.image.clone()),
+            data: None,
+        })
+    }
+
+    /// 图床直链此刻还取不取得到：QQ 的图片 URL 带签名会过期，还原引用前得先问一次。
+    /// 只索要第一个字节，5 秒内没有成功响应就当作已过期。
+    async fn url_alive(&self, url: &str) -> bool {
+        let request = self.prober().get(url).header("range", "bytes=0-0").header(
+            "accept",
+            "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+        );
+        matches!(request.send().await, Ok(response) if response.status().is_success())
+    }
+
+    /// 探活客户端挂在实例上惰性建：宿主那份连接池与 TLS 上下文因此能被插件共用
+    fn prober(&self) -> &reqwest::Client {
+        self.prober.get_or_init(|| {
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(5))
+                .user_agent(USER_AGENT)
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new())
+        })
+    }
+
+    /// 撤回用的 id：把调用方手上的任意一个号换成库里存的**真实** id。
+    /// NapCat / LLOWeb 一类实现端只认 real_id，拿事件里的 message_id 去 delete_msg 会报「消息不存在」。
+    pub fn recall_id(&self, message_id: i64) -> i64 {
+        self.find(message_id)
+            .and_then(|record| record.real_id)
+            .unwrap_or(message_id)
+    }
+
+    /// 撤回一条消息（自己发的，或有管理权限时撤别人的），按库里存的 id 发 `delete_msg`
+    pub async fn recall(&self, message_id: i64) -> Result<(), OneBotError> {
+        OneBotApi::global()
+            .delete_msg(self.recall_id(message_id))
+            .await
     }
 }
 
@@ -384,55 +533,6 @@ fn restored_segments(record: &ChatRecord, image: Option<MessageSegment>) -> Vec<
     segments
 }
 
-/// 查这条被引用的消息：先查本地库，查不到就去问实现端并回填
-async fn lookup(message_id: i64) -> Option<ChatRecord> {
-    if let Some(record) = find(message_id) {
-        return Some(record);
-    }
-    backfill(message_id).await
-}
-
-/// `get_msg` 回查并回填：库里没有的旧 id（机器人上线前发的）问一次实现端，
-/// 问到就记进库，下次同样的引用就不必再走网络。实现端答不上来时给 None。
-async fn backfill(message_id: i64) -> Option<ChatRecord> {
-    let api = OneBotApi::global();
-    let info = match tokio::time::timeout(Duration::from_secs(3), api.get_msg(message_id)).await {
-        Ok(Ok(info)) => info,
-        // 超时或实现端答不上来：这条消息我们无从还原
-        _ => return None,
-    };
-    let event = OneBotEvent {
-        time: to_secs(info.time),
-        self_id: crate::runtime::config::bot_id(),
-        post_type: "message".to_string(),
-        notice_type: None,
-        message_type: Some(info.message_type.clone()),
-        sub_type: None,
-        message_id: Some(info.message_id),
-        user_id: Some(info.user_id),
-        operator_id: None,
-        group_id: (info.group_id > 0).then_some(info.group_id),
-        raw_message: None,
-        message: Some(info.message.clone()),
-        sender: Some(info.sender.clone()),
-        raw: serde_json::Value::Null,
-    };
-    let segments = protocol::extract_segments(&event);
-    let record = ChatRecord {
-        message_id,
-        real_id: info.real_id.filter(|real| *real != message_id),
-        group: info.group_id,
-        qq: info.user_id,
-        from_bot: info.user_id != 0 && info.user_id == crate::runtime::config::bot_id(),
-        name: sender_name(&event),
-        time: event.time,
-        text: truncate(&record_text(&segments)),
-        image: first_image(&segments).unwrap_or_default(),
-    };
-    remember(&record);
-    Some(record)
-}
-
 /// 还原出来的引用头：谁在什么时候说了什么
 fn restore_text(record: &ChatRecord) -> String {
     let who = if record.name.is_empty() {
@@ -448,50 +548,199 @@ fn restore_text(record: &ChatRecord) -> String {
     format!("[引用 {who} {} 的消息]\n{text}", display_time(record.time))
 }
 
-/// 还原引用里的图片：本地文件看还在不在，网络直链先探一次活
-async fn image_segment(record: &ChatRecord) -> Option<MessageSegment> {
-    if record.image.is_empty() {
-        return None;
-    }
-    if is_web(&record.image) {
-        return url_alive(&record.image)
-            .await
-            .then(|| MessageSegment::Image {
-                url: Some(record.image.clone()),
-                file: None,
-                data: None,
-            });
-    }
-    local_alive(&record.image).then(|| MessageSegment::Image {
-        url: None,
-        file: Some(record.image.clone()),
-        data: None,
-    })
-}
-
-/// 图床直链此刻还取不取得到：QQ 的图片 URL 带签名会过期，还原引用前得先问一次。
-/// 只索要第一个字节，5 秒内没有成功响应就当作已过期。
-async fn url_alive(url: &str) -> bool {
-    let request = PROBER.get(url).header("range", "bytes=0-0").header(
-        "accept",
-        "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
-    );
-    matches!(request.send().await, Ok(response) if response.status().is_success())
-}
-
 // ==================== 撤回 ====================
 
-/// 撤回用的 id：把调用方手上的任意一个号换成库里存的**真实** id。
-/// NapCat / LLOWeb 一类实现端只认 real_id，拿事件里的 message_id 去 delete_msg 会报「消息不存在」。
-pub fn recall_id(message_id: i64) -> i64 {
-    find(message_id)
-        .and_then(|record| record.real_id)
-        .unwrap_or(message_id)
+// ==================== 对外门面 ====================
+//
+// 下面这些自由函数是既有调用点（business/message_sender/dispatcher/GUI）与插件一直使用的
+// 写法，签名一个都不改；它们只把调用转到**进程默认实例**那份库上。
+//
+// 但"转到实例上"只解决了去哪儿找这份状态，没解决用哪份代码碰它——所以这里一律经
+// [`ChatLogFace`] 的 trait 对象，而不是直接调 [`ChatLog`] 的同名方法。
+
+/// [`ChatLog`] 的**跨镜像出口**：动态插件 dll 只能通过它读这份库。
+///
+/// 一个 dll 里静态链接了整整一份框架代码，也带着**自己那一份 bundled sqlite**。
+/// 若在插件侧直接 `ChatLog::find`，编译进 dll 的那份实现会拿着**宿主创建的** `sqlite3*`
+/// 句柄去调 dll 自己那份引擎——两套引擎各有一批进程级全局（内存分配、互斥锁池、配置），
+/// 互不相认，实测是当场段错误、整个宿主一起没（纯 Rust 字段则完全正常：同一份 arona.yml
+/// 的 `quote_ttl_minutes: 7` 能读对，库路径也报出宿主那一份）。
+/// 经**宿主生成**的 vtable 调用才是把执行搬回宿主镜像：函数指针指向宿主的代码，
+/// sqlite 连接自始至终只被宿主那份引擎触碰。`prober` 里那份 reqwest 客户端同理，
+/// 所以 async 的几问也在宿主侧执行、只把 future 递回来。
+///
+/// 方法名与 [`ChatLog`] 的固有方法刻意重合，实现体因此用 `ChatLog::x(self, ..)` 的
+/// 完全限定写法——不然 `self.x()` 会选中固有方法以外的另一条路，读起来分不清谁调谁。
+pub trait ChatLogFace: Send + Sync {
+    fn settings(&self) -> ChatLogSettings;
+    fn enabled(&self) -> bool;
+    fn apply(&self, new_settings: ChatLogSettings);
+    fn purge(&self) -> i64;
+    fn open(&self, file: &Path) -> bool;
+    fn file(&self) -> Option<PathBuf>;
+    fn close(&self);
+    fn remember(&self, record: &ChatRecord);
+    fn find(&self, message_id: i64) -> Option<ChatRecord>;
+    fn lookup(&self, message_id: i64) -> BoxFuture<'_, Option<ChatRecord>>;
+    fn forget_before(&self, cutoff: i64) -> i64;
+    fn record_inbound(&self, event: &OneBotEvent, segments: &[MessageSegment]);
+    fn record_outgoing(
+        &self,
+        target: MessageTarget,
+        message: &OutgoingMessage,
+        receipt: &MessageReceipt,
+    );
+    fn quote_prefix(
+        &self,
+        quoted: Option<i64>,
+        at: i64,
+    ) -> BoxFuture<'_, Option<Vec<MessageSegment>>>;
+    fn recall_id(&self, message_id: i64) -> i64;
+    fn recall(&self, message_id: i64) -> BoxFuture<'_, Result<(), OneBotError>>;
 }
 
-/// 撤回一条消息（自己发的，或有管理权限时撤别人的），按库里存的 id 发 `delete_msg`
+impl ChatLogFace for ChatLog {
+    fn settings(&self) -> ChatLogSettings {
+        ChatLog::settings(self)
+    }
+    fn enabled(&self) -> bool {
+        ChatLog::enabled(self)
+    }
+    fn apply(&self, new_settings: ChatLogSettings) {
+        ChatLog::apply(self, new_settings)
+    }
+    fn purge(&self) -> i64 {
+        ChatLog::purge(self)
+    }
+    fn open(&self, file: &Path) -> bool {
+        ChatLog::open(self, file)
+    }
+    fn file(&self) -> Option<PathBuf> {
+        ChatLog::file(self)
+    }
+    fn close(&self) {
+        ChatLog::close(self)
+    }
+    fn remember(&self, record: &ChatRecord) {
+        ChatLog::remember(self, record)
+    }
+    fn find(&self, message_id: i64) -> Option<ChatRecord> {
+        ChatLog::find(self, message_id)
+    }
+    fn lookup(&self, message_id: i64) -> BoxFuture<'_, Option<ChatRecord>> {
+        Box::pin(ChatLog::lookup(self, message_id))
+    }
+    fn forget_before(&self, cutoff: i64) -> i64 {
+        ChatLog::forget_before(self, cutoff)
+    }
+    fn record_inbound(&self, event: &OneBotEvent, segments: &[MessageSegment]) {
+        ChatLog::record_inbound(self, event, segments)
+    }
+    fn record_outgoing(
+        &self,
+        target: MessageTarget,
+        message: &OutgoingMessage,
+        receipt: &MessageReceipt,
+    ) {
+        ChatLog::record_outgoing(self, target, message, receipt)
+    }
+    fn quote_prefix(
+        &self,
+        quoted: Option<i64>,
+        at: i64,
+    ) -> BoxFuture<'_, Option<Vec<MessageSegment>>> {
+        Box::pin(ChatLog::quote_prefix(self, quoted, at))
+    }
+    fn recall_id(&self, message_id: i64) -> i64 {
+        ChatLog::recall_id(self, message_id)
+    }
+    fn recall(&self, message_id: i64) -> BoxFuture<'_, Result<(), OneBotError>> {
+        Box::pin(ChatLog::recall(self, message_id))
+    }
+}
+
+fn host() -> &'static dyn ChatLogFace {
+    &**Framework::global().chatlog_api()
+}
+
+/// 当前生效的聊天记录配置
+pub fn settings() -> ChatLogSettings {
+    host().settings()
+}
+
+/// 是否启用（关掉后既不写库也不还原引用）
+pub fn enabled() -> bool {
+    host().enabled()
+}
+
+/// 应用配置并校准清理任务
+pub fn apply(new_settings: ChatLogSettings) {
+    host().apply(new_settings)
+}
+
+/// 删掉超出保留期的聊天记录，回报条数
+pub fn purge() -> i64 {
+    host().purge()
+}
+
+/// 打开（或换到）指定文件的聊天记录库并建表
+pub fn open(file: &Path) -> bool {
+    host().open(file)
+}
+
+/// 当前用的库文件
+pub fn file() -> Option<PathBuf> {
+    host().file()
+}
+
+/// 关闭库连接
+pub fn close() {
+    host().close()
+}
+
+/// 记一条消息
+pub fn remember(record: &ChatRecord) {
+    host().remember(record)
+}
+
+/// 按 message_id 或 real_id 查一条记录
+pub fn find(message_id: i64) -> Option<ChatRecord> {
+    host().find(message_id)
+}
+
+/// 查这条被引用的消息：先查本地库，查不到就去问实现端并回填
+pub async fn lookup(message_id: i64) -> Option<ChatRecord> {
+    host().lookup(message_id).await
+}
+
+/// 删掉 `time < cutoff` 的记录，返回条数
+pub fn forget_before(cutoff: i64) -> i64 {
+    host().forget_before(cutoff)
+}
+
+/// 把机器人听到的一条消息记进库
+pub fn record_inbound(event: &OneBotEvent, segments: &[MessageSegment]) {
+    host().record_inbound(event, segments)
+}
+
+/// 把机器人刚发出的一条消息记进库
+pub fn record_outgoing(target: MessageTarget, message: &OutgoingMessage, receipt: &MessageReceipt) {
+    host().record_outgoing(target, message, receipt)
+}
+
+/// 这次回复该在开头挂什么（见 [`ChatLog::quote_prefix`]）
+pub async fn quote_prefix(quoted: Option<i64>, at: i64) -> Option<Vec<MessageSegment>> {
+    host().quote_prefix(quoted, at).await
+}
+
+/// 撤回用的 id（见 [`ChatLog::recall_id`]）
+pub fn recall_id(message_id: i64) -> i64 {
+    host().recall_id(message_id)
+}
+
+/// 撤回一条消息（见 [`ChatLog::recall`]）
 pub async fn recall(message_id: i64) -> Result<(), OneBotError> {
-    OneBotApi::global().delete_msg(recall_id(message_id)).await
+    host().recall(message_id).await
 }
 
 // ==================== 小工具 ====================
@@ -893,6 +1142,43 @@ mod tests {
             enable: false,
             ..original.clone()
         });
-        *SETTINGS.write().unwrap() = original;
+        *Framework::global().chatlog().settings.write().unwrap() = original;
+    }
+
+    /// 库与配置必须挂在实例上，而不是进程级 `static`：插件 dll 经 `adopt_host` 认领宿主的
+    /// `Framework` 之后，`arona::runtime::chatlog::*` 这些自由函数读到的才是宿主真正在用的
+    /// 那份配置与那条连接。改造前这里是一枚 `Lazy` 全局，dll 里另有一份默认值——实测过：
+    /// 宿主 arona.yml 写 `quote_ttl_minutes: 7`，插件侧仍读到出厂的 30。
+    #[test]
+    fn library_and_settings_are_scoped_to_the_framework_instance() {
+        let one = Framework::new();
+        let other = Framework::new();
+        assert!(
+            !std::ptr::eq(Arc::as_ptr(one.chatlog()), Arc::as_ptr(other.chatlog())),
+            "两套实例不该共用同一份聊天记录状态"
+        );
+        assert!(
+            other.chatlog().file().is_none(),
+            "新实例不该带着别人的库文件"
+        );
+        // 跨镜像出口必须指向**同一份**库：插件侧那批自由函数只认 `chatlog_api`，
+        // 另起一份就又回到"两边各持一份状态"那个老问题。
+        // 只比数据指针：两处 unsize 转换各生成一份 vtable 常量是允许的，要锁的是对象。
+        let concrete = Arc::as_ptr(one.chatlog()).cast::<u8>();
+        let shared = Arc::as_ptr(one.chatlog_api()).cast::<u8>();
+        assert!(
+            std::ptr::eq(concrete, shared),
+            "chatlog_api 该是 chatlog 的另一副面孔，不是第二份库"
+        );
+        other.chatlog().apply(ChatLogSettings {
+            quote_ttl_minutes: 7,
+            ..ChatLogSettings::default()
+        });
+        assert_eq!(other.chatlog().settings().quote_ttl_minutes, 7);
+        assert_ne!(
+            one.chatlog().settings().quote_ttl_minutes,
+            7,
+            "改一套实例的配置不该波及另一套"
+        );
     }
 }

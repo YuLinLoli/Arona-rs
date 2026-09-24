@@ -9,10 +9,10 @@
 //! 冷门/新增动作仍有兜底通道：[`OneBotApi::call`] 拿原始 `data`，[`OneBotApi::call_typed`]
 //! 直接把 `data` 反序列化成自己的类型。
 //!
-//! 拿连接：一律走 [`OneBotApi::global`]，每次调用现取首个可用连接 —— 连接热重载
+//! 拿连接：一律走 [`OneBotApi::global`]，每次调用现取进程默认实例上的首个可用连接
+//! （见 [`OnebotOutlet`](crate::onebot::application::OnebotOutlet)）—— 连接热重载
 //! （改 onebot.yml）之后不会拿着已销毁的连接不放。没有可用连接时返回
 //! [`OneBotError::NoConnection`]，超时返回 [`OneBotError::Timeout`]。
-use crate::onebot::application;
 use crate::onebot::connection::OneBotConnection;
 use crate::onebot::model::OneBotActionResponse;
 use crate::onebot::protocol;
@@ -164,10 +164,12 @@ impl OneBotApi {
         OneBotApi
     }
 
+    /// 取当前可用连接：读的是**所属实例**上的 [`OnebotOutlet`](crate::onebot::application::OnebotOutlet)，
+    /// 所以插件 dll 里调它也落在宿主那条真实连接上（宿主未连时才是 `None`）。
     fn connection(&self) -> Option<Arc<dyn OneBotConnection>> {
-        application::global()
-            .and_then(|app| app.first_connection())
-            .or_else(|| crate::onebot::connection::global_registry().and_then(|r| r.first()))
+        crate::framework::Framework::global()
+            .onebot()
+            .first_connection()
     }
 
     /// 万能通道：发出动作并取回 `data`（实现端没回 data 时是 `Value::Null`）
@@ -213,7 +215,7 @@ impl OneBotApi {
         Ok(response)
     }
 
-    /// 发一条消息到指定目标（群/私聊），返回 message_id
+    /// 发一条消息到指定目标（群/私聊/临时会话），返回 message_id
     pub async fn send(
         &self,
         target: MessageTarget,
@@ -223,6 +225,9 @@ impl OneBotApi {
         match target {
             MessageTarget::Group(group_id) => self.send_group_msg(group_id, payload).await,
             MessageTarget::Private(user_id) => self.send_private_msg(user_id, payload).await,
+            MessageTarget::Temp { group_id, user_id } => {
+                self.send_msg(Some(group_id), Some(user_id), payload).await
+            }
         }
     }
 
@@ -322,6 +327,36 @@ impl OneBotApi {
             },
         )
         .await
+    }
+
+    /// `mark_msg_as_read` 把消息标成已读（对应 mirai 的 `source() + markRead`）。
+    /// 只吃消息号；实现端不支持时回 [`OneBotError::Failed`]，不影响消息本身。
+    pub async fn mark_msg_as_read(&self, message_id: i64) -> Result<(), OneBotError> {
+        self.call_ok(
+            "mark_msg_as_read",
+            params! { "message_id" => json!(message_id) },
+        )
+        .await
+    }
+
+    /// `translate_voice` 语音转文字。
+    ///
+    /// 各家入参不统一：v11 正式定义传语音文件名 `file`，NTQQ / LLOWeb 传 `message_id`。
+    /// 这里按"手上一般只有消息号"的常见情形传 `message_id`，返回值取 `text` 或
+    /// `translated` 里第一个非空字段。只有语音文件路径时改用
+    /// `call("translate_voice", json!({"file": ...}))`。
+    pub async fn translate_voice(&self, message_id: i64) -> Result<String, OneBotError> {
+        let data = self
+            .call(
+                "translate_voice",
+                params! { "message_id" => json!(message_id) },
+            )
+            .await?;
+        Ok(["text", "translated", "result"]
+            .iter()
+            .find_map(|key| data.get(*key).and_then(Value::as_str))
+            .unwrap_or_default()
+            .to_string())
     }
 
     /// `can_send_private_msg` 检查是否可以发私聊

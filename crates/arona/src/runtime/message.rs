@@ -236,12 +236,31 @@ impl std::ops::Add for OutgoingMessage {
 pub enum MessageTarget {
     Group(i64),
     Private(i64),
+    /// 临时会话（对应 mirai 的 `Temp`）：从某个群发起、单独跟那个人说话。
+    /// 协议层就是 `send_msg` 同时带 `group_id` 与 `user_id`——实现端拿它判"对方是不是
+    /// 同群成员"，只给 user_id 的裸私聊在不少实现端会被拒发。
+    /// 入站事件各家都不标临时会话，所以收到的消息只会是 `Group` / `Private` 两种。
+    Temp {
+        group_id: i64,
+        user_id: i64,
+    },
 }
 
 impl MessageTarget {
+    /// 这条发给"谁"：群消息是群号，私聊与临时会话是那个人的 QQ 号
     pub fn id(&self) -> i64 {
         match self {
             MessageTarget::Group(id) | MessageTarget::Private(id) => *id,
+            MessageTarget::Temp { user_id, .. } => *user_id,
+        }
+    }
+
+    /// 关联的群号：临时会话取它发起自的那个群，裸私聊是 `None`
+    pub fn group(&self) -> Option<i64> {
+        match self {
+            MessageTarget::Group(group_id) => Some(*group_id),
+            MessageTarget::Temp { group_id, .. } => Some(*group_id),
+            MessageTarget::Private(_) => None,
         }
     }
 }

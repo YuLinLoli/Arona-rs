@@ -141,8 +141,12 @@ impl Settings {
         // 框架行为选项写进所属实例的活状态：阈值在健康度板上，前缀开关在命令表上
         framework.set_panic_disable_threshold(new_config.framework.panic_disable_threshold);
         framework.set_prefix_match_by_default(new_config.framework.prefix_match_by_default);
-        // 聊天记录缓存：开关与保留期直接生效，热重载后不必重启
-        crate::runtime::chatlog::apply(new_config.chatlog.clone());
+        // 聊天记录缓存：开关与保留期直接生效，热重载后不必重启。
+        // 落的是**所属那一套**实例上的库，不是自由函数背后的默认实例——
+        // 否则隔离实例重载一次配置，就把真在跑的那套的清理排期改了。
+        // 走 `chatlog_api()` 这一层：`settings::init` 插件也调得着，那条路径上的方法体
+        // 必须留在宿主镜像里（理由见 [`crate::runtime::chatlog::ChatLogFace`]）。
+        framework.chatlog_api().apply(new_config.chatlog.clone());
         let first = {
             let mut st = self.state.write().unwrap();
             st.config = new_config;

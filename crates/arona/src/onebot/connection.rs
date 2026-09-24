@@ -3,7 +3,6 @@ use crate::onebot::business::BusinessHandler;
 use crate::onebot::model::{OneBotAction, OneBotActionResponse, ParsedPayload};
 use crate::onebot::protocol;
 use crate::runtime::message::BoxFuture;
-use once_cell::sync::OnceCell;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -223,15 +222,4 @@ pub fn receive_payload(core: &ConnectionCore, conn: Arc<dyn OneBotConnection>, p
             core.pending.resolve(&response);
         }
     }
-}
-
-// 为 pending/registry 提供共享全局（简化跨模块访问）
-static GLOBAL_REGISTRY: OnceCell<Arc<ConnectionRegistry>> = OnceCell::new();
-
-pub fn set_global_registry(registry: Arc<ConnectionRegistry>) {
-    let _ = GLOBAL_REGISTRY.set(registry);
-}
-
-pub fn global_registry() -> Option<Arc<ConnectionRegistry>> {
-    GLOBAL_REGISTRY.get().cloned()
 }

@@ -317,7 +317,9 @@ fn theme_combo(ui: &mut egui::Ui, theme: &mut ThemePref) -> bool {
 /// 右上角运行状态：绿点=已有活动连接，灰点=还没连上任何 OneBot 实现
 fn status_chip(ui: &mut egui::Ui) {
     let dark = ui.visuals().dark_mode;
-    let connections = crate::onebot::connection::global_registry()
+    let connections = crate::framework::Framework::global()
+        .onebot()
+        .registry()
         .map(|registry| registry.count())
         .unwrap_or(0);
     let dot = if connections > 0 {

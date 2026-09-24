@@ -162,6 +162,17 @@ impl CommandContext {
         }
     }
 
+    /// 协议层动作出口（mirai 的 `bot.callApi`）：上面 `reply` / `recall` 没覆盖的动作都走它。
+    /// 取的是所属实例上的连接池，插件 dll 里调用同样落在宿主真正那条连接。
+    pub fn api(&self) -> crate::onebot::api::OneBotApi {
+        crate::onebot::api::OneBotApi::global()
+    }
+
+    /// mirai 风格的对象模型入口：`context.bot().group(123).send_text("老师")`
+    pub fn bot(&self) -> crate::bot::Bot {
+        crate::bot::Bot::current()
+    }
+
     pub async fn reply_message(&self, message: OutgoingMessage) -> MessageReceipt {
         self.sender.send(self.target(), message).await
     }

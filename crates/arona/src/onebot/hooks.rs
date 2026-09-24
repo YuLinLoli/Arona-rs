@@ -528,6 +528,17 @@ pub struct EventContext {
 }
 
 impl EventContext {
+    /// 协议层动作出口（mirai 的 `bot.callApi`）：`reply` / `recall` 没覆盖的动作都走它。
+    /// 取的是所属实例上的连接池，插件 dll 里调用同样落在宿主真正那条连接。
+    pub fn api(&self) -> crate::onebot::api::OneBotApi {
+        crate::onebot::api::OneBotApi::global()
+    }
+
+    /// mirai 风格的对象模型入口：`ctx.bot().group(123).send_text("老师")`
+    pub fn bot(&self) -> crate::bot::Bot {
+        crate::bot::Bot::current()
+    }
+
     pub fn user_id(&self) -> i64 {
         self.event.user_id.unwrap_or_default()
     }
@@ -1148,10 +1159,8 @@ impl HookRegistry {
         target: MessageTarget,
         message: &mut OutgoingMessage,
     ) -> bool {
-        let group_id = match target {
-            MessageTarget::Group(group_id) => Some(group_id),
-            MessageTarget::Private(_) => None,
-        };
+        // 临时会话算在"来源群"的门控下：那是插件被授权的那个群，裸私聊才没有群号
+        let group_id = target.group();
         let hooks: Vec<OutboundHook> = {
             let guard = self.outbound.read().unwrap();
             let mut hooks: Vec<OutboundHook> = guard
