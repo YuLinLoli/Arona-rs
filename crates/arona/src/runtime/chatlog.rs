@@ -895,12 +895,19 @@ fn record_text(segments: &[MessageSegment]) -> String {
         .collect()
 }
 
-/// 事件里带的发送者名片/昵称，没有就留空由 qq 号顶上
+/// 事件里带的发送者名片/昵称，没有就留空由 qq 号顶上。
+/// 空串按「没给」处理：QQ 的群名片默认就是空，此刻要往昵称兜底，
+/// 否则翻出来的历史记录全都署不出名字。
 fn sender_name(event: &OneBotEvent) -> String {
     let sender = event.sender.as_ref();
     ["card", "card_name", "nickname", "user_name"]
         .iter()
-        .find_map(|key| sender?.get(*key).and_then(|value| value.as_str()))
+        .find_map(|key| {
+            sender?
+                .get(*key)
+                .and_then(|value| value.as_str())
+                .filter(|text| !text.trim().is_empty())
+        })
         .unwrap_or_default()
         .to_string()
 }
@@ -1173,6 +1180,17 @@ mod tests {
         assert_eq!(sender_name(&event), "群名片");
         let event = event_with_sender(serde_json::json!({ "nickname": "好友昵称" }));
         assert_eq!(sender_name(&event), "好友昵称");
+        // QQ 的群名片默认就是空串：端到端实测里翻历史全是署不出名的记录，就是这里把空串当成了「有名片」
+        let event = event_with_sender(serde_json::json!({
+            "card": "",
+            "nickname": "好友昵称",
+        }));
+        assert_eq!(sender_name(&event), "好友昵称", "空名片要往昵称兜底");
+        let event = event_with_sender(serde_json::json!({
+            "card": "   ",
+            "user_name": "另一个名字",
+        }));
+        assert_eq!(sender_name(&event), "另一个名字", "只有空白也算没给");
         let event = event_with_sender(serde_json::Value::Null);
         assert_eq!(sender_name(&event), "", "没有 sender 时留空，由 qq 号顶上");
     }
