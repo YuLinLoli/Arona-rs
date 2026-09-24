@@ -1,0 +1,28 @@
+# 两个仓库的入库内容一直是 LF，但此前没有文件约束行尾，全靠各人的 core.autocrlf。
+# 结果是 rustfmt 写出来的文件与 Windows 编辑器写出来的混在一起，git 会当场警告。
+# 这里把口径钉死：入库 LF、签出也 LF，二进制不许被“修复”行尾。
+* text=auto eol=lf
+
+*.dll binary
+*.exe binary
+*.png binary
+*.jpg binary
+*.webp binary
+*.ico binary
+*.icns binary
+*.ttf binary
+*.otf binary
+*.woff binary
+*.zip binary
+*.gz binary
+*.sqlite binary
+*.db binary
+
+# Inno Setup 与 PowerShell 脚本在 Windows 上跑，LF 一样认；这里显式写出来，
+# 免得下次有人以为 .iss 需要 CRLF 又去加一条 eol=crlf
+*.iss text eol=lf
+*.ps1 text eol=lf
+*.yml text eol=lf
+*.toml text eol=lf
+*.rs text eol=lf
+*.md text eol=lf
