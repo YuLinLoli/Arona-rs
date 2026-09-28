@@ -1020,10 +1020,12 @@ async fn demo(ctx: &arona::runtime::dispatcher::CommandContext) {
 装载成功的标志是这三行日志：
 
 ```
-[Arona] 插件 ABI 握手通过: 布局 3，契约 1.0.0
+[Arona] 插件 ABI 握手通过: 布局 5，契约 1.0.0
 [Arona] 已装载动态插件: HelloPlugin 0.1.0 (hello_plugin.dll)
 [Arona] 插件已启动: HelloPlugin v0.1.0
 ```
+
+那个「布局 5」是当前符号布局版本（§22），每次抬它这里的打印就跟着变，核对时以 §22 为准。
 
 `plugins/<id>/plugin.yml`、`config/<id>/arona.yml` 由框架在装载时自动写出来，GUI「插件管理」页
 立刻能开关它。换插件、删插件都不必重新编译框架，**但必须重启框架**——`plugins/` 只在启动时扫一遍，
