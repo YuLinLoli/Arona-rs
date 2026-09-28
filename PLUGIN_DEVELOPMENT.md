@@ -1023,8 +1023,9 @@ async fn demo(ctx: &arona::runtime::dispatcher::CommandContext) {
    [dependencies]
    # 务必 default-features = false（§16）。arona 的版本必须与目标宿主完全一致
    arona = { path = "../Arona-rs/crates/arona", version = "1.0.0", default-features = false }
-   # 类型化配置要 derive（§12）；自己 tokio::spawn / sleep 就要 tokio。
-   # 这两样是插件自己的依赖，不算"往插件里塞第二份宿主状态"——见 §22 的判据
+   # 类型化配置要 derive（§12）；命令/钩子的 async 体里要 tokio::time::sleep、select! 也得直依赖
+   # （§22 的"两份 tokio"小节：框架按帧给这类任务补装运行时上下文）。
+   # 起后台任务请用 ctx.spawn（§10），别裸 tokio::spawn，更不要 #[tokio::main]——运行时是宿主那一个
    serde = { version = "1", features = ["derive"] }
    tokio = { version = "1", features = ["time", "rt", "macros"] }
    ```
@@ -1034,6 +1035,12 @@ async fn demo(ctx: &arona::runtime::dispatcher::CommandContext) {
    于是它会跨过 dll 边界。握手核对的五项（§22）**不看**第三方 crate 版本，所以请自己跟框架同大版本
    （根 `Cargo.toml` 里是 `serde_json = "1"`）；两边版本差出布局就是两份不同的 `Value`，编译器不会拦。
    `reqwest` **不要装**，出站一律走 `arona::runtime::http`（§14.1）。
+
+   `arona` 这一行只有两种写法可编：`path` 指向本地 clone 的框架仓库（如上），或
+   `git = "<框架仓库地址>", tag = "<标签>"`。**crates.io 上没有本框架**（那个包名是别人的），
+   别去试 `arona = "1.0.0"`。走 git 时要挑**确实含你要用的接口**的标签：`v1.0.0` 里还没有 §14.2 的
+   对象模型，`ABI_LAYOUT` 也还是 3，指着它写插件会一片 `unresolved import` / 装载时拒载。
+   新标签没发出来之前，开发期一律用 `path` 最省事。
 
    再建一份 `.cargo/config.toml`，把框架仓库根目录那份的 `[target.*]` 段落**原样抄过来**：
 
