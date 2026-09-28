@@ -449,21 +449,24 @@ installer/               Windows 安装包：arona-rs.iss、intro.txt、defaults
 
 ## 写一个插件
 
-插件是一个**独立 crate**，编译成 dll 交付。以 `arona` 为依赖（依赖声明里**务必**带上
-`default-features = false`，别让 GUI 顺着依赖扩散），实现 `AronaPlugin` 并用一个宏导出三个入口符号：
+插件是一个**独立 crate**，编译成 dll 交付。以框架库为依赖（发布名 `arona-rs`、库名仍是 `arona`，
+所以源码照旧 `use arona::…`；依赖声明里**务必**带上 `default-features = false`，别让 GUI 顺着依赖扩散），
+实现 `AronaPlugin` 并用一个宏导出四个 C 符号（ABI 号、工具链指纹、宿主上行通道、造实例）：
 
 ```toml
 # Cargo.toml
 [lib]
-crate-type = ["cdylib"]        # 产物就是插件 dll
+crate-type = ["cdylib", "rlib"]   # cdylib 出 dll；rlib 那份只给 cargo test 用
 
 [dependencies]
-arona = { path = "../Arona-rs/crates/arona", default-features = false }
+arona = { package = "arona-rs", version = "1.1.0", default-features = false }
+# 同源联调改成 path：arona = { package = "arona-rs", path = "../Arona-rs/crates/arona", default-features = false }
 ```
 
 ```rust
 use arona::plugin::{AronaPlugin, PluginContext, PluginMeta, PluginRegistrar};
 
+#[derive(Default)]
 struct MyPlugin;
 impl AronaPlugin for MyPlugin {
     fn meta(&self) -> PluginMeta {
@@ -473,7 +476,7 @@ impl AronaPlugin for MyPlugin {
     fn configure(&self, _ctx: &PluginContext) -> Result<(), String> { Ok(()) }
 }
 
-arona::export_arona_plugin!(MyPlugin::new());
+arona::export_arona_plugin!(MyPlugin::default());
 ```
 
 编译出的 dll 放进框架运行目录的 `plugins/`，下次启动框架就会扫描、握手并装载它 ——

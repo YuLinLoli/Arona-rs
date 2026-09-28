@@ -11,15 +11,15 @@
 
 ```
 Cargo.toml                 # 虚拟 workspace（resolver=2）
-crates/arona/              # 框架库 crate：name=arona, version=1.0.0（发布版从 1.0.0 起）
-crates/arona-host/         # 宿主可执行：name=arona-host, version=1.0.0, 产物 bin=arona-rs
+crates/arona/              # 框架库 crate：包名 arona-rs（库名仍是 arona，见 §15），version=1.1.0
+crates/arona-host/         # 宿主可执行：name=arona-host, version=1.1.0, 产物 bin=arona-rs
 plugins/hello/             # 示例插件：name=hello-plugin, crate-type=["cdylib", "rlib"]
 ```
 
 框架仓库里不含任何功能插件（示例除外），宿主也不链接插件：功能插件是**各自独立的 crate**，
 编译出 `xxx_plugin.dll` 后由用户放进运行目录的 `plugins/`，框架启动时扫描装载（§22）。
 
-版本约定：框架与 host 同为 `1.0.0`，插件版本号各自演进。
+版本约定：框架与 host 同为 `1.1.0`，插件版本号各自演进。
 **插件接口的破坏性改动抬 `arona::plugin::FRAMEWORK_API_VERSION`**（与 crate 版本号无关），见 §6；
 **插件会读的那个类型换了布局**（`Framework`、`CommandContext`、`EventBody`、`BodyFilter`、`OneBotApi`
 这些，加字段/加变体/改字段类型）另抬 `arona::plugin::abi::ABI_LAYOUT`（当前 `5`），见 §22。
@@ -1022,7 +1022,7 @@ async fn demo(ctx: &arona::runtime::dispatcher::CommandContext) {
 
    [dependencies]
    # 务必 default-features = false（§16）。arona 的版本必须与目标宿主完全一致
-   arona = { path = "../Arona-rs/crates/arona", version = "1.0.0", default-features = false }
+   arona = { package = "arona-rs", version = "1.1.0", default-features = false }
    # 类型化配置要 derive（§12）；命令/钩子的 async 体里要 tokio::time::sleep、select! 也得直依赖
    # （§22 的"两份 tokio"小节：框架按帧给这类任务补装运行时上下文）。
    # 起后台任务请用 ctx.spawn（§10），别裸 tokio::spawn，更不要 #[tokio::main]——运行时是宿主那一个
@@ -1030,17 +1030,19 @@ async fn demo(ctx: &arona::runtime::dispatcher::CommandContext) {
    tokio = { version = "1", features = ["time", "rt", "macros"] }
    ```
 
+   `package = "arona-rs"` 那一行是本文档唯一需要解释的写法：**发布名是 `arona-rs`**
+   （`arona` 这个名字在 crates.io 上早年被别的项目占了），而**库名仍是 `arona`**，
+   所以源码照旧 `use arona::...`、feature 照旧写 `arona/gui`，只有 Cargo.toml 那一行带 `package`。
+   不想依赖 crates.io 时改成 `arona = { package = "arona-rs", path = "../Arona-rs/crates/arona", … }`
+   指到本地 clone（§17 的同源联调就是这么做的）；用 `git = "<框架仓库地址>", tag = "…"` 也行，
+   但**标签必须 ≥ `v1.1.0`**：`v1.0.0` 里还没有 §14.2 的对象模型，`ABI_LAYOUT` 也停在 3，
+   指着它写插件会一片 `unresolved import`、就算编过也会被装载时拒载。
+
    另两条口径：`serde_json` 框架**不 re-export**，插件要自己 `json!(...)` 就得直依赖。它并非"只在自己家里用"——
    卡片段 `MessageSegment::Json(Value)` / `Xml(Value)` 与兜底段 `Raw { data: Value }` 装的就是这个类型，
    于是它会跨过 dll 边界。握手核对的五项（§22）**不看**第三方 crate 版本，所以请自己跟框架同大版本
    （根 `Cargo.toml` 里是 `serde_json = "1"`）；两边版本差出布局就是两份不同的 `Value`，编译器不会拦。
    `reqwest` **不要装**，出站一律走 `arona::runtime::http`（§14.1）。
-
-   `arona` 这一行只有两种写法可编：`path` 指向本地 clone 的框架仓库（如上），或
-   `git = "<框架仓库地址>", tag = "<标签>"`。**crates.io 上没有本框架**（那个包名是别人的），
-   别去试 `arona = "1.0.0"`。走 git 时要挑**确实含你要用的接口**的标签：`v1.0.0` 里还没有 §14.2 的
-   对象模型，`ABI_LAYOUT` 也还是 3，指着它写插件会一片 `unresolved import` / 装载时拒载。
-   新标签没发出来之前，开发期一律用 `path` 最省事。
 
    再建一份 `.cargo/config.toml`，把框架仓库根目录那份的 `[target.*]` 段落**原样抄过来**：
 
@@ -1127,7 +1129,7 @@ cargo test               # rlib 那份给单测用，纯逻辑不必起宿主
 改动后的验证口径（本地 GUI 构建需要 ATL，见下节"零依赖"约束；纯逻辑改动用 `--no-default-features` 更快）：
 
 ```bash
-cargo check -p arona --features gui --all-targets   # 含 GUI 代码与测试
+cargo check -p arona-rs --features gui --all-targets   # 含 GUI 代码与测试（-p 用包名 arona-rs）
 cargo test --workspace                              # 单测（生命周期门控/配置迁移/钩子/隔离实例）
 cargo test --release --workspace                    # CI 口径：AutoUploadReleaseBuild.yml 跑的是 release
 cargo clippy --workspace --all-targets              # 框架侧 error 级必须清零
@@ -1142,7 +1144,7 @@ cargo fmt --all
 断点与 panic 定位：dll 是被宿主进程映射的，IDE 里 **attach 到 `arona-rs.exe`** 就能停在插件源码上；
 插件仓库若要调试发布构建，加一段 `[profile.release] debug = 1` 再重编 dll。
 框架侧的启动路径（`arona-host`）与插件仓库不在同一个 workspace，直接把 host 的 `Cargo.toml`
-用 `arona = { path = "../Arona-rs/crates/arona" }` 指过来即可同源联调。
+用 `arona = { package = "arona-rs", path = "../Arona-rs/crates/arona" }` 指过来即可同源联调。
 本地运行若被提权逻辑拦住，用 `ARONA_NO_ELEVATE=1` 绕过。
 
 GUI 相关的落地细节（改动前务必先读）：
@@ -1607,7 +1609,7 @@ tokio 也被静态链接成了两份，而"当前在哪个运行时里"这个上
 | 框架契约版本 | `FRAMEWORK_API_VERSION`（主版本相等 + 框架次版本不低于插件要求） | 插件用到了宿主还没有的接口 |
 | rustc 版本与 host 三件套 | 两边各自 `rustc -vV` 的 `release` / `host` 两行 | `dyn Trait` 胖指针布局、泛型单态化产物可能对不上 |
 | 目标三元组 + profile + CRT 链接方式 | `TARGET` / `PROFILE` / `crt-static` | debug 与 release 混编会炸；两套 MSVC 运行库会各自分配释放内存 |
-| arona 版本 + 除 `gui`/`default` 外的 feature 集合 | `CARGO_PKG_VERSION` / `CARGO_FEATURE_*` | 两边看到的 `Framework` / `PluginContext` 不是同一个结构 |
+| arona-rs 版本 + 除 `gui`/`default` 外的 feature 集合 | `CARGO_PKG_VERSION` / `CARGO_FEATURE_*` | 两边看到的 `Framework` / `PluginContext` 不是同一个结构 |
 
 指纹由 `crates/arona/build.rs` 算出、由 `export_arona_plugin!` 原样上报（末尾带 NUL，宿主按 C
 字符串读），宿主按字符串全等比对。`gui` 与它的别名 `default` 是被放行的两个例外（§16）：
@@ -1632,7 +1634,7 @@ tokio 也被静态链接成了两份，而"当前在哪个运行时里"这个上
 ### 发布插件时必须写明的三件事
 
 ```
-适用于 Arona-rs 1.0.0（框架契约 1.0.0，符号布局 5）
+适用于 Arona-rs 1.1.0（框架契约 1.0.0，符号布局 5）
 构建工具链：rustc 1.98.0，x86_64-pc-windows-msvc，--release，crt-static
 下载后放进 <框架运行目录>/plugins/<你的id>/，重启框架
 ```

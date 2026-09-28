@@ -1,12 +1,19 @@
 [package]
-name = "arona"
-version = "1.0.0"
+# crates.io 上的包名。`arona` 这个名字早年被一个计算机化自适应测试项目占了，
+# 所以发布名带 -rs 后缀；下面 [lib] 仍叫 arona，源码与插件一律 use arona::…，
+# 依赖方只需 `arona = { package = "arona-rs", … }` 重命名一次即可，代码不用改。
+name = "arona-rs"
+version = "1.1.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Arona 框架：OneBot 连接、管理面板(GUI)、群授权与命令分发；功能由插件提供"
+readme = "README.md"
+keywords = ["onebot", "qq", "bot", "plugin"]
+categories = ["network-programming"]
 
 [lib]
+# 库名保持 arona：包名换成 arona-rs 只为在 crates.io 上占得到名字
 name = "arona"
 path = "src/lib.rs"
 
