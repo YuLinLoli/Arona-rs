@@ -244,6 +244,8 @@ pub unsafe fn attach_host(bridge: *const HostBridge) -> u8 {
 /// ```
 ///
 /// 参数是构造插件实例的表达式（每次装载只求值一次，由宿主接管其强引用）。
+/// 结构体没有字段时可以直接写类型名——`MyPlugin::default()` 会被
+/// clippy 的 `default_constructed_unit_structs` 念一句。
 #[macro_export]
 macro_rules! export_arona_plugin {
     ($instance:expr) => {

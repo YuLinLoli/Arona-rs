@@ -480,9 +480,21 @@ fn configure(&self, ctx: &PluginContext) -> Result<(), String> {
 `segments`（§19 的全部消息段）、`api()`（§14 的动作出口，**绑的是投递这条事件的那套实例**）、`bot()`（§14.2 的对象模型入口），
 以及 `user_id()/group_id()/is_group()/is_private()/message_id()/field(key)/field_str(key)`、
 `target()`、`reply(text)`、`reply_message(OutgoingMessage)`、`reply_with_quote(OutgoingMessage)`、`recall(message_id)`（后两条见 §21）。
-发送者侧另有 `sender_name()`（群名片优先，退回昵称）、`sender_role()`（`Option<GroupRole>`，§8 的权限枚举）、
-`sender_is_admin()`、`quoted()`（这条消息引用了哪条：`command_text` 里已剥掉引用段，值在这里）——
+发送者侧另有 `sender_name() -> Option<&str>`（群名片优先，退回昵称）、`sender_role() -> Option<GroupRole>`（§8 的权限枚举）、
+`sender_is_admin() -> bool`（群身份是不是管理员或群主，身份未知时 `false`）、`quoted() -> Option<i64>`（这条消息引用了哪条：`command_text` 里已剥掉引用段，值在这里）——
 全部读事件自带的 `sender`/`segments`，不发协议请求，实现端没给就是 `None`。
+
+**同名不同物，照抄时最容易撞**：这几项在 `EventContext` 上是**方法**，在 `CommandContext` 上是**字段**，
+括号多打或漏打都编不过。
+```rust
+// 钩子里（context: Arc<EventContext>）——sender_name 是方法，借用回来的 Option<&str>
+let who = context.sender_name().unwrap_or("新同学");
+// 命令里（context: Arc<CommandContext>）——sender_name 是字段，Option<String>
+let who = context.sender_name.as_deref().unwrap_or("陌生老师");
+```
+另有一处语义差别别看错：`CommandContext::is_admin` 说的是这个人在不在框架 `config/arona.yml` 的
+`managers` 名单里，`EventContext::sender_is_admin()` 说的是这个人在**那个群**里的身份（管理员或群主），
+两者完全独立，可以一个真一个假。
 
 `BodyFilter` 的档位：`All`、`Kind(EventKind)`（大类）、`GroupMessage` / `PrivateMessage` /
 `PrivateSubType(String)`、`Notice(NoticeKind)`、`NoticeAction(NoticeKind, String)`、`Request(RequestKind)`、
@@ -1061,7 +1073,8 @@ async fn demo(ctx: &arona::runtime::dispatcher::CommandContext) {
 
    宏负责导出四个 C 符号（`arona_plugin_abi` / `arona_plugin_toolchain` / `arona_plugin_host` /
    `arona_plugin_new`），框架靠它们完成握手、把宿主的进程实例、日志出口和 HTTP 代发通道交进 dll，
-   再取出实例。
+   再取出实例。参数只要是「造出实例的表达式」即可：`MyPlugin` 有字段时写 `::default()` 或自己的
+   `::new(..)`，是空单位结构体就直接写类型名（否则 clippy 的 `default_constructed_unit_structs` 会念一句）。
    **插件不要写 `main`、也不提供任何可执行入口**——
    插件只能被框架装载、不能独立运行，这点与 mirai 一致。
 4. 构建并投放：

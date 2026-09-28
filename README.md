@@ -466,7 +466,6 @@ arona = { package = "arona-rs", version = "1.1.0", default-features = false }
 ```rust
 use arona::plugin::{AronaPlugin, PluginContext, PluginMeta, PluginRegistrar};
 
-#[derive(Default)]
 struct MyPlugin;
 impl AronaPlugin for MyPlugin {
     fn meta(&self) -> PluginMeta {
@@ -476,7 +475,7 @@ impl AronaPlugin for MyPlugin {
     fn configure(&self, _ctx: &PluginContext) -> Result<(), String> { Ok(()) }
 }
 
-arona::export_arona_plugin!(MyPlugin::default());
+arona::export_arona_plugin!(MyPlugin);
 ```
 
 编译出的 dll 放进框架运行目录的 `plugins/`，下次启动框架就会扫描、握手并装载它 ——
