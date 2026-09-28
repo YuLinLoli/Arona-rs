@@ -532,6 +532,9 @@ mod tests {
         use crate::onebot::connection::ConnectionRegistry;
         use std::sync::Arc;
 
+        // 这里建的 app 会按自己那份 config 覆写进程默认实例的图片直传开关，
+        // 与 admin 那个"写完立即生效"的用例必须错开
+        let _serial = crate::runtime::config::process_state_lock();
         crate::runtime::config::set_bot_id(10000);
         let base = 30000 + (std::process::id() % 1000) as u16 * 2;
         let registry = Arc::new(ConnectionRegistry::new());
@@ -582,6 +585,8 @@ mod tests {
     /// 写入 onebot.yml 并立即热生效（不需要「保存并热重载」或重启）
     #[test]
     fn image_send_switch_writes_onebot_yml_and_applies_immediately() {
+        // 断言的是进程默认实例那一份开关，与建 app 的用例串行（见 process_state_lock）
+        let _serial = crate::runtime::config::process_state_lock();
         let dir = std::env::temp_dir().join("arona-admin-send-image-test");
         let _ = std::fs::create_dir_all(&dir);
         let file = dir.join("onebot.yml");

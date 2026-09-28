@@ -328,6 +328,16 @@ fn gating() -> &'static Gating {
     Framework::global().gating()
 }
 
+/// 只给测试用的串行闸门：`send_image_as_file` 这类值仍是进程默认实例上的一份真值，
+/// 而 `OneBotApplication::new` 会按自己那份 config 覆写它（application.rs 里那一步）。
+/// 单测并行跑时，"我刚设成 true" 与"别处的用例正在建 app" 会交错，断言就偶发红。
+/// 会碰这份进程状态的用例共拿这一把锁；中毒也要继续跑，否则一个用例失败会级联。
+#[cfg(test)]
+pub(crate) fn process_state_lock() -> std::sync::MutexGuard<'static, ()> {
+    static GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    GATE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// 登记一个可分群开关的功能（key 重复时忽略后来的，保留首个的展示信息）
 pub fn register_feature(feature: Feature, plugin: &str) {
     gating().register_feature(feature, plugin);

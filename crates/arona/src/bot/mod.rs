@@ -1129,6 +1129,9 @@ mod tests {
 
     /// 造一套"真连着实现端"的隔离实例，返回实例和它那条连接的记账本
     fn canned_instance(nickname: &'static str, self_id: i64) -> (Arc<Framework>, Arc<Canned>) {
+        // 造 app 的那一步会覆写进程默认实例上的图片直传开关（application.rs 里同步的），
+        // 与 admin 那个"写完立即生效"的用例串行；覆写只发生在 new 内，故函数返回即可放锁
+        let _serial = crate::runtime::config::process_state_lock();
         let framework = Framework::new();
         let registry = Arc::new(ConnectionRegistry::new());
         let canned = Arc::new(Canned {
