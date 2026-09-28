@@ -10,14 +10,12 @@
 //! ctx.listen(
 //!     &[arona::onebot::EventKind::Message],
 //!     arona::onebot::hooks::ListenerPriority::Normal,
-//!     arona::onebot::hooks::event_handler(|ctx| {
-//!         Box::pin(async move {
-//!             if ctx.text.contains("早安") {
-//!                 let _ = ctx.reply("老师早安！").await;
-//!                 return arona::onebot::HookFlow::Handled; // 已处理，别再走命令分发
-//!             }
-//!             arona::onebot::HookFlow::Pass
-//!         })
+//!     arona::onebot::hooks::event_handler(|context| async move {
+//!         if context.text.contains("早安") {
+//!             let _ = context.reply("老师早安！").await;
+//!             return arona::onebot::HookFlow::Handled; // 已处理，别再走命令分发
+//!         }
+//!         arona::onebot::HookFlow::Pass
 //!     }),
 //! );
 //!

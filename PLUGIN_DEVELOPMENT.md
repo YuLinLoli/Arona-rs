@@ -98,7 +98,7 @@ arona-host ──depends──▶ arona（框架）──启动时扫描──�
 | `CommandManager.registerCommand` | `ctx.command(..)` / `ctx.commands(..)`，按框架实例持有、条目带插件归属 | `runtime/dispatcher.rs` |
 | `commandRegistry { string("...") int("分钟") optional() }`（`ArgParserCombinationDSL`） | `CommandRegistration::with_args(vec![arg::i64("分钟").optional() ..])`，缺参/类型错的用法回显由框架给 | `runtime/args.rs` |
 | `SimpleCommandDispatcher.shortestPrefixMatch` | `CommandRegistration::with_prefix_match(true)` + `FrameworkOptions::prefix_match_by_default`（最短前缀唯一即命中） | 同上 + `framework.rs` |
-| `PermissionService` / `MiraiPermission` | `Permission::{Anyone,GroupAdmin,GroupOwner}` + `GroupRole`（`ctx.with_permission(..)`，身份优先读 `sender.role`，回查带缓存） | `runtime/dispatcher.rs` |
+| `PermissionService` / `MiraiPermission` | `Permission::{Anyone,GroupAdmin,GroupOwner}` + `GroupRole`（登记时挂在命令上：`CommandRegistration::with_permission(..)`，身份优先读 `sender.role`，回查带缓存） | `runtime/dispatcher.rs` |
 | `MiraiInstance.new { .. }`（构造选项） | `Framework::builder().panic_disable_threshold(..).build()` / `Framework::with_options(..)` | `framework.rs` |
 | `broadcastAndDumpInterceptedExceptions`（插件异常不冒泡到宿主） | 框架调用的插件入口全被兜住：命令/兜底、入站与出站钩子过 `guarded()`，生命周期回调与定时任务各自 `catch_unwind`，三处记账在同一张健康度面板上；连续 panic 达阈值自动停用该插件 | `plugin/health.rs` |
 | `GroupMessageEvent` / `FriendMessageEvent` / `NudgedEvent` 事件族 | `EventBody`（强类型事件体，notice/request/meta 另带 `NoticeInfo`/`RequestInfo`/`MetaInfo` 细节：动作、操作者、禁言时长、处理凭据、生命周期状态）+ `BodyFilter` 子类型订阅（私聊分好友/临时会话，元事件分连接状态）：`ctx.on_group_message(..)`、`ctx.listen_where(&[BodyFilter::..], ..)` | `onebot/hooks.rs` |
@@ -294,6 +294,12 @@ fn install(&self, reg: &PluginRegistrar) -> Result<(), String> {
 GUI「群管理 → 功能开关」与配置模板注释都据此生成。拿不到 `reg` 的地方（如自由函数）可用等价的
 `arona::admin::register_feature(feature, PLUGIN_ID)`。
 
+**这一层的字符串 key 全是 `&'static str`**：`Feature` 的三个字段、`reg.config::<T>(key)` 与 §12 的
+`ctx.config::<T>(key)`、下面命令的 `with_feature(..)`、§9 的 `listen_feature(..)` 都是。
+字符串字面量与 `const`/`static` 项天然满足，`format!` 出来的 `String` 编不过（`&String` 不行，
+`&*some_string` 也不行）——key 必须在运行期拼出来就 `Box::leak` 成 ` &'static str `，
+更常见的做法是把 key 定成 `const FEATURE: &str = "gacha";` 复用，顺便让命令与钩子写同一个常量。
+
 ### 命令（configure 阶段）
 
 命令表挂在**框架实例**上（`ctx.framework().commands()`）、条目**按插件归属**（mirai 的 `CommandManager`）。
@@ -313,7 +319,13 @@ fn configure(&self, ctx: &PluginContext) -> Result<(), String> {
         CommandRegistration::new(
             vec!["/单抽".into(), "gacha_one".into()],
             "单抽一次, 可选服务器",
-            handler(|context, arguments| async move { /* Some(OutgoingMessage) 或 None */ }),
+            handler(|_context, arguments| async move {
+                // 原始词表版：arguments 是切好的裸词，返回 Some 就交框架发回原会话
+                let server = arguments.first().cloned().unwrap_or_else(|| "jp".to_string());
+                Some(arona::runtime::message::OutgoingMessage::text(format!(
+                    "{server} 服务器单抽结果（示例）"
+                )))
+            }),
         )
         .with_feature("gacha")             // 绑分群功能开关；该群关掉时视为未匹配
         .with_usage("/单抽 [jp|global|cn]") // 帮助页展示
@@ -403,43 +415,64 @@ fn configure(&self, ctx: &PluginContext) -> Result<(), String> {
 ```rust
 use arona::onebot::{EventContext, EventKind, HookFlow};
 use arona::onebot::hooks::{BodyFilter, EventBody, NoticeKind, event_handler, ListenerPriority};
+use arona::plugin::PluginContext;
+use std::sync::Arc;
 
 fn configure(&self, ctx: &PluginContext) -> Result<(), String> {
-    // 只订阅"成员进群"这一种子事件，框架先把别的过滤掉，插件里不用自己比字符串
+    // 只订阅"成员进群"这一种子事件，框架先把别的过滤掉，插件里不用自己比字符串。
+    // 优先用构造器而不是手写枚举：少写一层，子类型那一格也不会漏
     ctx.listen_where(
-        &[BodyFilter::Notice(NoticeKind::GroupIncrease)],
+        &[BodyFilter::notice(NoticeKind::GroupIncrease, "")],
         ListenerPriority::Normal,
-        event_handler(|e: std::sync::Arc<EventContext>| {
-            Box::pin(async move {
-                let _ = e.reply("老师好！").await;
-                HookFlow::Pass                 // 通知事件一般继续往下走
-            })
+        event_handler(|context: Arc<EventContext>| async move {
+            let _ = context.reply("老师好！").await;
+            HookFlow::Pass                 // 通知事件一般继续往下走
         }),
     );
 
-    // 群消息 / 私聊消息有专用入口
-    ctx.on_group_message(event_handler(|e| Box::pin(async move {
+    // 群消息 / 私聊消息有专用入口，另有 on_message / on_notice / on_request / on_meta
+    ctx.on_group_message(event_handler(|context| async move {
         // 需要更细的分支就 match 强类型事件体，而不是拼字符串
-        if matches!(&e.body, EventBody::GroupMessage { sub_type: Some(s) } if s == "anonymous") {
+        if matches!(&context.body, EventBody::GroupMessage { sub_type: Some(s) } if s == "anonymous") {
             return HookFlow::Handled;          // 匿名消息直接吞掉
         }
         HookFlow::Pass
-    })));
+    }));
 
     ctx.listen(
         &[EventKind::Message],
         ListenerPriority::Monitor,         // 审计/风控类先看一眼
-        event_handler(|e| Box::pin(async move {
-            if e.text.contains("早安") {
-                let _ = e.reply("老师早安！").await;
+        event_handler(|context| async move {
+            if context.text.contains("早安") {
+                let _ = context.reply("老师早安！").await;
                 return HookFlow::Handled;  // = mirai 的 event.intercept()：后续钩子与命令分发都不再跑
             }
             HookFlow::Pass
-        })),
+        }),
     );
     Ok(())
 }
 ```
+
+`event_handler(..)` / `handler(..)` 只要求那个闭包**返回一个 future**，所以 `|context| async move { .. }` 就够了。
+旧写法 `|context| Box::pin(async move { .. })` 也编得过（`Pin<Box<dyn Future + Send>>` 本身实现了 `Future`），
+但那一层包装在这里没有任何作用，本文档现在一律用直返的写法；`plugins/hello` 也是这一种。
+反过来，若你要把处理器存进结构体或跨边界传递，才需要 `Arc<dyn EventHandler>` 那个形态——
+`event_handler(..)` 的返回值就是它。
+
+上面示例里 `ctx.listen_where(..)` / `ctx.listen(..)` 都写全了三个参数，实际还有一批单参数快捷入口
+（`h` 就是 `event_handler(..)` 的返回值，档位一律 `ListenerPriority::Normal`）：
+
+| 快捷入口 | 等价于 |
+| --- | --- |
+| `ctx.on_message(h)` | `ctx.listen(&[EventKind::Message], Normal, h)` |
+| `ctx.on_group_message(h)` | `ctx.listen_where(&[BodyFilter::GroupMessage], Normal, h)` |
+| `ctx.on_private_message(h)` | `ctx.listen_where(&[BodyFilter::PrivateMessage], Normal, h)` |
+| `ctx.on_notice(h)` / `ctx.on_request(h)` / `ctx.on_meta(h)` | `ctx.listen(&[EventKind::对应大类], Normal, h)` |
+| `ctx.on_outgoing(h)` | `ctx.on_outgoing_at(h, Normal)`（§9.1） |
+
+要指定优先级、或要窄到子类型（`BodyFilter::notice(..)` / `private(..)` / `meta(..)`），就得把三个参数写全；
+绑分群功能开关的订阅只有 `ctx.listen_feature(feature, filters, priority, h)` 一条路，没有对应的 `on_*` 简写。
 
 `EventContext` 提供：`kind`、归位后的强类型 `body`（`EventBody::{GroupMessage,PrivateMessage,Notice,Request,Meta,Other}`，
 其中 `Notice(.., NoticeInfo)` / `Request(.., RequestInfo)` / `Meta(.., MetaInfo)` 各带一份细节）、
@@ -459,16 +492,19 @@ fn configure(&self, ctx: &PluginContext) -> Result<(), String> {
 同一个 `notice_type` 下的不同动作在 QQ 上是完全不同的事，所以子类之外还有一层细节：
 
 ```rust
+// 本块与下面两块沿用上一块的 use，这里只补新出现的枚举；
+// 出现的 ctx 是 configure 的入参，context 是钩子闭包收到的那个 Arc<EventContext>
 use arona::onebot::hooks::{BodyFilter, EventBody, NoticeKind, RequestKind};
 
 // "被踢出群"与"自己退群"都是 group_decrease，靠动作分开订阅
 ctx.listen_where(
     &[BodyFilter::notice(NoticeKind::GroupDecrease, "kick")],   // leave=自行退群, kick_me=被自家机器人踢
     ListenerPriority::Normal,
-    event_handler(|e| Box::pin(async move { /* 清理该成员的数据 */ HookFlow::Pass })),
+    event_handler(|_context| async move { /* 清理该成员的数据 */ HookFlow::Pass }),
 );
 
-if let EventBody::Notice(NoticeKind::GroupBan, info) = &e.body {
+// 钩子体内按强类型事件体分支（NoticeInfo 带动作/操作者/时长）
+if let EventBody::Notice(NoticeKind::GroupBan, info) = &context.body {
     // info.action: ban / unban；info.operator_id: 谁干的；info.duration: 秒（0 = 解禁）
     if info.action.as_deref() == Some("ban") && info.duration == Some(0) {
         // ...
@@ -481,7 +517,10 @@ if let EventBody::Notice(NoticeKind::GroupBan, info) = &e.body {
 ctx.listen_where(
     &[BodyFilter::Request(RequestKind::AddGroup)],
     ListenerPriority::Normal,
-    event_handler(|e| Box::pin(async move { /* 审核并 set_group_add_request(e.body 里的 flag) */ HookFlow::Pass })),
+    event_handler(|context| async move {
+        // 审核完拿 context.body 里的 flag 去调 set_group_add_request
+        HookFlow::Pass
+    }),
 );
 ```
 
@@ -495,17 +534,17 @@ use arona::onebot::HookFlow;
 ctx.listen_where(
     &[BodyFilter::private("friend")],   // "group" = 从群里发起的临时会话，另有 "other"
     ListenerPriority::Normal,
-    event_handler(|e| Box::pin(async move { /* 只有好友消息进这一档 */ HookFlow::Pass })),
+    event_handler(|_context| async move { /* 只有好友消息进这一档 */ HookFlow::Pass }),
 );
 
 // 机器人上下线：框架在传输层 0↔1 翻转时合成一条 lifecycle 元事件
 ctx.listen_where(
     &[BodyFilter::meta(MetaKind::Lifecycle, "connect")],   // "disable" 是掉线那一侧
     ListenerPriority::Normal,
-    event_handler(|e| Box::pin(async move {
-        // body 显示成「元事件:生命周期(connect)」，来源标识在 e.event.raw["url"]
+    event_handler(|context| async move {
+        // body 显示成「元事件:生命周期(connect)」，来源标识在 context.event.raw["url"]
         HookFlow::Pass
-    })),
+    }),
 );
 ```
 
@@ -552,28 +591,27 @@ NapCat、LLOneBot、Lagrange 把戳一戳、名片与头衔变更都塞进 `noti
 都会先过这道门：
 
 ```rust
-use arona::onebot::MessageSegment;
 use arona::onebot::hooks::{ListenerPriority, OutboundContext, outbound_handler};
+use arona::runtime::message::MessageSegment;   // 消息段在 runtime::message，不在 onebot 下
+use std::sync::Arc;
 
 // 本插件发出的每条消息末尾加一行落款
-ctx.on_outgoing(outbound_handler(|out: std::sync::Arc<OutboundContext>| {
-    Box::pin(async move {
-        out.rewrite(|message| {
-            message.segments.push(MessageSegment::Text("\n—— 阿罗娜".into()));
-        });
-    })
+ctx.on_outgoing(outbound_handler(|out: Arc<OutboundContext>| async move {
+    out.rewrite(|message| {
+        message.segments.push(MessageSegment::Text("\n—— 阿罗娜".into()));
+    });
 }));
 
 // 风控：内容涉敏就整条拦下
 ctx.on_outgoing_at(
-    outbound_handler(|out| Box::pin(async move {
+    outbound_handler(|out| async move {
         let risky = out.message().segments.iter().any(|segment| {
             matches!(segment, MessageSegment::Text(text) if text.contains("密码"))
         });
         if risky {
             out.cancel();   // 发送方拿到空回执，实现端收不到任何动作
         }
-    })),
+    }),
     ListenerPriority::Monitor,   // 越早的档位越先改，后面的看到改完的结果
 );
 ```
@@ -985,7 +1023,17 @@ async fn demo(ctx: &arona::runtime::dispatcher::CommandContext) {
    [dependencies]
    # 务必 default-features = false（§16）。arona 的版本必须与目标宿主完全一致
    arona = { path = "../Arona-rs/crates/arona", version = "1.0.0", default-features = false }
+   # 类型化配置要 derive（§12）；自己 tokio::spawn / sleep 就要 tokio。
+   # 这两样是插件自己的依赖，不算"往插件里塞第二份宿主状态"——见 §22 的判据
+   serde = { version = "1", features = ["derive"] }
+   tokio = { version = "1", features = ["time", "rt", "macros"] }
    ```
+
+   另两条口径：`serde_json` 框架**不 re-export**，插件要自己 `json!(...)` 就得直依赖。它并非"只在自己家里用"——
+   卡片段 `MessageSegment::Json(Value)` / `Xml(Value)` 与兜底段 `Raw { data: Value }` 装的就是这个类型，
+   于是它会跨过 dll 边界。握手核对的五项（§22）**不看**第三方 crate 版本，所以请自己跟框架同大版本
+   （根 `Cargo.toml` 里是 `serde_json = "1"`）；两边版本差出布局就是两份不同的 `Value`，编译器不会拦。
+   `reqwest` **不要装**，出站一律走 `arona::runtime::http`（§14.1）。
 
    再建一份 `.cargo/config.toml`，把框架仓库根目录那份的 `[target.*]` 段落**原样抄过来**：
 
@@ -1117,9 +1165,12 @@ GUI 相关的落地细节（改动前务必先读）：
   所以测试的隔离手法是**造实例**而不是抢串行锁：
 
   ```rust
+  use std::sync::Arc;
+
   let framework = arona::framework::Framework::new();      // 一套全空的注册表
   let manager = framework.plugins().clone();               // 或 PluginManager::new()，等价
-  manager.register(MyPlugin);
+  // register 收的是 Arc<dyn AronaPlugin>：裸实例编不过，`arona::plugin::register(..)` 同理
+  manager.register(Arc::new(MyPlugin));
   assert!(manager.install_all().is_empty());
   // 停用名单/命令表按实例读写：framework.gating() / framework.commands()
   ```
@@ -1160,13 +1211,13 @@ GUI 相关的落地细节（改动前务必先读）：
 | `Text` | `text` 段 / CQ 码外的裸文本 | `{"type":"text","data":{"text":…}}` |
 | `At(qq)` / `AtAll` | `at`（`qq` 是数字或字符串，`"all"` → `AtAll`） | `at` + `qq` |
 | `Reply(id)` | `reply`（别人引用了某条消息） | `reply` + `id`（出站即"引用回复那条"） |
-| `Image{url,file,data}` | `image` | `image` + `file`（取值优先级见下） |
+| `Image{url,file,data,file_id}` | `image`（`file_id` 与实现端别名 `substitute` 都还原到第四个字段） | `image` + `file`（取值优先级见下），有 `file_id` 时一并带上 |
 | `Face(id)` | `face`（QQ 表情号，字符串保留） | `face`：能转 `i64` 就发数字，否则原样 |
 | `Record{url,file}` | `record` / `voice`（两种写法都认） | `record` + `file` |
 | `Video{url,file}` | `video` | `video` + `file` |
 | `File{file_id,name,size}` | `file`（群文件上传） | `file` + `file_id`/`file_name`/`file_size` |
 | `Poke{name,target}` | `poke`（`type`/`target_id`，也吃 `target`） | `poke` + `type`/`target_id` |
-| `Location{…}` | `location`（`lat`/`lon` 数字或字符串都行） | `location` + `name`/`address`/`lat`/`lon` |
+| `Location{name,address,latitude,longitude}` | `location`（协议键是 `lat`/`lon`，数字或字符串都行） | `location` + `name`/`address`/`lat`/`lon` |
 | `Json(card)` / `Xml(card)` | `json`/`xml`：`data.data` 给对象直接用，给 JSON 字符串会先解析 | `json`/`xml` + `data` |
 | `Forward{title,id,messages}` | `forward`/`node`（递归解析 `content`，空内容整段丢弃；`id` 是实现端给的 flag，可拿它调 `get_forward_msg` 取全量节点，`messages` 常为空） | 普通发送接口不支持合并转发 → 占位文本；真发送见下 |
 | `Raw{kind,data}` | 框架还不认识的段（新版实现端自己加的类型）：不再丢弃，原样留在这里，显示成 `[kind]` | `{"type":kind,"data":data}` 原样拼回，转发/重发不丢信息 |
@@ -1176,6 +1227,11 @@ GUI 相关的落地细节（改动前务必先读）：
 （同机部署用的"图片按文件直传"）且文件确实存在时才改成 `file:///…` URI，免去一次大图 base64，
 实现端按原始文件上传因此不被压缩。中文与空格路径按 RFC 8089 百分号编码，Windows 盘符冒号保持原样。
 
+两张对照表读法：第一列是 **Rust 字段名**（`match` 时写的就是它），最后一列是 **OneBot JSON 键**，
+两者不完全同名——位置段的 `latitude`/`longitude` 上线变成 `lat`/`lon`，图片段只有 `file_id` 两边同名。
+另外"只给了 `file_id`、没有 URL/路径/字节"时框架会把这个值同时写进 `data.file`：
+NapCat 读 `data.file_id`、LLOWeb 读 `data.file`，双写才两边都认。
+
 `arona::bot::Image`（§14.2）是图片段那一行的**可复用句柄**：`Image::from_segment(&segment)` 把收到的
 几种线索原样取出来（直链、本机路径、字节、`file_id`，在这一步不猜该用哪个、也不丢），`image.segment()`
 挂回要发的消息，`OutgoingMessage::from(image)` 是它的简写。它不含连接状态、是 `Clone` 的，可以放心放进
@@ -1184,8 +1240,9 @@ GUI 相关的落地细节（改动前务必先读）：
 （`Image::from_stored`，认 `fileid://<id>`、http(s) 直链与本地路径三种写法）。同一张图第二次发可以带上
 同一个 `file_id`，至于实现端是否因此省下重传，框架不替它保证——要确定性不重传就自己留 `from_file` 那条路。
 
-出站构造：`OutgoingMessage::{new, text, at, at_all, quoted, image_file, image_data, record_file,
-video_file, json_card, xml_card, forward}`，再加 `.with_revoke(毫秒)` 让框架发完自动撤回。
+出站构造：`OutgoingMessage::{new, text, at, at_all, quoted, image_file, image_data, image_reuse,
+record_file, video_file, json_card, xml_card, forward}`；链式改动有两个：`.with_quote(消息 id)` 前置一个
+引用段、`.with_revoke(毫秒)` 让框架发完自动撤回。
 `ctx.reply(..)` / `context.reply_message(..)` / `api.send(target, msg)` 都吃它。
 区别在于走哪条路：前两者（以及 §12 的延时推送）走框架统一发送口，会先过 §9.1 的出站钩子、`.with_revoke(..)` 生效；
 `api.send(..)` 是协议层直连出口，不过门、`.with_revoke(..)` 在它身上无效。
@@ -1193,11 +1250,15 @@ video_file, json_card, xml_card, forward}`，再加 `.with_revoke(毫秒)` 让�
 合并转发（`Forward` 段）由发送器自动分流：`onebot::message_sender` 把一条消息里的 `Forward` 摘出来走
 `send_forward_msg`，其余段照常发送，所以插件把合并转发当普通段拼进消息链就行，不用自己分两次调接口。
 
-入站解析两条路都通：实现端给 `message` 数组（推荐，`parse_segment` 逐段还原，认不出的类型留成
-`Raw{kind,data}` 而不是丢掉）或只给 `raw_message` CQ 码（`decode_cq_message`：按 `[CQ:类型,键=值]`
+入站解析两条路都通：实现端给 `message` 数组（推荐，框架内部的逐段还原函数认不出的类型留成
+`Raw{kind,data}` 而不是丢掉；该函数不对外，插件只管 `match` 段）或只给 `raw_message` CQ 码
+（`decode_cq_message`：按 `[CQ:类型,键=值]`
 还原，`&#44;/&#58;/&#93;/&amp;` 实体自动解转义，未知 CQ 码整段留成原文文本，绝不吞字）。
 两条路都只是"不丢信息"，**不保证你认得**：要按类型分支处理，`match` 的兜底分支请写
 `MessageSegment::Raw { kind, .. }`，别写 `_ => {}`。
+带字段的变体同理请留 `..`：图片段的 `file_id` 是布局 5 才加上的第四个字段，写成
+`MessageSegment::Image { url, file, .. }` 就吃得到下一次加字段，把字段列全则会让框架每抬一次布局
+就把你插件打崩一轮（抬布局的规矩见 §22）。
 
 `MessageSegment::is_mention_of(self_id)` 判断"这是在召唤机器人吗"（@机器人 与 @全体都算），
 `command_text(event, self_id)` 就是靠它剥命令前缀的（§8）。
