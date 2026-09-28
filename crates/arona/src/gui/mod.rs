@@ -383,7 +383,7 @@ struct AronaGui {
     theme_applied: Option<ThemePref>,
     /// 已下发的配色对应的是深色还是浅色（跟随系统时系统换主题要重刷）
     palette_applied: Option<bool>,
-    /// 品牌图（assets/arona.png），标题栏与空状态用
+    /// 品牌图（本 crate 的 assets/arona.png），标题栏与空状态用
     icon: Option<egui::TextureHandle>,
     started: bool,
     toast: Option<Toast>,
@@ -520,7 +520,7 @@ impl AronaGui {
         if self.icon.is_some() {
             return;
         }
-        const PNG: &[u8] = include_bytes!("../../../../assets/arona.png");
+        const PNG: &[u8] = include_bytes!("../../assets/arona.png");
         let Ok(rgba) = image::load_from_memory(PNG).map(|image| image.to_rgba8()) else {
             return;
         };
@@ -2000,9 +2000,11 @@ impl AronaGui {
     }
 }
 
-/// 加载窗口（标题栏左上角/任务栏）图标：与 exe 图标同源，来自 assets/arona.png
+/// 加载窗口（标题栏左上角/任务栏）图标：与 exe 图标同源，来自本 crate 的 `assets/arona.png`
+/// （放在 crate 内而不是仓库根，是因为 `arona-rs` 要发到 crates.io——包外的文件不进 tarball，
+/// 从 crates.io 拉依赖的人会在 `include_bytes!` 处直接编不过。）
 fn load_window_icon() -> Option<egui::IconData> {
-    const PNG: &[u8] = include_bytes!("../../../../assets/arona.png");
+    const PNG: &[u8] = include_bytes!("../../assets/arona.png");
     let rgba = image::load_from_memory(PNG).ok()?.to_rgba8();
     let (width, height) = rgba.dimensions();
     Some(egui::IconData {
@@ -2916,7 +2918,7 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
         .with_title("Arona 管理面板");
     match load_window_icon() {
         Some(icon) => viewport = viewport.with_icon(icon),
-        None => crate::runtime::console::eprint_safe("[Arona] 未能加载窗口图标 assets/arona.png"),
+        None => crate::runtime::console::eprint_safe("[Arona] 未能加载窗口图标：内嵌的 assets/arona.png 解不开"),
     }
 
     // 依次尝试各个渲染后端：能用显卡就用显卡，之后才是随程序附带的软件 OpenGL；

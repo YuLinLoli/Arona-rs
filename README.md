@@ -435,11 +435,12 @@ crates/arona/            框架库
   framework/ 注册表的宿主实例（对齐 mirai 的 MiraiInstance）
   container/ 插件间共享能力的服务容器
   quartz/    定时任务内核   services/ 服务开关表   admin/ 管理与诊断接口   gui/ 管理面板
+  assets/    GUI 内嵌的品牌图 arona.png（放在 crate 目录内才进得了 crates.io 的包）
 crates/arona-host/       宿主可执行：产物 bin = arona-rs，里面没有任何功能插件
   build.rs   只把图标与清单编进 Windows 产物（不再生成插件注册代码）
   src/main.rs  一行 arona::run(args)
 plugins/hello/           插件开发示例（编译成 dll）：命令 / 事件钩子 / 出站钩子 / 类型化配置 / 每日任务
-assets/                  程序图标（arona.ico）、预览图与源立绘（source/）、arona.manifest
+assets/                  程序图标（arona.ico）、arona.manifest、源立绘（source/）；GUI 用的 arona.png 在 crates/arona/assets/
 scripts/                 make-icon.ps1、fetch-dxc.ps1、fetch-softgl.ps1
 installer/               Windows 安装包：arona-rs.iss、intro.txt、defaults/（默认配置模板）、languages/
 ```

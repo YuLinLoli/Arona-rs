@@ -20,7 +20,9 @@ param(
   [int[]]$Sizes = @(16, 24, 32, 48, 64, 128, 256),
   # 大于等于该尺寸的条目改用 PNG 压缩(体积小); 默认 4096 表示全部使用 DIB
   [int]$PngThreshold = 4096,
-  [string]$PreviewPng = "assets/arona.png"
+  # 256px 那一份另存成 PNG：GUI 的标题栏图标与窗口图标内嵌用它，所以落在 arona crate 里
+  # （crates.io 的 tarball 只带 crate 目录内的文件，放仓库根会让 include_bytes! 编不过）
+  [string]$PreviewPng = "crates/arona/assets/arona.png"
 )
 
 $ErrorActionPreference = "Stop"
@@ -34,6 +36,7 @@ $outIco = Resolve-Path2 $Out
 $preview = Resolve-Path2 $PreviewPng
 if (-not (Test-Path $source)) { throw "找不到源图片: $source" }
 [System.IO.Directory]::CreateDirectory([System.IO.Path]::GetDirectoryName($outIco)) | Out-Null
+[System.IO.Directory]::CreateDirectory([System.IO.Path]::GetDirectoryName($preview)) | Out-Null
 
 $image = [System.Drawing.Image]::FromFile($source)
 Write-Host "源图片: $source ($($image.Width)x$($image.Height))"
