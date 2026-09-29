@@ -484,6 +484,13 @@ fn configure(&self, ctx: &PluginContext) -> Result<(), String> {
 `sender_is_admin() -> bool`（群身份是不是管理员或群主，身份未知时 `false`）、`quoted() -> Option<i64>`（这条消息引用了哪条：`command_text` 里已剥掉引用段，值在这里）——
 全部读事件自带的 `sender`/`segments`，不发协议请求，实现端没给就是 `None`。
 
+**`reply` 回到哪儿（上面进群示例靠的就是这一条）**：`target()` 的回退顺序是群 → 私聊发送者 → 无目标。
+群那一档**只看 `group_id`**——OneBot 11 只在消息事件里给 `message_type`，进群/退群/改名片/加群请求这些
+notice、request 事件都带 `group_id` 而不带 `message_type`，所以钩子里对它们 `context.reply(..)` 会发进那个群。
+私聊那一档只认消息事件：加好友请求的 `user_id` 是对方的号，框架不会擅自往那儿发一句。
+meta 事件（心跳、连接状态）没有可回复对象——这三类情况下 `reply` 返回 `Ok(None)`，
+同时控制台打一条「这条事件没有可回复对象，已丢弃」，不会让你对着一个查不出原因的沉默。
+
 **同名不同物，照抄时最容易撞**：这几项在 `EventContext` 上是**方法**，在 `CommandContext` 上是**字段**，
 括号多打或漏打都编不过。
 ```rust
