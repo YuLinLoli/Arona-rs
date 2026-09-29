@@ -688,12 +688,18 @@ impl EventContext {
     }
 
     /// 发送目标的回退顺序：群 -> 私聊发送者 -> None（meta 事件没有可回复对象）
+    ///
+    /// 群这一档**只看 `group_id`**：OneBot 11 只在消息事件里给 `message_type`，notice/request
+    /// 事件带着 `group_id` 却没有 `message_type` 是常态（进群、退群、群名片变更、加群请求都这样），
+    /// 早先这里额外要求 `is_group()`，于是钩子里 `e.reply(..)` 对整类通知静默失效。
+    /// 私聊那一档仍只认消息事件：加群请求的 `user_id` 是对方账号，擅自回一句私聊比不回更难排查。
     pub fn target(&self) -> Option<MessageTarget> {
+        if self.kind == EventKind::Meta {
+            return None;
+        }
         match self.group_id() {
-            Some(group_id) if self.kind == EventKind::Message || self.is_group() => {
-                Some(MessageTarget::Group(group_id))
-            }
-            _ => match self.event.user_id {
+            Some(group_id) => Some(MessageTarget::Group(group_id)),
+            None => match self.event.user_id {
                 Some(user_id) if self.kind == EventKind::Message => {
                     Some(MessageTarget::Private(user_id))
                 }
@@ -712,6 +718,10 @@ impl EventContext {
         message: OutgoingMessage,
     ) -> Result<Option<i64>, crate::onebot::api::OneBotError> {
         let Some(target) = self.target() else {
+            crate::runtime::log::warning(format!(
+                "钩子想回话，但这条{}事件没有可回复对象（既无 group_id 也不是消息），已丢弃",
+                self.kind.display_name()
+            ));
             return Ok(None);
         };
         if !crate::runtime::services::sender_ready() {
@@ -1746,6 +1756,85 @@ mod tests {
         assert_eq!(context.message_id(), Some(7));
         assert_eq!(context.body.kind(), Some(EventKind::Notice));
         assert_eq!(context.body.notice_kind(), Some(NoticeKind::GroupIncrease));
+    }
+
+    /// notice/request 事件带 `group_id` 却没有 `message_type`（v11 只在消息事件里给这个字段），
+    /// 钩子里 `e.reply(..)` 必须仍然回到那个群 —— 早先这里要求 `is_group()`，
+    /// 于是进群欢迎语整类通知静默不回话，端到端实测才抓出来。
+    #[test]
+    fn notices_without_message_type_still_reply_to_the_group() {
+        let increase = context_from(json!({
+            "post_type": "notice",
+            "notice_type": "group_increase",
+            "group_id": 20001,
+            "user_id": 100,
+        }));
+        assert!(!increase.is_group(), "notice 事件本来就不带 message_type");
+        assert_eq!(increase.target(), Some(MessageTarget::Group(20001)));
+
+        let invited = context_from(json!({
+            "post_type": "request",
+            "request_type": "group",
+            "sub_type": "invite",
+            "group_id": 30002,
+            "user_id": 456,
+        }));
+        assert_eq!(invited.target(), Some(MessageTarget::Group(30002)));
+
+        // 加好友请求只有对方账号：不能顺手回一条私聊，宁可没有目标
+        let friend = context_from(json!({
+            "post_type": "request",
+            "request_type": "friend",
+            "user_id": 456,
+        }));
+        assert_eq!(friend.target(), None);
+
+        // 元事件（心跳、#58 的合成 lifecycle）同样没有可回复对象
+        let heartbeat = context_from(json!({
+            "post_type": "meta_event",
+            "meta_event_type": "heartbeat",
+            "group_id": 20001,
+        }));
+        assert_eq!(heartbeat.target(), None);
+
+        // 消息事件的原有回落顺序不变：群优先，私聊看 user_id
+        assert_eq!(
+            context_from(json!({
+                "post_type": "message",
+                "message_type": "group",
+                "group_id": 20001,
+                "user_id": 100,
+                "message": [{ "type": "text", "data": { "text": "早安" } }],
+            }))
+            .target(),
+            Some(MessageTarget::Group(20001))
+        );
+        assert_eq!(
+            context_from(json!({
+                "post_type": "message",
+                "message_type": "private",
+                "user_id": 100,
+                "message": [{ "type": "text", "data": { "text": "在吗" } }],
+            }))
+            .target(),
+            Some(MessageTarget::Private(100))
+        );
+    }
+
+    /// 从实现端样子的原始 JSON 造一个上下文（kind 由 post_type 决定，与投递时一致）
+    fn context_from(raw: serde_json::Value) -> EventContext {
+        let event = raw_event(raw.clone());
+        let kind = EventKind::from_post_type(&event.post_type).expect("post_type 应能认出来");
+        let parsed = protocol::ParsedMessage::parse(&event, event.self_id);
+        EventContext {
+            kind,
+            body: EventBody::from_event(&event),
+            event,
+            text: parsed.text,
+            command_text: parsed.command_text,
+            segments: parsed.segments,
+            api: OneBotApi::global(),
+        }
     }
 
     /// 用一段原始 JSON 造事件（细节字段全看 raw，正是实现端发来的样子）
