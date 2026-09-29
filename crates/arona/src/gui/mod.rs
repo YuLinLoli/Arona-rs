@@ -2918,7 +2918,9 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
         .with_title("Arona 管理面板");
     match load_window_icon() {
         Some(icon) => viewport = viewport.with_icon(icon),
-        None => crate::runtime::console::eprint_safe("[Arona] 未能加载窗口图标：内嵌的 assets/arona.png 解不开"),
+        None => crate::runtime::console::eprint_safe(
+            "[Arona] 未能加载窗口图标：内嵌的 assets/arona.png 解不开",
+        ),
     }
 
     // 依次尝试各个渲染后端：能用显卡就用显卡，之后才是随程序附带的软件 OpenGL；
