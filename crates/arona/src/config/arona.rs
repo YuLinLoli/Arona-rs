@@ -240,6 +240,12 @@ fn render_node(
                 Value::Mapping(_) => "{}".to_string(),
                 Value::Sequence(_) => "[]".to_string(),
                 Value::Null => "null".to_string(),
+                // 带换行的字符串不能交给 serde_yaml 排版：它出的是块标量（`|2` 再跟内容行），
+                // 而那些内容行只带相对缩进，拼到本层就成了非法 YAML——框架自己生成的配置文件
+                // 会读不回来。双引号转义是 YAML 兼容的，一行写得下。
+                Value::String(raw) if raw.contains(['\n', '\r']) => {
+                    serde_json::to_string(raw).unwrap_or_default()
+                }
                 scalar => serde_yaml::to_string(scalar)
                     .unwrap_or_default()
                     .trim_end_matches('\n')
@@ -788,5 +794,34 @@ mod tests {
         assert_eq!(file["demo"].black_groups, vec![999, 1001]);
         assert_eq!(file["demo"].alert.text, "预警");
         assert_eq!(file["demo"].extra["a"], "b");
+    }
+
+    /// 回归：值里带换行时不能让 serde_yaml 自己排版——它出块标量（`|2` 再跟内容行），
+    /// 那些内容行只带相对缩进，拼到当前层级就是非法 YAML。实测踩过：
+    /// 框架生成的插件配置里 `cutLine: |2` 那一段，框架自己读不回来。
+    #[test]
+    fn multiline_string_renders_as_one_escaped_line() {
+        let section = typed_section::<DemoConfig>("demo");
+        let filled = serde_yaml::to_value(DemoConfig {
+            alert: DemoAlert {
+                hour: 3,
+                text: "第一行\n第二行\r第三行".to_string(),
+            },
+            ..Default::default()
+        })
+        .unwrap();
+        let text = section.render(&filled);
+        assert!(
+            !text.contains("|2") && !text.contains("|-"),
+            "不该出现块标量: {text}"
+        );
+        assert!(
+            text.contains("text: \"第一行\\n第二行\\r第三行\""),
+            "多行字符串该转义成一行: {text}"
+        );
+        let back: BTreeMap<String, DemoConfig> =
+            serde_yaml::from_str(&text).expect("带多行值的模板该能读回");
+        assert_eq!(back["demo"].alert.text, "第一行\n第二行\r第三行");
+        assert_eq!(back["demo"].alert.hour, 3);
     }
 }
