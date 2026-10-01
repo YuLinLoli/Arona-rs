@@ -144,6 +144,7 @@ arona-host ──depends──▶ arona（框架）──启动时扫描──�
 | 图片不是可复用对象 | `arona::bot::Image`：`from_file_id` / `from_url` / `from_file` / `from_bytes`，`image.segment()` 或 `OutgoingMessage::from(image)`，`file_id()` 能把实现端给的回执号接着用第二次（§19） | 上传动作还是实现端在做，框架不代管一份图库 |
 | 事件不是一事件一 class | 仍按 `BodyFilter` 找而不是按类名找，但私聊能按子类型分档了：`BodyFilter::private("friend")` 只看好友消息、`private("group")` 只看临时会话，v11 的字符串写法与 CQ 的数字写法（`0`/`1`/`2`）都认（§9） | 事件类本身没有，一家 OneBot 只有一个 `EventContext` |
 | `Bot::of(隔离实例)` 上 `api()` 不隔离 | `OneBotApi` 现在持有所属 `Framework` 实例（`OneBotApi::of(&实例)`，`global()` 是进程默认实例那一份）。`Bot::api()`、`PluginContext::api()`、`EventContext::api()`、`CommandContext::api()` 一律落在**构造它的那套实例**上，`recall` / `reply_with_quote` 也跟着走实例上的 `chatlog_api()` | `arona::runtime::chatlog::*` 那批自由函数仍读进程默认实例（§22 末尾的遗留清单） |
+| mirai 那种「等这个会话的下一句话」（`nextMessage` / `whileSelectMessages`）没有对应出口 | **框架没有为它加任何 API**，插件侧现有两样料就够：一条 `ListenerPriority::High` 的消息钩子，加上插件自己那张以「会话号#发起人」为键的会话表；命中后回 `HookFlow::Handled`（§9：后续钩子与命令分发都不再执行），有效窗口用 `Instant` 自己比 | 谁在等、等什么、多久过期全在插件手里，框架不替它记这份状态；两个插件各自挂同档钩子时谁先吃掉那句话，取决于注册顺序 |
 
 ## 4. 生命周期（`arona::run` → `run_bot` 的真实顺序）
 
