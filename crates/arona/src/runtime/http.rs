@@ -23,6 +23,7 @@ use std::ffi::c_void;
 use std::ptr::null;
 use std::sync::OnceLock;
 use std::time::Duration;
+use tokio::sync::Semaphore;
 use tokio::sync::oneshot;
 
 /// 插件没指定超时时用这一档
@@ -31,6 +32,32 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 const TEXT_LIMIT: usize = 8 * 1024 * 1024;
 /// 一次请求最多带多少对请求头（或表单项）
 const PAIR_LIMIT: usize = 128;
+/// 一次响应正文最多收多少字节。请求侧那道 `TEXT_LIMIT` 只管得进不出的方向，
+/// 方向反过来同样要有闸：跑飞的接口或错误页回几百 MB 时，不能先全额进内存再决定要不要。
+const RESPONSE_LIMIT: usize = 64 * 1024 * 1024;
+/// 同时在途的代发请求数。原来每个请求都 spawn 一条任务且没有闸，
+/// 插件一轮抓几十张大图就是几十份完整响应同时驻留在堆上。
+const MAX_INFLIGHT: usize = 16;
+
+/// 跨边界的响应字节闸：先看对端声明的长度，超了连读都不读
+fn guard_declared_len(url: &str, declared: Option<u64>) -> Result<(), String> {
+    match declared {
+        Some(len) if len > RESPONSE_LIMIT as u64 => Err(format!(
+            "请求 {url} 的响应声明 {len} 字节，超出单次响应上限 {RESPONSE_LIMIT}"
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// 收完之后的第二道闸：对端可以谎报 `content-length`，所以实读到的长度也要判
+fn guard_actual_len(url: &str, got: usize) -> Result<(), String> {
+    if got > RESPONSE_LIMIT {
+        return Err(format!(
+            "请求 {url} 实际回了 {got} 字节，超出单次响应上限 {RESPONSE_LIMIT}"
+        ));
+    }
+    Ok(())
+}
 
 /// [`HostBridge::http`](crate::plugin::abi::HostBridge::http) 的函数指针类型
 type Submit = extern "C" fn(call: *const HttpCall, done: HttpDone, user: *mut c_void);
@@ -345,7 +372,12 @@ pub(crate) extern "C" fn host_submit(call: *const HttpCall, done: HttpDone, user
         Err(reason) => return report(done, ticket, Err(reason)),
     };
     let url = request.url.clone();
-    let task = async move { report(done, ticket, local(request).await) };
+    let task = async move {
+        // 闸：`_permit` 活到这条任务末尾，所以在途响应最多 `MAX_INFLIGHT` 份。
+        // `None` 只可能是闸被关闭（runtime 拆解），那时照常把请求发完比卡住更合适。
+        let _permit = inflight().acquire().await.ok();
+        report(done, ticket, local(request).await)
+    };
     if crate::runtime::reactor::spawn(task).is_none() {
         report(
             done,
@@ -456,7 +488,7 @@ unsafe fn take_pairs(
         .collect()
 }
 
-/// 宿主自己那份常驻客户端：连接池与 keepalive 都开着——跑在宿主的 runtime 上，
+/// 宿主侧那份常驻客户端：连接池与 keepalive 都开着——跑在宿主的 runtime 上，
 /// hyper 派生的后台任务本来就看得见上下文，用不着像插件自己发请求那样把池子关掉。
 fn client() -> &'static reqwest::Client {
     CLIENT.get_or_init(|| {
@@ -465,6 +497,13 @@ fn client() -> &'static reqwest::Client {
             .build()
             .unwrap_or_else(|_| reqwest::Client::new())
     })
+}
+
+/// 同时在途的代发请求闸。许可在 [`host_submit`] 那条任务里拿，拿不到就在宿主这边排队——
+/// 背压回到插件那边是"这一条还没发完"，而不是继续在堆上叠第 17 份完整响应。
+fn inflight() -> &'static Semaphore {
+    static INFLIGHT: OnceLock<Semaphore> = OnceLock::new();
+    INFLIGHT.get_or_init(|| Semaphore::new(MAX_INFLIGHT))
 }
 
 /// 真发一次请求：非 2xx 与传输失败都归成 `Err`，文案与插件自己写 reqwest 时一贯的写法一致
@@ -492,13 +531,19 @@ async fn local(request: Request) -> Result<Vec<u8>, String> {
         .await
         .map_err(|err| format!("请求失败 {url}: {err}"))?;
     let status = response.status();
+    // 先按对端声明的长度拦一道：跑飞的接口或错误页回几百 MB 时，连读都不该开始
+    guard_declared_len(&url, response.content_length())?;
+    // 非 2xx 在**读正文之前**就拒。原来这里是先把整份 body 读进内存再看状态码，
+    // 于是一个几百 MB 的错误页会先占住几百 MB，再被原样丢掉。
+    if !status.is_success() {
+        return Err(format!("请求 {url} 返回 HTTP {status}"));
+    }
     let bytes = response
         .bytes()
         .await
         .map_err(|err| format!("读取响应失败 {url}: {err}"))?;
-    if !status.is_success() {
-        return Err(format!("请求 {url} 返回 HTTP {status}"));
-    }
+    // 谎报 `content-length` 的兜底：实收长度再判一道
+    guard_actual_len(&url, bytes.len())?;
     Ok(bytes.to_vec())
 }
 
@@ -611,6 +656,64 @@ mod tests {
             "失败原因里该带状态码: {reason}"
         );
         assert!(reason.contains("/probe"), "失败原因里该带 URL: {reason}");
+    }
+
+    /// 对端**声明**的长度超上限时，连读都不该开始（`local()` 里这一道在读正文之前）。
+    #[test]
+    fn a_declared_response_over_the_cap_is_rejected_before_reading() {
+        assert!(
+            guard_declared_len("http://x/big", Some(RESPONSE_LIMIT as u64 + 1)).is_err(),
+            "声明超出上限却没拦下来"
+        );
+        assert!(guard_declared_len("http://x/ok", Some(10)).is_ok());
+        // 分块传输没有 content-length，这不能当成"要攻击我"
+        assert!(guard_declared_len("http://x/chunked", None).is_ok());
+    }
+
+    /// 谎报长度的兜底：实收到的字节也要判一道，边界上不误伤。
+    #[test]
+    fn an_undeclared_response_is_measured_after_reading() {
+        assert!(
+            guard_actual_len("http://x", RESPONSE_LIMIT).is_ok(),
+            "正好在上限上不该拒"
+        );
+        assert!(
+            guard_actual_len("http://x", RESPONSE_LIMIT + 1).is_err(),
+            "超一个字节就该拒"
+        );
+    }
+
+    /// 走完整 `local()` 的那道闸：对端**声明**一个 64MB+ 的长度时，必须在读正文之前就报错——
+    /// 只测上面那两个纯函数不足以证明 `local()` 真的调了它们（原来这里是先读满再判状态码）。
+    #[tokio::test]
+    async fn a_huge_declared_response_is_refused_without_reading_the_body() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                if socket.read(&mut byte).await.unwrap_or(0) == 0 {
+                    return;
+                }
+                head.push(byte[0]);
+            }
+            // 声明一个超限的长度就再不写了：正文根本不存在，能读它会挂住/吃内存
+            let _ = socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 999000000\r\n\r\n")
+                .await;
+            let _ = socket.shutdown().await;
+        });
+        let reason = send(Request::get(format!("http://{addr}/huge")))
+            .await
+            .expect_err("声明超出上限的响应该被拒掉");
+        assert!(
+            reason.contains("超出单次响应上限"),
+            "拒得不对，像是读完之后再报的: {reason}"
+        );
     }
 
     #[tokio::test]
