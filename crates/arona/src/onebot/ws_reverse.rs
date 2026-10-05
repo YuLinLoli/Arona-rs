@@ -1,7 +1,8 @@
 //! 反向 WebSocket 连接（对应原版 OneBotWsReverseConnection）
 use crate::config::onebot::ConnectionConfig;
 use crate::onebot::connection::{
-    ConnectionCore, OneBotConnection, SendWait, begin_send, next_conn_id, receive_payload,
+    ConnectionCore, OneBotConnection, SendWait, WRITE_TIMEOUT_MILLIS, begin_send, next_conn_id,
+    receive_payload,
 };
 use crate::onebot::model::OneBotAction;
 use crate::runtime::log;
@@ -208,14 +209,40 @@ async fn handle_socket(socket: WebSocket, state: Arc<WsReverseState>) {
     }
     // 独立写任务：大图(base64)等大负载写 socket 时不再堵住读循环，
     // 否则「收消息 + 打印日志」会跟着一起卡住。
+    // 这个 Notify 是**每个 socket 自己**的：反向侧同时挂着多个客户端时，一个写不下去不该把
+    // 别人的读循环也叫醒（各客户端各有独立队列，本来就互不队头阻塞）。
+    let stalled = Arc::new(tokio::sync::Notify::new());
+    let writer_state = state.clone();
+    let writer_stalled = stalled.clone();
     let writer = tokio::spawn(async move {
         while let Some(message) = rx.recv().await {
-            let closing = matches!(message, Message::Close(_));
-            if sink.send(message).await.is_err() {
+            // 停用/热重载之后不再往外刷：退出这条 while 就等于把**已积压的整段队列**丢掉。
+            // 原来只有下面那句 `writer.abort()`，而它写在主任务尾部，`stop()` abort 主任务时
+            // 根本轮不到跑，于是僵尸写任务连同队列一直常驻。
+            if writer_state.stopped.load(Ordering::SeqCst) {
                 break;
             }
-            if closing {
-                break;
+            let closing = matches!(message, Message::Close(_));
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(WRITE_TIMEOUT_MILLIS),
+                sink.send(message),
+            )
+            .await
+            {
+                Err(_) => {
+                    log::warning(format!(
+                        "[OneBot reverse WS] 写出超时（{} 秒没写出去），断开这个客户端以丢掉出站积压",
+                        WRITE_TIMEOUT_MILLIS / 1000
+                    ));
+                    writer_stalled.notify_one();
+                    break;
+                }
+                Ok(Err(_)) => break,
+                Ok(Ok(())) => {
+                    if closing {
+                        break;
+                    }
+                }
             }
         }
     });
@@ -246,6 +273,8 @@ async fn handle_socket(socket: WebSocket, state: Arc<WsReverseState>) {
                     None => break,
                 }
             }
+            // 这个客户端的写任务判定 socket 已废（写出超时）：读循环跟着退出，走下面的收尾与摘除
+            _ = stalled.notified() => break,
         }
     }
     writer.abort();

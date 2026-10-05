@@ -11,6 +11,13 @@ use std::time::Duration;
 
 pub const ACTION_TIMEOUT_MILLIS: u64 = 15_000;
 
+/// 一次 socket 写最多等多久（正向与反向 WS 共用）。
+///
+/// 出站写队列是 `unbounded_channel`：对端不再读 socket 时，`sink.send().await` 会永远挂着，
+/// 上游还在往里塞，几百 MB 的出站图片字节就这么堆在堆上且不归还。到点就判定这条连接已废，
+/// 断开走重连，积压随写任务退出一起丢掉。
+pub const WRITE_TIMEOUT_MILLIS: u64 = 20_000;
+
 static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
 
 /// 等待动作响应的句柄

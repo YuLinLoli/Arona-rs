@@ -1,7 +1,8 @@
 //! 正向 WebSocket 连接（对应原版 OneBotWsForwardConnection）
 use crate::config::onebot::ConnectionConfig;
 use crate::onebot::connection::{
-    ConnectionCore, OneBotConnection, SendWait, begin_send, next_conn_id, receive_payload,
+    ConnectionCore, OneBotConnection, SendWait, WRITE_TIMEOUT_MILLIS, begin_send, next_conn_id,
+    receive_payload,
 };
 use crate::onebot::model::OneBotAction;
 use crate::onebot::protocol;
@@ -28,6 +29,8 @@ pub struct RunState {
     pub online: AtomicBool,
     /// 读循环的唤醒信号：stop() 时用它立刻打断 select!（Notify 会保存一次许可，不会丢事件）
     pub stop_notify: tokio::sync::Notify,
+    /// 写侧卡死的唤醒信号：写任务超时后用它让读循环退出，好让这条连接去重连
+    pub stalled: tokio::sync::Notify,
 }
 
 impl RunState {
@@ -43,6 +46,7 @@ impl RunState {
             stopped: AtomicBool::new(false),
             online: AtomicBool::new(false),
             stop_notify: tokio::sync::Notify::new(),
+            stalled: tokio::sync::Notify::new(),
         })
     }
 }
@@ -224,17 +228,40 @@ async fn run_forward(state: Arc<RunState>) {
         // 独立的写任务：所有待发 payload 都排在这里，socket 写只占用这个任务。
         // 原来 socket 写直接跑在读循环里，发送大图(base64)等大负载时 sink.send().await
         // 会把「收消息 + 打印日志」整条读循环一并堵住，控制台因此卡住不动。
+        let writer_state = state.clone();
         let writer = tokio::spawn(async move {
             while let Some(message) = rx.recv().await {
                 if matches!(&message, Message::Text(text) if text.is_empty()) {
                     break;
                 }
-                let closing = matches!(message, Message::Close(_));
-                if sink.send(message).await.is_err() {
+                // 停用（GUI 关插件、配置热重载、panic 隔离）之后不再往外刷：这条 while 一退出，
+                // `rx` 连同**已经积压的整段队列**一起被丢弃。原来这里没有检查，`stop()` 又是
+                // abort 主任务，于是那句 `writer.abort()` 根本轮不到跑，僵尸写任务抱着队列常驻。
+                if writer_state.stopped.load(Ordering::SeqCst) {
                     break;
                 }
-                if closing {
-                    break;
+                let closing = matches!(message, Message::Close(_));
+                match tokio::time::timeout(
+                    std::time::Duration::from_millis(WRITE_TIMEOUT_MILLIS),
+                    sink.send(message),
+                )
+                .await
+                {
+                    Err(_) => {
+                        // 对端整整 WRITE_TIMEOUT_MILLIS 都没读过 socket 才会走到这里：把它当已废的连接处理
+                        log::warning(format!(
+                            "[OneBot WS] 写出超时（{} 秒没写出去），断开这条连接以丢掉出站积压",
+                            WRITE_TIMEOUT_MILLIS / 1000
+                        ));
+                        writer_state.stalled.notify_one();
+                        break;
+                    }
+                    Ok(Err(_)) => break,
+                    Ok(Ok(())) => {
+                        if closing {
+                            break;
+                        }
+                    }
                 }
             }
         });
@@ -286,6 +313,8 @@ async fn run_forward(state: Arc<RunState>) {
                 }
                 // stop() 唤醒：立刻退出，不再傻等 stream
                 _ = state.stop_notify.notified() => break,
+                // 写任务判定这条 socket 已废（写出超时）：读循环跟着退出，走下面的正常收尾与重连
+                _ = state.stalled.notified() => break,
             }
         }
         writer.abort();
