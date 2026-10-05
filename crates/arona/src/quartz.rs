@@ -40,11 +40,47 @@ struct TaskEntry {
     health: Option<Arc<HealthBoard>>,
     paused: AtomicBool,
     canceled: AtomicBool,
+    /// 取消的即时唤醒。只靠 `canceled` 标志的话，那条循环要**睡完这一觉**才发现自己被取消了：
+    /// Daily 是最长 24 小时，这期间这条任务连同 `run` 闭包（里面挂着插件那一轮的上下文）
+    /// 一直占着内存——反复热重载就是照着这条攒出来的。
+    cancel: tokio::sync::Notify,
+    /// 回到所属的那张表：单次任务跑完要自己摘掉自己。
+    ///
+    /// 原来两条自然退出的路（`delay_until_next` 说"没有下一次了"、以及触发完算不出下一次）都
+    /// 只是 `return`，条目却永远留在表里。表是按任务名长的，而延时任务的名字通常带着消息号，
+    /// 于是**每延一次时就在表里留下一个 `TaskEntry`**，连它 `run` 闭包里握着的东西一起不退——
+    /// 长跑几天就是几百 MB 的那个形状。这里用弱引用是故意的：表持有任务，任务不能反过来持有表。
+    owner: Weak<RwLock<HashMap<String, Arc<TaskEntry>>>>,
     last_fire: RwLock<Option<i64>>,
     next_fire: RwLock<Option<i64>>,
 }
 
 impl TaskEntry {
+    /// 自然跑完之后把自己从表里摘掉。
+    ///
+    /// 只摘"表里那一格还是我"的情况：同名重排时表里已经是新条目，误摘会把刚排好的任务一起删掉。
+    fn retire(self: &Arc<Self>) {
+        let Some(tasks) = self.owner.upgrade() else {
+            return;
+        };
+        let mut tasks = tasks.write().unwrap();
+        if tasks
+            .get(self.name.as_str())
+            .is_some_and(|held| Arc::ptr_eq(held, self))
+        {
+            tasks.remove(self.name.as_str());
+        }
+    }
+
+    /// 取消这条任务：置标志 + 叫醒正在睡觉的那条循环。
+    ///
+    /// `notify_one` 会保存一个许可，所以哪怕这条循环还没进 `select!`，下一次 `notified()`
+    /// 也会立刻返回，不存在"叫醒丢事件"。
+    fn cancel_now(&self) {
+        self.canceled.store(true, Ordering::SeqCst);
+        self.cancel.notify_one();
+    }
+
     /// 跑一次任务体，返回是否发生了 panic。
     ///
     /// 不吞的话异常会顺着循环把整个 tokio 任务打死，而表里还留着一条
@@ -78,10 +114,17 @@ impl TaskEntry {
             loop {
                 let now_ms = chrono::Utc::now().timestamp_millis();
                 let Some(delay_ms) = entry.delay_until_next(now_ms) else {
+                    // 单次任务到点却没有下一次：跑完（或根本没赶上）就该从表里消失
+                    entry.retire();
                     return;
                 };
                 if delay_ms > 0 {
-                    tokio::time::sleep(Duration::from_millis(delay_ms as u64)).await;
+                    // 睡这一觉期间随时可能被取消，所以两路一起等：只 sleep 的话，
+                    // 取消要等到睡醒才看得见（Daily 就是最长 24 小时）
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_millis(delay_ms as u64)) => {}
+                        _ = entry.cancel.notified() => {}
+                    }
                 }
                 if entry.canceled.load(Ordering::SeqCst) {
                     return;
@@ -104,6 +147,8 @@ impl TaskEntry {
                 } else {
                     let mut guard = entry.next_fire.write().unwrap();
                     *guard = None;
+                    // 单次任务已经触发完，不留条目
+                    entry.retire();
                     return;
                 }
             }
@@ -185,7 +230,7 @@ fn next_daily_ms(hour: u32, now_ms: i64) -> i64 {
 /// 表实例由 [`crate::framework::Framework`] 持有，本模块的自由函数走进程默认实例。
 #[derive(Default)]
 pub struct Scheduler {
-    tasks: RwLock<HashMap<String, Arc<TaskEntry>>>,
+    tasks: Arc<RwLock<HashMap<String, Arc<TaskEntry>>>>,
     /// 回填后，任务 panic 才能记到归属插件的健康度上（见 [`Scheduler::attach`]）
     framework: OnceLock<Weak<crate::framework::Framework>>,
 }
@@ -199,7 +244,7 @@ impl Scheduler {
     fn register(&self, name: &str, group: &str, kind: TaskKind, run: JobFn) -> Arc<TaskEntry> {
         let existing = self.tasks.read().unwrap().get(name).cloned();
         if let Some(entry) = existing {
-            entry.canceled.store(true, Ordering::SeqCst);
+            entry.cancel_now();
         }
         let health = self
             .framework
@@ -214,6 +259,8 @@ impl Scheduler {
             health,
             paused: AtomicBool::new(false),
             canceled: AtomicBool::new(false),
+            cancel: tokio::sync::Notify::new(),
+            owner: Arc::downgrade(&self.tasks),
             last_fire: RwLock::new(None),
             next_fire: RwLock::new(None),
         });
@@ -259,7 +306,7 @@ impl Scheduler {
 
     pub fn remove(&self, name: &str) -> bool {
         if let Some(entry) = self.tasks.write().unwrap().remove(name) {
-            entry.canceled.store(true, Ordering::SeqCst);
+            entry.cancel_now();
             true
         } else {
             false
@@ -277,7 +324,7 @@ impl Scheduler {
             .collect();
         let count = removed.len();
         for entry in removed {
-            entry.canceled.store(true, Ordering::SeqCst);
+            entry.cancel_now();
         }
         count
     }
@@ -409,6 +456,74 @@ mod tests {
         assert!(
             FIRES.load(Ordering::SeqCst) >= 2,
             "panic 之后调度循环不该消失，实际触发 {FIRES:?}"
+        );
+    }
+
+    /// 取消必须**即时**生效，不能等下一次触发才醒。
+    ///
+    /// 回归点：原先 `canceled` 只是个标志，那条循环要睡完这一觉才去查它，于是 Daily/长间隔任务
+    /// 被取消之后还要挂到下一个触发点（最长 24 小时）；这期间它连同 `run` 闭包里握着的插件上下文
+    /// 都不肯放手，反复热重载就是照这条攒出内存台阶的。这里用一只"闭包被放掉时响一声"的哨子，
+    /// 量的正是放手的时刻，而不是有没有响过。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn canceled_task_releases_its_job_at_once() {
+        struct Watchdog(std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>);
+        impl Drop for Watchdog {
+            fn drop(&mut self) {
+                if let Some(tx) = self.0.get_mut().unwrap().take() {
+                    let _ = tx.send(());
+                }
+            }
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let watch = Watchdog(std::sync::Mutex::new(Some(tx)));
+        let framework = crate::framework::Framework::new();
+        // 一小时一跳：取消不即时生效的话，这条要再挂一个小时才放手
+        framework.jobs().create_repeat(
+            3600,
+            "QuartzCancelNow",
+            "QuartzCancelPlugin",
+            Arc::new(move || {
+                let _ = &watch;
+            }),
+        );
+        // 先确认循环真跑起来了（首次立即触发），否则下面的断言会空过
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(framework.jobs().remove("QuartzCancelNow"));
+        rx.recv_timeout(std::time::Duration::from_secs(3))
+            .expect("取消之后 3 秒内没放掉任务闭包——取消仍然要等到下一次触发");
+    }
+
+    /// 单次任务触发完必须从表里消失。
+    ///
+    /// 回归点：原来那条循环只是 `return`，条目连它 `run` 闭包里握着的东西一起永远留在表里。
+    /// 而延时任务的名字通常带着消息号（撤回占位、延迟清理都是按条消息起的），于是
+    /// **每延一次时表里就长一格**——长跑几天攒出几百 MB 就是这条，跟热重载无关。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_single_shot_task_is_removed_after_it_fires() {
+        let fired = Arc::new(AtomicBool::new(false));
+        let flag = fired.clone();
+        let scheduler = Scheduler::default();
+        scheduler.create_delay(
+            1,
+            "QuartzOnceJob",
+            "QuartzOncePlugin",
+            Arc::new(move || {
+                flag.store(true, Ordering::SeqCst);
+            }),
+        );
+        assert!(
+            scheduler.exists("QuartzOnceJob"),
+            "登记之后表里就该有这一格"
+        );
+        tokio::time::sleep(Duration::from_millis(1_600)).await;
+        assert!(
+            fired.load(Ordering::SeqCst),
+            "延时任务压根没触发，这条测试就成了空过"
+        );
+        assert!(
+            !scheduler.exists("QuartzOnceJob"),
+            "单次任务跑完之后条目还留在表里——那就是那条只会变长的泄漏"
         );
     }
 
