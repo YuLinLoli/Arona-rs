@@ -29,6 +29,15 @@ fn ensure_file_log() -> Option<&'static Mutex<FileLog>> {
         .into()
 }
 
+/// 落盘一行的正文：剥 ANSI 后按内存缓冲那同一份单行上限截断。
+///
+/// 按天日志文件过去写的是**原文**——内联 base64 图片、插件打印的超长字符串一行就是几 MB，
+/// 内存缓冲有界而磁盘无界。超长行在两个出口上必须用同一个限流，否则「保住日志文件」那句只是注释。
+fn file_body(line: &str) -> String {
+    // 先剥 ANSI 再截断：反过来转义码会占掉单行额度，残片还可能被当成 CSI 一路跳下去吃掉正文。
+    clamp_line(&strip_ansi(line))
+}
+
 fn append_file(line: &str) {
     let Some(guard) = ensure_file_log() else {
         return;
@@ -42,7 +51,7 @@ fn append_file(line: &str) {
         file_log.file = crate::runtime::paths::logs_dir().join(format!("arona-{today}.log"));
     }
     let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-    let line = strip_ansi(line);
+    let line = file_body(line);
     if line.is_empty() {
         return;
     }
@@ -343,8 +352,16 @@ pub struct LiveLine {
 /// 缓冲上限（超出后丢弃最旧的行）
 const LIVE_CAPACITY: usize = 3000;
 
+/// 缓冲的总字节上限。只按行数限流挡不住「一行几 MB」——内联 base64 图片、插件打印超长
+/// 字符串都会进来，3000 行 × 1 MB 就是 3 GB。这里再压一道总字节上限。
+const LIVE_CAPACITY_BYTES: usize = 8 * 1024 * 1024;
+
+/// 单行上限。超长行先在这里截断，内存缓冲（[`push_live`]）与按天日志文件（[`file_body`]）共用这一条。
+const LIVE_LINE_MAX: usize = 16 * 1024;
+
 struct LiveLog {
     lines: std::collections::VecDeque<LiveLine>,
+    bytes: usize,
     version: u64,
 }
 
@@ -355,9 +372,22 @@ fn live_log() -> &'static Mutex<LiveLog> {
     LIVE_LOG.get_or_init(|| {
         Mutex::new(LiveLog {
             lines: std::collections::VecDeque::new(),
+            bytes: 0,
             version: 0,
         })
     })
+}
+
+/// 超长行按 UTF-8 边界截断，并标出原始长度
+fn clamp_line(text: &str) -> String {
+    if text.len() <= LIVE_LINE_MAX {
+        return text.to_string();
+    }
+    let mut end = LIVE_LINE_MAX;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…<本行共 {} 字节>", &text[..end], text.len())
 }
 
 /// 记录一行到内存缓冲（由 `runtime::console` 统一调用，覆盖所有控制台输出）
@@ -368,14 +398,19 @@ pub fn push_live(text: &str, stderr: bool) {
     let Ok(mut log) = live_log().lock() else {
         return;
     };
-    while log.lines.len() >= LIVE_CAPACITY {
-        log.lines.pop_front();
-    }
+    let line = clamp_line(text);
+    log.bytes += line.len();
     log.lines.push_back(LiveLine {
         time: chrono::Local::now().format("%H:%M:%S").to_string(),
-        text: text.to_string(),
+        text: line,
         stderr,
     });
+    while log.lines.len() > LIVE_CAPACITY || log.bytes > LIVE_CAPACITY_BYTES {
+        let Some(dropped) = log.lines.pop_front() else {
+            break;
+        };
+        log.bytes = log.bytes.saturating_sub(dropped.text.len());
+    }
     log.version += 1;
     LIVE_VERSION.store(log.version, std::sync::atomic::Ordering::Relaxed);
 }
@@ -406,6 +441,7 @@ pub fn clear_live() {
         return;
     };
     log.lines.clear();
+    log.bytes = 0;
     log.version += 1;
     LIVE_VERSION.store(log.version, std::sync::atomic::Ordering::Relaxed);
 }
@@ -673,5 +709,50 @@ mod tests {
             push_live(&format!("[Arona] bounded-{i}"), false);
         }
         assert!(live_lines().len() <= LIVE_CAPACITY);
+    }
+
+    /// 一行几 MB 的日志（内联 base64 图片就走这条路）不能把缓冲撑爆：单行要截断，
+    /// 总字节要被 LIVE_CAPACITY_BYTES 挡住。
+    #[test]
+    fn live_log_buffer_is_bounded_by_bytes() {
+        let _serial = LIVE_LOG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        clear_live();
+        let big = "x".repeat(LIVE_LINE_MAX * 4);
+        for _ in 0..64 {
+            push_live(&big, false);
+        }
+        let lines = live_lines();
+        let total: usize = lines.iter().map(|line| line.text.len()).sum();
+        assert!(
+            lines
+                .iter()
+                .all(|line| line.text.len() <= LIVE_LINE_MAX + 64),
+            "单行没有被截断"
+        );
+        assert!(
+            total <= LIVE_CAPACITY_BYTES,
+            "总字节 {total} 超过上限 {LIVE_CAPACITY_BYTES}"
+        );
+        clear_live();
+    }
+
+    /// 按天日志文件过去写的是**原文**：内存缓冲被 `LIVE_LINE_MAX` 管住了，磁盘那侧一行几 MB
+    /// 照样照写。这条钉住两个出口共用同一份单行上限。
+    #[test]
+    fn the_daily_file_body_is_clamped_like_the_live_buffer() {
+        let colored = format!("\x1b[32m{}\x1b[0m", "图".repeat(LIVE_LINE_MAX));
+        let body = file_body(&colored);
+        assert!(
+            body.len() <= LIVE_LINE_MAX + 64,
+            "落盘正文没按单行上限截断：{} 字节",
+            body.len()
+        );
+        assert!(body.contains("本行共"), "截断后要标出原始长度");
+        assert!(
+            body.starts_with('图'),
+            "转义码被算进了单行额度，正文开头成了残片"
+        );
     }
 }

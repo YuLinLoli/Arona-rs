@@ -856,6 +856,10 @@ pub fn recent(scope: HistoryScope, limit: i64, before: Option<HistoryCursor>) ->
 
 // ==================== 小工具 ====================
 
+/// 内联负载（`base64://…` / `data:…`）不是可复用的地址：还原引用时既没法当网络直链探活，
+/// 也不是本地路径，原样入库只会让每条消息在 SQLite 里占几百 KB～几 MB，读回来还会被误报成
+/// 「图片已过期」。`first_image` 在这里把它们滤掉。
+///
 /// 消息段里第一张图的地址（原链接优先，其次实现端给的本地路径，再退到它给的图片标识）。
 /// 只有 `file_id` 时存成 `fileid://<id>`：库里那一列永远是一个可直接还原的字符串，
 /// 而 QQ 的图床直链会过期，`file_id` 反而是三者里最耐用的那个。
@@ -863,16 +867,18 @@ fn first_image(segments: &[MessageSegment]) -> Option<String> {
     segments.iter().find_map(|segment| match segment {
         MessageSegment::Image {
             url, file, file_id, ..
-        } => url
-            .clone()
-            .or_else(|| file.clone())
+        } => [url.as_deref(), file.as_deref()]
+            .into_iter()
+            .flatten()
+            // url 优先，但内联 base64 既不是直链也不是路径，换下一个槽再试
+            .find(|value| !value.is_empty() && !crate::onebot::protocol::is_inline_media(value))
+            .map(str::to_string)
             .or_else(|| {
                 file_id
                     .as_deref()
                     .filter(|value| !value.is_empty())
                     .map(|value| format!("{FILE_ID_SCHEME}{value}"))
-            })
-            .filter(|value| !value.is_empty()),
+            }),
         _ => None,
     })
 }
@@ -1017,6 +1023,27 @@ mod tests {
             file_id: Some(String::new()),
         }];
         assert_eq!(first_image(&empty), None);
+    }
+
+    /// 内联 base64 不是可还原的地址：存进库只会撑爆磁盘，引用时还会被误报成「图片已过期」。
+    #[test]
+    fn inbound_image_drops_inline_payloads() {
+        let inline = vec![MessageSegment::Image {
+            url: Some("base64://AAAA".to_string()),
+            file: None,
+            data: Some(vec![0, 1, 2]),
+            file_id: None,
+        }];
+        assert_eq!(first_image(&inline), None);
+
+        // URL 是内联负载、但实现端另外给了 file_id：退回 file_id，仍然可还原
+        let with_id = vec![MessageSegment::Image {
+            url: Some("data:image/png;base64,AAAA".to_string()),
+            file: None,
+            data: None,
+            file_id: Some("E2A1B3C4".to_string()),
+        }];
+        assert_eq!(first_image(&with_id).as_deref(), Some("fileid://E2A1B3C4"));
     }
 
     #[test]

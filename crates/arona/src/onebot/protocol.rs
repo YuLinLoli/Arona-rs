@@ -176,15 +176,57 @@ pub fn format_face(id: Option<&str>) -> String {
     }
 }
 
+/// 按 UTF-8 边界安全截断，绝不切碎多字节字符。
+fn truncate_utf8(value: &str, max: usize) -> &str {
+    if value.len() <= max {
+        return value;
+    }
+    let mut end = max;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
+/// 内联负载（`base64://…` / `data:…`）：既不是可复用的地址，也不是本地路径。
+/// 展示时要截断，留档时要丢弃——两边都用这一个判断，别再各写一份前缀匹配。
+pub fn is_inline_media(value: &str) -> bool {
+    value.starts_with("base64://") || value.starts_with("data:")
+}
+
+/// 图片段在日志/控制台/`EventContext::text` 里的取值提示。
+///
+/// 实现端经常把内联图片直接塞进 `url`/`file`（`base64://…` 或 `data:…;base64,…`），一张
+/// 600×600 的图就是几百 KB 到几 MB。这串东西会经 `runtime::console::write_line` →
+/// `runtime::log::push_live` 进内存日志缓冲（按**行数**计上限，不按字节），几百条消息就能
+/// 吃掉几百 MB；按天日志文件同样会被撑爆。所以这里统一按长度截断，只保留足以辨认来源的
+/// 前缀与原始字节数。普通外链 URL 只有几十字节，原样保留。
+pub fn media_display(value: &str) -> String {
+    const MAX_PLAIN: usize = 256;
+    if let Some(payload) = value.strip_prefix("base64://") {
+        return format!("base64://<{} 字节>", payload.len());
+    }
+    if value.starts_with("data:") {
+        let meta = value.split(',').next().unwrap_or("data:");
+        return format!("{},<{} 字节>", truncate_utf8(meta, 64), value.len());
+    }
+    if value.len() > MAX_PLAIN {
+        return format!("{}…<{} 字节>", truncate_utf8(value, MAX_PLAIN), value.len());
+    }
+    value.to_string()
+}
+
 pub fn format_image(image: &MessageSegment) -> String {
     match image {
-        MessageSegment::Image { url: Some(url), .. } => format!("[arona:image,url={url}]"),
+        MessageSegment::Image { url: Some(url), .. } => {
+            format!("[arona:image,url={}]", media_display(url))
+        }
         MessageSegment::Image {
             file: Some(file), ..
-        } => format!("[arona:image,file={file}]"),
+        } => format!("[arona:image,file={}]", media_display(file)),
         MessageSegment::Image {
             file_id: Some(id), ..
-        } => format!("[arona:image,file_id={id}]"),
+        } => format!("[arona:image,file_id={}]", media_display(id)),
         _ => "[arona:image]".to_string(),
     }
 }

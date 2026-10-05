@@ -185,7 +185,9 @@ fn format_segment(segment: &MessageSegment) -> String {
                 match media_hint(url, file) {
                     // 三个槽都没内容时才轮到 file_id：控制台那行要看得出这条到底是哪张图
                     hint if hint.is_empty() => match file_id.as_deref() {
-                        Some(id) if !id.is_empty() => format!("[arona:image,file_id={id}]"),
+                        Some(id) if !id.is_empty() => {
+                            format!("[arona:image,file_id={}]", protocol::media_display(id))
+                        }
                         _ => "[arona:image]".to_string(),
                     },
                     hint => format!("[arona:image,{hint}]"),
@@ -198,8 +200,8 @@ fn format_segment(segment: &MessageSegment) -> String {
 /// 控制台里媒体段的取值提示：URL 优先，其次文件路径
 fn media_hint(url: &Option<String>, file: &Option<String>) -> String {
     match (url, file) {
-        (Some(url), _) => format!("url={url}"),
-        (_, Some(file)) => format!("file={file}"),
+        (Some(url), _) => format!("url={}", protocol::media_display(url)),
+        (_, Some(file)) => format!("file={}", protocol::media_display(file)),
         _ => String::new(),
     }
 }
