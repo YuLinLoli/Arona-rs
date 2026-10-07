@@ -1817,6 +1817,8 @@ impl AronaGui {
         ui.add_space(2.0);
 
         let filter = self.log_filter.trim().to_lowercase();
+        // 过滤词先折成 char 表，整帧就这一份小拷贝；逐行再拷一份全文是几百 MB 瞬时的主要来源
+        let needle: Vec<char> = filter.chars().map(fold_char).collect();
         let errors_only = self.log_errors_only;
         let auto_scroll = self.log_auto_scroll;
         let dark = ui.visuals().dark_mode;
@@ -1825,7 +1827,7 @@ impl AronaGui {
         let lines: Vec<&crate::runtime::log::LiveLine> = self.log_lines[start..]
             .iter()
             .filter(|line| !errors_only || is_alert_line(line))
-            .filter(|line| filter.is_empty() || line.text.to_lowercase().contains(&filter))
+            .filter(|line| contains_ci(&line.text, &needle))
             .collect();
         // 日志区单独一块「终端」底色的圆角面板：和页面其它部分拉开层次，长时间阅读时不刺眼
         let visuals = ui.visuals().clone();
@@ -1900,7 +1902,7 @@ fn draw_log_lines(
                     },
                 );
                 job.append(
-                    &line.text,
+                    &display_body(&line.text),
                     0.0,
                     egui::TextFormat {
                         font_id: text_font.clone(),
@@ -2017,6 +2019,55 @@ fn load_window_icon() -> Option<egui::IconData> {
 /// 是否为等宽艺术字行（启动横幅用的方框绘制/方块字符）：这类行在 GUI 里不能折行
 fn is_ascii_art_line(text: &str) -> bool {
     text.chars().any(|c| matches!(c, '\u{2500}'..='\u{259F}'))
+}
+
+/// GUI 单行最多排多少**字符**。
+///
+/// 内存日志缓冲那边按 16 KiB 一行了断，但那一档是"不炸内存"而不是"能看"：面板把每一行都
+/// 合成 `LayoutJob` 逐字排版，`ScrollArea` 又不虚拟化，于是"最近 3000 行"里只要掺着几条长行，
+/// 一帧就要排几十 MB 的字形。日志行通常不到 240 字节，这里压到 600 字符只会切到那几条病态行，
+/// 而完整内容本来就在按天日志文件里。
+const DISPLAY_LINE_MAX: usize = 600;
+
+/// 显示用的行正文：超长就在字符边界上切一刀并标出总长（不动缓冲里的原文）。
+fn display_body(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.char_indices().nth(DISPLAY_LINE_MAX).is_none() {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let cut = text
+        .char_indices()
+        .map(|(i, _)| i)
+        .nth(DISPLAY_LINE_MAX)
+        .unwrap_or(text.len());
+    let total = text.chars().count();
+    std::borrow::Cow::Owned(format!(
+        "{}…<本行共 {total} 字符，完整内容见日志文件>",
+        &text[..cut]
+    ))
+}
+
+/// 大小写折叠（按单字符；个别一对多的映射匹配不上，日志过滤这一用途可以接受）
+fn fold_char(ch: char) -> char {
+    ch.to_lowercase().next().unwrap_or(ch)
+}
+
+/// 不拷整行的子串检查：`line.text.to_lowercase()` 是**每帧一次全缓冲重抄**，
+/// 几千行 × 每行十几 KB 就是面板发沉的那笔瞬时分配。
+fn contains_ci(hay: &str, needle: &[char]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    let mut window: Vec<char> = Vec::with_capacity(needle.len());
+    for ch in hay.chars().map(fold_char) {
+        if window.len() == needle.len() {
+            window.remove(0);
+        }
+        window.push(ch);
+        if window.len() == needle.len() && window.iter().eq(needle.iter()) {
+            return true;
+        }
+    }
+    false
 }
 
 /// 常规文本色：黑夜模式纯白、白天模式纯黑（面板里没被特殊染色的文字都用它）
@@ -3333,5 +3384,99 @@ mod tests {
                 row.rect
             );
         }
+    }
+
+    /// 显示层那把闸：病态长行只画开头一截并指路日志文件，缓冲里的原文一个字都不动。
+    #[test]
+    fn the_log_view_cuts_absurdly_long_lines_only_on_screen() {
+        let plain = "V/Bot.1493074321: [测试群(993871966)] 收到一条消息";
+        assert_eq!(display_body(plain), plain, "没超限的行不该被动");
+
+        let text = "图".repeat(DISPLAY_LINE_MAX + 2_400);
+        let shown = display_body(&text);
+        assert!(
+            shown.contains("完整内容见日志文件"),
+            "截断之后要指路完整内容在哪: {}",
+            shown.chars().take(40).collect::<String>()
+        );
+        assert_eq!(
+            shown.chars().next().unwrap(),
+            '图',
+            "截断从行首切，开头必须还在"
+        );
+        assert!(
+            shown.chars().count() < DISPLAY_LINE_MAX + 40,
+            "显示用的长度必须有界，实得 {}",
+            shown.chars().count()
+        );
+
+        // 接线：画出来的那一块确实走显示层截断，而缓冲仍是全文
+        let line = crate::runtime::log::LiveLine {
+            time: "11:30:03".to_string(),
+            text,
+            stderr: false,
+        };
+        let lines = [&line];
+        let ctx = egui::Context::default();
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(900.0, 600.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .show(ctx, |ui| draw_log_lines(ui, &lines, true, false));
+            },
+        );
+        let drawn: String = output
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::epaint::Shape::Text(shape) => Some(shape.galley.text().to_string()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(
+            drawn.contains("完整内容见日志文件"),
+            "渲染没走显示层截断，画出了 {} 字符",
+            drawn.chars().count()
+        );
+        assert_eq!(
+            line.text.chars().count(),
+            DISPLAY_LINE_MAX + 2_400,
+            "截断只许发生在显示侧，缓冲不能被动"
+        );
+    }
+
+    /// 过滤改成就地比对：行为不能变（大小写、中文、匹配点在行中间、空串、超长过滤词）。
+    #[test]
+    fn the_log_filter_matches_without_recopying_each_line() {
+        let hay = "V/Bot: [arona:IMAGE,url=https://multimedia.nt.qq.com.cn/download?A=1] 岚凛凛";
+        let needle = |text: &str| -> Vec<char> { text.chars().map(fold_char).collect() };
+        assert!(contains_ci(hay, &needle("image")), "正文大写、过滤词小写");
+        assert!(
+            contains_ci(hay, &needle("url=https")),
+            "匹配点在行中间，且两边大小写不同"
+        );
+        assert!(contains_ci(hay, &needle("岚凛")), "中文照样能匹配");
+        assert!(
+            contains_ci(hay, &needle("download?A=1] 岚")),
+            "跨过边界也要命中"
+        );
+        assert!(contains_ci(hay, &needle("A")), "单字符");
+        assert!(
+            contains_ci(hay, &needle(hay)),
+            "过滤词与整行等长时就是整行本身"
+        );
+        assert!(contains_ci(hay, &[]), "空过滤词等于不过滤");
+        assert!(!contains_ci(hay, &needle("没有这个串")));
+        assert!(
+            !contains_ci("短", &needle("短的多的过滤词")),
+            "过滤词比正文长不可能命中"
+        );
     }
 }
