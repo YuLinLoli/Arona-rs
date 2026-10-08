@@ -4,7 +4,7 @@
 //! （见 [`plugin::dynamic`]），框架本体不链接任何功能插件。
 //!
 //! 这个 crate 就是插件开发时引入的唯一依赖：`arona = { path = "...", default-features = false }`，
-//! 插件在 [`runtime`] / [`config`] / [`onebot`] / [`services`] / [`quartz`] 里复用框架能力，
+//! 插件在 [`runtime`] / [`config`] / [`onebot`] / [`services`] / [`quartz`] / [`views`] 里复用框架能力，
 //! 生命周期回调由框架驱动，插件自己不提供 `main`。
 
 #[cfg(feature = "gui")]
@@ -23,6 +23,8 @@ pub mod plugin;
 pub mod quartz;
 pub mod runtime;
 pub mod services;
+/// 会话展示板：插件上报"这个会话里我订了什么"，框架 GUI 按通用形状列出来
+pub mod views;
 
 use crate::onebot::application::OneBotApplication;
 use crate::onebot::business::BusinessHandler;

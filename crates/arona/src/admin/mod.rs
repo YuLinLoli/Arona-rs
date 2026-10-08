@@ -60,6 +60,29 @@ pub fn features() -> Vec<runtime_config::Feature> {
     runtime_config::features()
 }
 
+/// 某个群在会话展示板上的行（GUI「群管理」页那一块）。每一项是
+/// `(提供它的插件展示名, 一行)`；展示名解析不到时退回插件 id。
+///
+/// 框架这边只搬运，不解释：标题与条目文本都是插件经
+/// [`HostBridge::views`](crate::plugin::abi::HostBridge::views) 交上来的，
+/// 所以这里既不认识"UP 主"也不认识"番剧"。
+pub fn peer_rows(group_id: i64) -> Vec<(String, crate::views::ViewRow)> {
+    let names = crate::plugin::metas();
+    crate::framework::Framework::global()
+        .views()
+        .rows_of(group_id)
+        .into_iter()
+        .map(|(plugin, row)| {
+            let display = names
+                .iter()
+                .find(|meta| meta.id == plugin)
+                .map(|meta| meta.name.to_string())
+                .unwrap_or(plugin);
+            (display, row)
+        })
+        .collect()
+}
+
 /// 登记一个可分群开关的功能：插件在 install 阶段调用，GUI 的「功能开关」页会自动列出。
 /// 这就是框架留给插件的权限/开关接口——功能属于插件，开关与黑名单的存取由框架统一管理。
 ///

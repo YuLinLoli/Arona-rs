@@ -602,10 +602,11 @@ impl PluginManager {
         framework.commands().unregister_plugin(id);
         let services = framework.container().revoke_plugin(id);
         let boards = framework.services().revoke(id);
+        let shown = framework.views().clear_plugin(id);
         framework.health().forget(id);
-        if tasks + jobs + hooks + services + boards > 0 {
+        if tasks + jobs + hooks + services + boards + shown > 0 {
             log::info(format!(
-                "已回收插件 {id} 的资源: 后台任务 {tasks} / 定时任务 {jobs} / 事件订阅 {hooks} / 共享能力 {services} / 服务开关 {boards}"
+                "已回收插件 {id} 的资源: 后台任务 {tasks} / 定时任务 {jobs} / 事件订阅 {hooks} / 共享能力 {services} / 服务开关 {boards} / 展示条目 {shown} 个会话"
             ));
         }
     }

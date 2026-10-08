@@ -778,8 +778,10 @@ extern "C" fn collect_info(info: *const JobInfo, user: *mut c_void) -> bool {
     true
 }
 
-/// 读一个 C 字符串：空指针当空串，非法 UTF-8 走 lossy（跨边界不该因为对面手滑而崩）
-fn read_c(ptr: *const c_char) -> String {
+/// 读一个 C 字符串：空指针当空串，非法 UTF-8 走 lossy（跨边界不该因为对面手滑而崩）。
+/// 跨边界的几条通道都用这一份（[`crate::views`] 的展示板上报也一样），免得两处各写一遍
+/// "怎么才不算读坏别人的内存"。
+pub(crate) fn read_c(ptr: *const c_char) -> String {
     if ptr.is_null() {
         return String::new();
     }

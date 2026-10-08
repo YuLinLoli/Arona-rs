@@ -246,6 +246,34 @@ fn card(dark: bool) -> egui::Frame {
         .inner_margin(egui::Margin::symmetric(12, 10))
 }
 
+/// 群列表里那几行"插件登记的条目"的预览：最多三行、每行最多三个名字，多出来的折成
+/// `…共 N 项`。全量在右边的详情卡片里看——左侧列表是要滚的，一家插件订满几十个人时
+/// 这里会把别的群挤出屏幕。
+///
+/// 单独抽成一个**纯函数**是因为：这段拼法一旦错行（漏了名字、把上限当成了总数），
+/// 在真实面板上要人肉盯才知道，而它又是唯一决定"这个群看上去订了谁"的地方。
+fn shown_preview(rows: &[(String, crate::views::ViewRow)]) -> String {
+    const LINE_LIMIT: usize = 3;
+    const ITEM_LIMIT: usize = 3;
+    let mut out = String::new();
+    for (_, row) in rows {
+        if row.items.is_empty() {
+            continue;
+        }
+        let head = row.items[..row.items.len().min(ITEM_LIMIT)].join("、");
+        let more = if row.items.len() > ITEM_LIMIT {
+            format!("…共 {} 项", row.items.len())
+        } else {
+            String::new()
+        };
+        out.push_str(&format!("\n　{}：{head}{more}", row.label));
+        if out.matches('\n').count() >= LINE_LIMIT {
+            break;
+        }
+    }
+    out
+}
+
 /// 分节小标题
 fn section_title(ui: &mut egui::Ui, text: &str) {
     ui.add(egui::Label::new(egui::RichText::new(text).strong().size(15.0)).selectable(false));
@@ -743,8 +771,11 @@ impl AronaGui {
                     } else {
                         String::new()
                     };
+                    // 插件登记的条目（"这个群订了谁"）。只搬运不解释：标题与文字都是插件给的。
+                    // 列表里最多三行、每行最多三个名字，全量到右边的详情卡片去看。
+                    let shown = shown_preview(&admin::peer_rows(info.group_id));
                     let label = egui::RichText::new(format!(
-                        "{mark} {}\n　{} · {} 人{tag}",
+                        "{mark} {}\n　{} · {} 人{tag}{shown}",
                         info.name, info.group_id, info.member_count
                     ))
                     .size(13.5);
@@ -815,6 +846,44 @@ impl AronaGui {
                 }
             });
         });
+        // 插件在这个群登记的条目。框架只搬运：不认得这些标题与名字是什么，也不据它们做任何判定。
+        let shown = admin::peer_rows(group_id);
+        if !shown.is_empty() {
+            ui.add_space(10.0);
+            card_row(ui, dark, |ui| {
+                section_title(ui, "订阅条目");
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(
+                            "由各插件登记、框架只负责列出来。私聊/好友上的订阅这里不显示——\
+                             GUI 只有群这一张列表，那一路用插件自己的命令查。",
+                        )
+                        .size(12.0)
+                        .weak(),
+                    )
+                    .selectable(false),
+                );
+                ui.add_space(4.0);
+                // 来路不止一个插件时才标插件名：只有一家时那一行字是噪音
+                let many = shown
+                    .iter()
+                    .map(|(plugin, _)| plugin.as_str())
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len()
+                    > 1;
+                for (plugin, row) in &shown {
+                    if many {
+                        ui.weak(plugin);
+                    }
+                    let items = if row.items.is_empty() {
+                        "（现在没有）".to_string()
+                    } else {
+                        row.items.join("、")
+                    };
+                    ui.label(format!("{}：{items}", row.label));
+                }
+            });
+        }
         ui.add_space(10.0);
         card_row(ui, dark, |ui| {
             section_title(ui, "功能开关");
@@ -3276,6 +3345,86 @@ mod tests {
         assert_eq!(ThemePref::parse("  Dark  "), ThemePref::Dark);
         assert_eq!(ThemePref::parse(""), ThemePref::System);
         assert_eq!(ThemePref::parse("乱写的"), ThemePref::System);
+    }
+
+    /// 群列表里的订阅条目预览：三行封顶、每行三个名字封顶，但截断的那一行要交代总数——
+    /// 只印前三个而不说"共 5 项"，看的人会把这三个当成这个群订阅的全部。
+    #[test]
+    fn the_group_list_previews_three_rows_and_still_tells_the_total() {
+        let row = |label: &str, n: usize| crate::views::ViewRow {
+            label: label.to_string(),
+            items: (1..=n).map(|i| format!("{label}{i}")).collect(),
+        };
+        let rows = vec![
+            ("bilibili".to_string(), row("UP 主", 2)),
+            ("bilibili".to_string(), row("番剧", 5)),
+            ("bilibili".to_string(), row("直播", 0)),
+            ("bilibili".to_string(), row("特别关注", 1)),
+            ("bilibili".to_string(), row("第五行", 1)),
+        ];
+        let preview = shown_preview(&rows);
+        assert_eq!(preview.matches('\n').count(), 3, "只该画三行: {preview}");
+        assert!(
+            preview.contains("UP 主：UP 主1、UP 主2"),
+            "没截断的那行不该带尾巴: {preview}"
+        );
+        assert!(
+            preview.contains("番剧3…共 5 项"),
+            "截断了的要报总数: {preview}"
+        );
+        assert!(!preview.contains("直播"), "现在没东西的那一档不该占一行");
+        assert!(
+            !preview.contains("第五行"),
+            "第四行该被三行上限挡住: {preview}"
+        );
+        assert_eq!(
+            shown_preview(&[]),
+            "",
+            "没登记过就是空串，列表行不该多出空白"
+        );
+    }
+
+    /// 预览确实排得进那块 300 宽的左侧面板：多行 label 在 egui 里要自己折行，
+    /// 只测字符串拼法测不出"名字太长把面板撑爆/被裁掉"这一类只在版面上才看得见的问题。
+    #[test]
+    fn the_preview_survives_layout_inside_the_group_panel() {
+        let rows = vec![(
+            "bilibili".to_string(),
+            crate::views::ViewRow {
+                label: "UP 主".to_string(),
+                items: vec![
+                    "一个很长很长很长的小电视名字".to_string(),
+                    "央视新闻".to_string(),
+                ],
+            },
+        )];
+        let text = format!("● 测试群\n　20001 · 12 人{}", shown_preview(&rows));
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(300.0, 240.0));
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let _ =
+                        ui.selectable_label(false, egui::RichText::new(text.as_str()).size(13.5));
+                });
+            },
+        );
+        let laid: String = output
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::epaint::Shape::Text(shape) => Some(shape.galley.text().to_string()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            laid.contains("一个很长很长很长的小电视名字") && laid.contains("央视新闻"),
+            "订阅的名字必须真出现在版面上，一个字符都不能丢: {laid:?}"
+        );
     }
 
     /// 底栏必须排在中央面板之前：egui 里中央面板会吃满剩余高度，之后再补底栏，

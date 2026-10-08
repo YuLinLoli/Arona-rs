@@ -369,6 +369,31 @@ impl PluginContext {
         crate::runtime::purge::cancel(name);
     }
 
+    // ==================== 会话展示板 ====================
+
+    /// 把"这个群在我这儿订了些什么"交给框架，GUI 的群管理页会把它列出来。
+    ///
+    /// 框架只存 `(标题, 条目)` 这一种形状，**一个字都不解释**：标题与条目文本全由插件给，
+    /// 框架本体里因此不会认识任何某个插件的业务概念。覆盖式——每次调用以这次给的为准，
+    /// 传空切片等于 [`clear_rows`](Self::clear_rows)。
+    ///
+    /// 只对**群**会话有意义：GUI 没有好友/私聊列表页，私聊那一路用插件自己的命令查即可。
+    /// 什么时候报由插件决定（启动时一次、订阅表每次变更后一次就够）——这张板子只是给人看一眼
+    /// 的现状，不参与任何判定，插件一次都没报也不会坏什么。
+    pub fn publish_rows(&self, peer: i64, rows: &[crate::views::ViewRow]) -> bool {
+        crate::views::submit_publish(self.framework(), self.plugin_id(), peer, rows)
+    }
+
+    /// 摘掉本插件在某个会话上的展示行（那个群现在什么都不订了）
+    pub fn clear_rows(&self, peer: i64) {
+        crate::views::submit_clear(self.framework(), self.plugin_id(), peer);
+    }
+
+    /// 摘掉本插件名下所有会话的展示行。一般用不上：插件被停用时框架按归属自己收。
+    pub fn clear_all_rows(&self) {
+        crate::views::submit_clear_plugin(self.framework(), self.plugin_id());
+    }
+
     // ==================== 配置 ====================
 
     /// 取自己的一块强类型配置（须已在 install 阶段用 [`PluginRegistrar::config`] 登记）

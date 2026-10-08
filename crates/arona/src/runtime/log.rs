@@ -334,6 +334,7 @@ pub(crate) fn host_bridge() -> &'static HostBridge {
         runtime: crate::runtime::reactor::host_handle,
         http: crate::runtime::http::host_submit,
         jobs: crate::quartz::host_jobs,
+        views: crate::views::host_views,
     })
 }
 

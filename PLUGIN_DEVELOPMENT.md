@@ -22,7 +22,7 @@ plugins/hello/             # 示例插件：name=hello-plugin, crate-type=["cdyl
 版本约定：框架与 host 同为 `1.1.0`，插件版本号各自演进。
 **插件接口的破坏性改动抬 `arona::plugin::FRAMEWORK_API_VERSION`**（与 crate 版本号无关），见 §6；
 **插件会读的那个类型换了布局**（`Framework`、`CommandContext`、`EventBody`、`BodyFilter`、`OneBotApi`
-这些，加字段/加变体/改字段类型）另抬 `arona::plugin::abi::ABI_LAYOUT`（当前 `7`），见 §22。
+这些，加字段/加变体/改字段类型）另抬 `arona::plugin::abi::ABI_LAYOUT`（当前 `8`），见 §22。
 
 运行期的落盘目录由框架统一规定（见 §7），插件不自己挑地方：
 
@@ -1074,6 +1074,44 @@ async fn demo(ctx: &arona::runtime::dispatcher::CommandContext) {
 **收到的**消息只会是前两种；`Temp` 只在出站时用，`target.group()` 会把它报成来源群，
 门控（§13）与出站记账都按那个群算。
 
+### 14.3 会话展示板：让 GUI 的「群管理」页列出你的订阅条目
+
+框架 GUI 只有一张群列表，它读不到、也不该去读插件自己的 `data/<插件>/store.yml`（框架本体里不许
+出现任何插件信息）。想让用户在面板里看见"这个群订了谁"，得**由你报上来**：
+
+```rust
+use arona::views::ViewRow;
+
+// 一个群一组行；标题与条目文本都随你，框架只搬运不解释
+ctx.publish_rows(
+    20001,
+    &[
+        ViewRow::new("UP 主", ["央视新闻", "哔哩哔哩会员购"]),
+        ViewRow::new("番剧", ["ss38942"]),
+    ],
+);
+ctx.clear_rows(20001);      // 这个群现在什么都不订了，把那一格摘掉
+ctx.clear_all_rows();       // 全摘（一般用不上：插件被停用时框架按归属自己收）
+```
+
+几条要记住的：
+
+* **覆盖式**。同一个群再报一次是以这次为准，不去追加；报空切片等于 `clear_rows`。
+* **只有群这一张列表**。框架 GUI 没有好友/私聊页，`Private(QQ)` 那一路的订阅在这里没有地方放，
+  用你自己的命令查即可（这也是"个人订阅不在 GUI 显示"的由来，不是缺陷）。
+* **别每轮都报**。这张板子是给人看一眼的现状，不是心跳。B 站插件的做法是把上报挂在状态库
+  落盘那一手之后，并用一份"上一次报出去的内容"做对比：检测任务每轮都写水位线，订阅面没变时
+  就一次门都不敲。
+* **什么时候报由你定**，但至少要报两次：`start` 里补一次（盘上的订阅表早就在了，而板子是内存里的
+  现状，装载后不主动报就一直是空的），以及每次订阅关系变更后一次。
+* 上报失败不会让你的命令或任务出问题：通道内部出岔子只折成返回码并记一条日志（`publish_rows`
+  返回 `false`），展示板不参与任何判定。
+
+跨边界的形状是 `HostBridge::views` + `ViewSpec`（布局 8 起）。行与条目编在**一段** C 字符串里：
+行之间 `\n`、行内标题与条目之间 `\t`，而名字里的控制字符在你这边就被换成空格——所以外来昵称
+伪造不出第二行。这张表的结构体字段布局**不出边界**，理由与 §10 的定时任务同一套：dll 按自己
+编译期的偏移读写宿主实例上的结构体，错位过的实测结果是"装载、启动都正常，但那件事就是没生效"。
+
 ## 15. 新增一个插件
 
 插件是**独立仓库、独立 crate**：不进框架的 workspace，也不需要框架侧改任何文件。
@@ -1142,12 +1180,12 @@ async fn demo(ctx: &arona::runtime::dispatcher::CommandContext) {
 装载成功的标志是这三行日志：
 
 ```
-[Arona] 插件 ABI 握手通过: 布局 7，契约 1.0.0
+[Arona] 插件 ABI 握手通过: 布局 8，契约 1.0.0
 [Arona] 已装载动态插件: HelloPlugin 0.1.0 (hello_plugin.dll)
 [Arona] 插件已启动: HelloPlugin v0.1.0
 ```
 
-那个「布局 7」是当前符号布局版本（§22），每次抬它这里的打印就跟着变，核对时以 §22 为准。
+那个「布局 8」是当前符号布局版本（§22），每次抬它这里的打印就跟着变，核对时以 §22 为准。
 
 `plugins/<id>/plugin.yml`、`config/<id>/arona.yml` 由框架在装载时自动写出来，GUI「插件管理」页
 立刻能开关它。换插件、删插件都不必重新编译框架，**但必须重启框架**——`plugins/` 只在启动时扫一遍，
@@ -1480,13 +1518,13 @@ mirai 靠 JVM ClassLoader 把插件隔离开，Rust 没有等价物。本框架�
 
 单个文件在任何一步失败都只影响它自己：日志里一条中文原因，其余插件照常装配。
 
-### 宿主的上行通道（接管的就这五样，判据看状态挂在哪）
+### 宿主的上行通道（接管的就这六样，判据看状态挂在哪）
 
 mirai 的插件和框架在同一个 ClassLoader 树里，`MiraiInstance` 只有一份。这里不行：dll 把 `arona`
 **静态链接成了自己的第二份**，于是 `Framework::global()`、日志文件句柄、tokio 句柄这些进程级状态
 天生有两套，插件写进自己那套宿主永远看不见——表现为"命令登记了却没人路由"这种最难查的静默失效。
 
-装载器在握手通过之后、造实例之前，把宿主真正在跑的五样东西交给插件（`export_arona_plugin!` 生成的
+装载器在握手通过之后、造实例之前，把宿主真正在跑的六样东西交给插件（`export_arona_plugin!` 生成的
 `arona_plugin_host` 符号，接管失败直接拒载）：
 
 | 交出去的东西 | 插件侧的效果 |
@@ -1496,11 +1534,12 @@ mirai 的插件和框架在同一个 ClassLoader 树里，`MiraiInstance` 只有
 | 宿主登记的 tokio 句柄 | 在 GUI 主线程上装配插件时（面板里关掉再打开），`ctx.spawn` / 定时任务照样投得出去 |
 | 宿主的 HTTP 代发通道 | `arona::runtime::http::*`（§14.1）把请求递给宿主那份 reqwest，插件不必自带客户端；举 `wanting_headers` 旗还能把响应头（含跳转链上每一跳的 `Set-Cookie`）一并拿回来 |
 | 宿主的定时任务通道 | `ctx.daily_job`/`repeat_job`/`single_job`/`delay_job`/`remove_job` 与 `arona::quartz::*` 都落到宿主那张表；条目由宿主分配与释放，插件只交一个回调句柄（§10） |
+| 宿主的会话展示板 | `ctx.publish_rows`/`clear_rows` 把"这个会话里我订了什么"交给宿主，GUI 的「群管理」页按通用形状列出来（§14.3）。框架不读插件的数据文件，也不解释这些文字 |
 
 所以**插件写起来和同仓静态编译时一样**：能用 `ctx` 就用 `ctx`（下面那条禁令的真实含义）。
 接管由宏与装载器完成，插件代码里没有任何对应的手续。
 
-但"接管了五样"只意味着**这五样以及挂在它们身后的东西**是通的。判断某个进程级自由函数在插件里
+但"接管了六样"只意味着**这六样以及挂在它们身后的东西**是通的。判断某个进程级自由函数在插件里
 能不能用，要**过两道关**，缺一道都不算通：
 
 **① 状态挂在哪。** 挂在 `Framework` 实例上的才可能通（`quartz`、`container`、`plugin::manager`、
@@ -1539,7 +1578,8 @@ dll 把 `arona` **连同它的全部依赖**静态链接成了第二份，所以
 （`EventBody::Meta` 多带一个 `MetaInfo`、`BodyFilter` 多两档、`CommandContext` 末尾多一个 `framework`、
 `OneBotApi` 由零宽单元类型变成持有实例引用的结构体）；`5 → 6` 是 `HostBridge` 多一条排期通道，
 从此 `quartz` 的 `Scheduler`/`TaskEntry` 不再出界；`6 → 7` 是代发 HTTP 要能把**响应头**交回来
-（`HttpCall` 末尾多一个 `want_headers`、`HttpDone` 末尾多两段），§14.1。**宿主侧的四个导出符号一个字都没改，
+（`HttpCall` 末尾多一个 `want_headers`、`HttpDone` 末尾多两段），§14.1；`7 → 8` 是多一条会话展示板
+   通道（`HostBridge::views` + `ViewSpec`），插件把自己的订阅条目报上来给 GUI 列，§14.3。**宿主侧的四个导出符号一个字都没改，
 也算改 ABI**——这条最容易漏。同理，给跨镜像 `trait` 追加方法（vtable 变长）也要抬。
 
 #### 还欠着的两处（不影响插件正常写法，但排查时值得知道）
@@ -1676,7 +1716,7 @@ tokio 也被静态链接成了两份，而"当前在哪个运行时里"这个上
 
 | 项 | 来源 | 不一致的后果 |
 | --- | --- | --- |
-| 符号布局版本 | `arona::plugin::abi::ABI_LAYOUT`（当前 7） | 四个导出符号的签名、或**插件会读的那个类型**（`Framework`、`CommandContext`、`EventBody`、`BodyFilter`、`OneBotApi`）换了布局，新旧不可混用。布局 6 起 `quartz` 的 `Scheduler`/`TaskEntry` **已经不出界**（排期走宿主通道，§10），那两个结构内部随便改；布局 7 起 `HttpCall`/`HttpDone` 多的那几段也在这一号里——**跨边界的结构体加字段就是抬布局的事**，私有与否不看 |
+| 符号布局版本 | `arona::plugin::abi::ABI_LAYOUT`（当前 8） | 四个导出符号的签名、或**插件会读的那个类型**（`Framework`、`CommandContext`、`EventBody`、`BodyFilter`、`OneBotApi`）换了布局，新旧不可混用。布局 6 起 `quartz` 的 `Scheduler`/`TaskEntry` **已经不出界**（排期走宿主通道，§10），那两个结构内部随便改；布局 7 起 `HttpCall`/`HttpDone` 多的那几段也在这一号里——**跨边界的结构体加字段就是抬布局的事**，私有与否不看；布局 8 起 `HostBridge` 多一条会话展示板通道（`ViewSpec`，§14.3），那张表的字段布局同样不出界 |
 | 框架契约版本 | `FRAMEWORK_API_VERSION`（主版本相等 + 框架次版本不低于插件要求） | 插件用到了宿主还没有的接口 |
 | rustc 版本与 host 三件套 | 两边各自 `rustc -vV` 的 `release` / `host` 两行 | `dyn Trait` 胖指针布局、泛型单态化产物可能对不上 |
 | 目标三元组 + profile + CRT 链接方式 | `TARGET` / `PROFILE` / `crt-static` | debug 与 release 混编会炸；两套 MSVC 运行库会各自分配释放内存 |
@@ -1705,7 +1745,7 @@ tokio 也被静态链接成了两份，而"当前在哪个运行时里"这个上
 ### 发布插件时必须写明的三件事
 
 ```
-适用于 Arona-rs 1.1.0（框架契约 1.0.0，符号布局 7）
+适用于 Arona-rs 1.1.0（框架契约 1.0.0，符号布局 8）
 构建工具链：rustc 1.98.0，x86_64-pc-windows-msvc，--release，crt-static
 下载后放进 <框架运行目录>/plugins/<你的id>/，重启框架
 ```

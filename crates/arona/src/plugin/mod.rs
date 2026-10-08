@@ -590,6 +590,13 @@ mod tests {
                         tokio::time::sleep(Duration::from_secs(3600)).await;
                     }
                 });
+                ctx.publish_rows(
+                    77001,
+                    &[crate::views::ViewRow::new(
+                        "回收自检条目",
+                        ["第一个", "第二个"],
+                    )],
+                );
                 Ok(())
             }
 
@@ -626,6 +633,11 @@ mod tests {
             !framework.commands().commands_of(ID).is_empty(),
             "命令应已登记"
         );
+        assert_eq!(
+            framework.views().rows_of(77001).len(),
+            1,
+            "展示条目应记在插件名下"
+        );
 
         manager.disable(&plugin);
         assert!(
@@ -647,11 +659,22 @@ mod tests {
             "服务开关应随停用人一起撤掉"
         );
         assert!(!framework.commands().has_commands_of(ID), "命令应全部撤回");
+        assert!(
+            framework.views().rows_of(77001).is_empty(),
+            "展示条目应随停用一起撤掉，GUI 不该留下僵尸行"
+        );
         assert_eq!(plugin.state(), PluginState::Disabled);
         // 回收只作用于本实例：进程默认实例那套注册表从头到尾没被碰过
         assert_eq!(crate::onebot::hooks::hook_count(ID), 0);
         assert!(crate::container::instance::<ProbeService>().is_none());
         assert!(!crate::quartz::exists("ContractResourceDaily"));
+        assert!(
+            crate::framework::Framework::global()
+                .views()
+                .rows_of(77001)
+                .is_empty(),
+            "隔离实例上报的条目不该串到进程默认实例那张板子上"
+        );
 
         let _ = std::fs::remove_dir_all(crate::runtime::paths::plugin_dir(ID));
         let _ = std::fs::remove_dir_all(crate::runtime::paths::plugin_config_dir(ID));

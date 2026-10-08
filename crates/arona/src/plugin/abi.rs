@@ -47,6 +47,9 @@ use std::os::raw::c_char;
 /// 7 = 代发 HTTP 能带响应头回来了：[`HttpCall::want_headers`] 与 [`HttpDone`] 末尾那两段
 ///     `headers`/`header_count`。B 站扫码那份票只在 `crossDomain` 跳转的 `Set-Cookie` 上，
 ///     插件拿不到响应头就等于拿不到登录态——这条通道是补给插件的一个真缺口。
+/// 8 = 再多一条通道：会话展示板（[`HostBridge::views`] + [`ViewSpec`]）。GUI 要按群列出插件登记的
+///     条目（"这个群订阅了谁"），而框架不许读插件的私有数据文件，所以只能由插件上报。
+///     表本身挂在 [`Framework`](crate::framework::Framework) 实例上（那也是加字段），读写走通道。
 ///
 /// **别以为改了 `HostBridge` 才算改 ABI**：[`HostBridge::framework`] 交出去的是擦成
 /// `*const c_void` 的实例指针，插件 dll 里那份框架代码按**它自己编译期的字段偏移**去读这个
@@ -55,7 +58,7 @@ use std::os::raw::c_char;
 /// 句柄去调自己那份 bundled sqlite）。所以 `Framework` 的字段序本身就是 ABI 的一部分，
 /// 动它必须抬这个版本号。同理，插件直接读的任何 `pub` 结构体/枚举（新变体、加字段、
 /// 改字段类型）也一样要抬，哪怕宿主侧的签名一个字都没动。
-pub const ABI_LAYOUT: u32 = 7;
+pub const ABI_LAYOUT: u32 = 8;
 
 /// 装载器名（写进 `plugins/<id>/plugin.yml` 的 `loader:` 与 GUI 插件列表）
 pub const DYNAMIC_LOADER: &str = "dynamic";
@@ -273,6 +276,39 @@ pub struct JobInfo {
 /// 宿主代管的排期通道。返回值见各操作号上的说明；负数留给"通道自己出错"。
 pub type Jobs = extern "C" fn(spec: *const JobSpec) -> i64;
 
+/// [`HostBridge::views`] 的操作号（面向插件的封装见 [`crate::views`]）。
+/// 与排期通道同一个理由：**一条通道带多个操作**，以后这项能力再加动作不必动 `HostBridge` 的字段数。
+pub const VIEW_PUBLISH: u32 = 0;
+/// 摘掉本插件在 `peer` 这一个会话上的行，返回 1 表示确实摘过
+pub const VIEW_CLEAR: u32 = 1;
+/// 摘掉本插件名下所有会话的行（`peer` 忽略），返回收掉的会话数
+pub const VIEW_CLEAR_PLUGIN: u32 = 2;
+
+/// 插件交给宿主的一份"会话展示"上报，给框架 GUI 的群管理页列出来。
+///
+/// 框架这边只有 `(会话号, 插件 id, 若干行"标题 + 条目")` 这个形状，**不懂条目是什么**：
+/// 标题与条目文本都是插件给的，框架一个字都不解释（框架本体里不许出现插件信息，见
+/// `PLUGIN_DEVELOPMENT.md`）。行与条目编在**一段** C 字符串里：行之间 `\n`、行内标题与条目之间
+/// `\t`，控制字符由插件侧在拼串之前换掉（拼法与解析都在 `crate::views`，两边同一份代码）。
+///
+/// 与 [`JobSpec`] 同一条约定：`plugin`/`rows` 指向插件内存里的 NUL 结尾 UTF-8，**只需在本次
+/// 调用期间有效**。字段顺序与类型本身就是 ABI 的一部分，改动必须抬 [`ABI_LAYOUT`]。
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ViewSpec {
+    /// [`VIEW_PUBLISH`] 到 [`VIEW_CLEAR_PLUGIN`] 之一
+    pub op: u32,
+    /// 插件 id：宿主按它分组，插件被停用时也按它把这一整块收干净
+    pub plugin: *const c_char,
+    /// 会话号（群号）。[`VIEW_CLEAR_PLUGIN`] 忽略它
+    pub peer: i64,
+    /// 行文本；[`VIEW_PUBLISH`] 必填（空串等于"这一档现在没东西"），其余两档给空指针
+    pub rows: *const c_char,
+}
+
+/// 宿主代管的会话展示通道。返回 `>=0` 是这次收下/摘掉的条数，负数是通道自己出错。
+pub type Views = extern "C" fn(spec: *const ViewSpec) -> i64;
+
 /// 装载时把宿主真正在跑的东西接过来，插件里的自由函数才不落空表。
 ///
 /// 字段顺序与签名就是 ABI 的一部分，改动必须抬 [`ABI_LAYOUT`]。
@@ -306,6 +342,13 @@ pub struct HostBridge {
     /// 编在 dll 里，dll 按自己编译期的偏移读写宿主的表，错位过一次的实测结果是「握手照放行、
     /// 插件装载启动都正常，但它排的定时任务一条都不跑」，且不报任何错。
     pub jobs: Jobs,
+    /// 把"这个会话里我订了些什么"交给宿主的展示板，GUI 的群管理页按通用形状列出来
+    /// （面向插件的封装见 [`crate::views`] 与 `PluginContext::publish_rows`）。
+    ///
+    /// 为什么不是"GUI 自己去读插件的 `data/<插件>/store.yml`"：那等于让框架认识某个插件的私有
+    /// 格式，硬边界不允许；为什么不是把表交给插件直接读写：与 [`Self::jobs`] 同一个理由，dll 会
+    /// 按自己编译期的偏移去动宿主的表。所以这张表的字段布局同样不出边界。
+    pub views: Views,
 }
 
 /// [`export_arona_plugin!`] 生成的 `arona_plugin_host` 的实现：把插件里的
@@ -333,6 +376,7 @@ pub unsafe fn attach_host(bridge: *const HostBridge) -> u8 {
     crate::runtime::http::attach_host(bridge.http);
     crate::runtime::log::attach_host(bridge);
     crate::quartz::attach_host(bridge.jobs);
+    crate::views::attach_host(bridge.views);
     HOST_ACCEPTED
 }
 
@@ -401,10 +445,18 @@ mod tests {
     /// `HostBridge` 要跨 dll 边界传给插件，字段数量与顺序本身就是 ABI 的一部分：
     /// 布局漂了（多一个字段、忘了 `repr(C)`）宿主就会按错位的方式取函数指针。
     #[test]
-    fn host_bridge_is_exactly_five_function_pointers() {
+    fn host_bridge_is_exactly_six_function_pointers() {
         use std::mem::{align_of, size_of};
-        assert_eq!(size_of::<HostBridge>(), 5 * size_of::<usize>());
+        assert_eq!(size_of::<HostBridge>(), 6 * size_of::<usize>());
         assert_eq!(align_of::<HostBridge>(), align_of::<usize>());
+    }
+
+    /// 展示板上报也是 ABI：`op` 是 u32，后面跟着指针所以要补满一个字，其余三个字段各占一个字。
+    #[test]
+    fn view_spec_is_four_words() {
+        const WORD: usize = std::mem::size_of::<usize>();
+        assert_eq!(std::mem::size_of::<ViewSpec>(), 4 * WORD);
+        assert_eq!(std::mem::align_of::<ViewSpec>(), WORD);
     }
 
     /// 任务描述也是 ABI：`op` 与 `kind` 两个 u32 凑满一个字，其余七个字段各占一个字。

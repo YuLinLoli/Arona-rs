@@ -84,6 +84,10 @@ pub struct Framework {
     health: Arc<HealthBoard>,
     /// 群成员/陌生人资料的按需读缓存。**追加在末尾**：字段序是跨边界 ABI 的一部分。
     peers: Arc<PeerCache>,
+    /// 会话展示板（插件上报"这个会话里我订了什么"，GUI 的群管理页读这张表）。
+    /// **同样追加在末尾**，理由同上；插件侧不许直接读写它，只经
+    /// [`HostBridge::views`](crate::plugin::abi::HostBridge::views) 递交。
+    views: Arc<crate::views::ViewBoard>,
 }
 
 /// 框架实例的构造选项（对应 mirai 的 `MiraiInstance.new { }`）
@@ -189,6 +193,7 @@ impl Framework {
             plugins: plugins.clone(),
             health: health.clone(),
             peers: Arc::default(),
+            views: Arc::default(),
         });
         // PluginManager 与 HealthBoard 要按归属回收资源、隔离停用插件，得知道整套注册表；
         // 它们先于 Framework 造出来，所以构造完再回填一次。
@@ -371,6 +376,12 @@ impl Framework {
     /// 插件装载器登记表
     pub fn loaders(&self) -> &Arc<LoaderRegistry> {
         &self.loaders
+    }
+
+    /// 会话展示板（插件上报"这个会话里我订了什么"，GUI 的群管理页读这一张表）。
+    /// 插件侧不许直接读写它——那份表在 dll 里会按自己编译期的偏移被操作，见 [`crate::views`]。
+    pub fn views(&self) -> &Arc<crate::views::ViewBoard> {
+        &self.views
     }
 
     /// 插件表与生命周期编排
