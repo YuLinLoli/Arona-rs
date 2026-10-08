@@ -63,7 +63,7 @@ fn guard_actual_len(url: &str, got: usize) -> Result<(), String> {
 type Submit = extern "C" fn(call: *const HttpCall, done: HttpDone, user: *mut c_void);
 
 /// 插件侧等待结果的凭据
-type Sender = oneshot::Sender<Result<Vec<u8>, String>>;
+type Sender = oneshot::Sender<Result<(Vec<u8>, Headers), String>>;
 
 /// dll 侧：宿主的代发入口，由 `plugin::abi::attach_host` 写入；宿主自己那份恒空
 static SUBMIT: OnceLock<Submit> = OnceLock::new();
@@ -99,7 +99,15 @@ pub struct Request {
     pub body: Body,
     /// 整个请求的超时；`None` 用宿主的 60 秒
     pub timeout: Option<Duration>,
+    /// 要不要把**响应头**一并拿回来（含重定向链上每一跳的 `Set-Cookie`）。
+    ///
+    /// 默认 `false`：逐条拷头是白花的钱，而且绝大多数调用只关心正文。要拿登录票的那一类才开
+    /// （B 站扫码那份票只出现在 `crossDomain` 跳转的 `Set-Cookie` 上，正文里没有）。
+    pub want_headers: bool,
 }
+
+/// 响应头：`Vec<(名字, 值)>`，同名可以有多条——`Set-Cookie` 正是这种，收进 `HashMap` 就只剩最后一条。
+pub type Headers = Vec<(String, String)>;
 
 impl Request {
     /// 只给 URL 的 GET
@@ -144,12 +152,23 @@ impl Request {
         self.timeout = Some(timeout);
         self
     }
+
+    /// 这一趟要把响应头一并拿回来（配合 [`send_with_headers`]）
+    pub fn wanting_headers(mut self) -> Request {
+        self.want_headers = true;
+        self
+    }
 }
 
-/// 发一次请求，拿回响应正文（图片这类二进制就用它）。
+/// 发一次请求，**只要正文**（绝大多数调用用这个）。
 ///
 /// 非 2xx 一律算失败，原因里带 URL 与状态码；连不上、超时这些传输失败同理。
 pub async fn send(request: Request) -> Result<Vec<u8>, String> {
+    send_with_headers(request).await.map(|(body, _)| body)
+}
+
+/// 发一次请求，正文与响应头一起给（头只有请求里 `want_headers` 开着才非空）
+pub async fn send_with_headers(request: Request) -> Result<(Vec<u8>, Headers), String> {
     match SUBMIT.get() {
         Some(submit) => via_host(*submit, request).await,
         None => local(request).await,
@@ -231,8 +250,8 @@ pub(crate) fn attach_host(submit: Submit) {
 ///
 /// 请求描述里的指针直接指向 `request` 自己的值（宿主在这次同步调用内就拷走了），
 /// 所以插件侧一次多余拷贝都没有。
-async fn via_host(submit: Submit, request: Request) -> Result<Vec<u8>, String> {
-    let (sender, receiver) = oneshot::channel::<Result<Vec<u8>, String>>();
+async fn via_host(submit: Submit, request: Request) -> Result<(Vec<u8>, Headers), String> {
+    let (sender, receiver) = oneshot::channel::<Result<(Vec<u8>, Headers), String>>();
     // 这次提交的唯一凭据：宿主保证回调一次，回调里再把它收回 Box 销毁
     let user = Box::into_raw(Box::new(sender)).cast::<c_void>();
     commit(submit, &request, user);
@@ -285,6 +304,7 @@ fn commit(submit: Submit, request: &Request, user: *mut c_void) {
         timeout_ms: request.timeout.map_or(0, |span| {
             u64::try_from(span.as_millis()).unwrap_or(u64::MAX)
         }),
+        want_headers: u8::from(request.want_headers),
     };
     crate::runtime::log::debug(format!("[HTTP] 插件请求代发 {}", request.url));
     submit(&call, deliver, user);
@@ -301,6 +321,8 @@ extern "C" fn deliver(
     error_len: usize,
     body: *const u8,
     body_len: usize,
+    headers: *const HttpPair,
+    header_count: usize,
 ) {
     // SAFETY: 约定由宿主保证——同一个 user 只会被回调一次
     let sender = unsafe { Box::from_raw(user.cast::<Sender>()) };
@@ -308,11 +330,36 @@ extern "C" fn deliver(
         // SAFETY: 约定 error/error_len 指向本次调用期内有效的一段 UTF-8
         Err(unsafe { text_of(error, error_len) })
     } else {
-        // SAFETY: 约定 body/body_len 指向本次调用期内有效的一段字节
-        Ok(unsafe { copy_of(body, body_len) })
+        // SAFETY: 约定 body/body_len 与 headers/header_count 都指向本次调用期内可读的那几段
+        let body = unsafe { copy_of(body, body_len) };
+        // SAFETY: 同上
+        let headers = unsafe { copy_pairs(headers, header_count) };
+        Ok((body, headers))
     };
     // 接收端可能已经不在了（那次等待被超时、或插件被停用），静默收下即可
     let _ = sender.send(result);
+}
+
+/// 拷走宿主给回来的响应头：空指针或 0 项就是没有。
+///
+/// # Safety
+/// `list`/`count` 要么都是 0，要么指向本次调用期内可读的那么多项 [`HttpPair`]。
+unsafe fn copy_pairs(list: *const HttpPair, count: usize) -> Headers {
+    if list.is_null() || count == 0 {
+        return Vec::new();
+    }
+    // SAFETY: 上面刚验过指针非空、项数在约定内
+    unsafe { std::slice::from_raw_parts(list, count) }
+        .iter()
+        .map(|item| {
+            // SAFETY: 约定由调用方保证
+            (
+                unsafe { text_of(item.name.ptr, item.name.len) },
+                // SAFETY: 约定由调用方保证
+                unsafe { text_of(item.value.ptr, item.value.len) },
+            )
+        })
+        .collect()
 }
 
 /// 读一段宿主给回来的字节；空指针或零长度都当空
@@ -387,15 +434,42 @@ pub(crate) extern "C" fn host_submit(call: *const HttpCall, done: HttpDone, user
     }
 }
 
-fn report(done: HttpDone, ticket: Ticket, result: Result<Vec<u8>, String>) {
+fn report(done: HttpDone, ticket: Ticket, result: Result<(Vec<u8>, Headers), String>) {
     match result {
-        Ok(body) => {
-            crate::runtime::log::debug(format!("[HTTP] 代发成功，响应 {} 字节", body.len()));
-            done(ticket.0, null(), 0, body.as_ptr(), body.len())
+        Ok((body, headers)) => {
+            crate::runtime::log::debug(format!(
+                "[HTTP] 代发成功，响应 {} 字节、{} 个头",
+                body.len(),
+                headers.len()
+            ));
+            // 两段都只在这次回调期间有效：`pairs` 借的是 `headers` 里那些 String，
+            // 而 `headers`/`body` 活到 `done` 返回之后才一起析构。
+            let pairs: Vec<HttpPair> = headers.iter().map(pair).collect();
+            done(
+                ticket.0,
+                null(),
+                0,
+                body.as_ptr(),
+                body.len(),
+                if pairs.is_empty() {
+                    null()
+                } else {
+                    pairs.as_ptr()
+                },
+                pairs.len(),
+            );
         }
         Err(reason) => {
             crate::runtime::log::debug(format!("[HTTP] 代发失败 {reason}"));
-            done(ticket.0, reason.as_ptr(), reason.len(), null(), 0)
+            done(
+                ticket.0,
+                reason.as_ptr(),
+                reason.len(),
+                null(),
+                0,
+                null(),
+                0,
+            );
         }
     }
 }
@@ -439,6 +513,7 @@ unsafe fn take_call(call: *const HttpCall) -> Result<Request, String> {
         headers,
         body,
         timeout: (raw.timeout_ms > 0).then(|| Duration::from_millis(raw.timeout_ms)),
+        want_headers: raw.want_headers != 0,
     })
 }
 
@@ -506,35 +581,117 @@ fn inflight() -> &'static Semaphore {
     INFLIGHT.get_or_init(|| Semaphore::new(MAX_INFLIGHT))
 }
 
-/// 真发一次请求：非 2xx 与传输失败都归成 `Err`，文案与插件自己写 reqwest 时一贯的写法一致
-async fn local(request: Request) -> Result<Vec<u8>, String> {
+/// 手动走跳转时最多跟几跳（与 reqwest 默认的 `Policy::limited(10)` 同一档）
+const MAX_HOPS: usize = 10;
+
+/// 真发一次请求：非 2xx 与传输失败都归成 `Err`，文案与插件自己写 reqwest 时一贯的写法一致。
+///
+/// 开了 `want_headers` 的那一路走 [`hopping`]：跳转自己一层层跟，中间那一跳的 `Set-Cookie`
+/// 才收得着。绝大多数调用只关心正文，照旧用常驻客户端、由它按默认策略跟进跳转。
+async fn local(request: Request) -> Result<(Vec<u8>, Headers), String> {
+    if request.want_headers {
+        let url = request.url.clone();
+        let total = request.timeout.unwrap_or(DEFAULT_TIMEOUT);
+        // 超时按**整趟**算：`Request::timeout` 这个字段的口径是"整个请求"，不是"每一跳"。
+        return match tokio::time::timeout(total, hopping(request)).await {
+            Ok(result) => result,
+            Err(_) => Err(format!(
+                "请求 {url} 超时（整趟限 {total:?}，跳转链上每一跳都算在内）"
+            )),
+        };
+    }
     let url = request.url.clone();
-    let method = match request.method {
-        Method::Get => reqwest::Method::GET,
-        Method::Post => reqwest::Method::POST,
-    };
-    let mut call = client()
-        .request(method, &request.url)
+    let response = build(client(), &request, &url)
+        .send()
+        .await
+        .map_err(|err| format!("请求失败 {url}: {err}"))?;
+    Ok((final_body(&url, response).await?, Vec::new()))
+}
+
+/// `want_headers` 那一路：一层层跟跳转，把每一跳的响应头都收着。
+///
+/// 为什么非要自己跟：登录那类调用要的票**只在中间那一跳的 `Set-Cookie` 上**（B 站
+/// `crossDomain` 就是 302 给票、再跳到落地页），而 reqwest 一旦自己跟进跳转，上一跳的响应头
+/// 就再也取不出来了——`redirect::Attempt` 只给状态码和下一跳 URL，不给头。
+///
+/// 跟法照 reqwest/tower-http 自己的默认策略来，免得同一份配置两套语义：301/302/303 把 POST
+/// 降级成 GET 并丢掉正文，307/308 原样重试；跨主机那一跳不带走凭据（[`strip_sensitive`]）。
+async fn hopping(mut request: Request) -> Result<(Vec<u8>, Headers), String> {
+    let client = no_follow_client();
+    let mut url = request.url.clone();
+    let mut bag = Headers::new();
+    for _ in 0..MAX_HOPS {
+        let response = build(client, &request, &url)
+            .send()
+            .await
+            .map_err(|err| format!("请求失败 {url}: {err}"))?;
+        let status = response.status();
+        if !status.is_redirection() {
+            // 最终这一跳给全部响应头；中间那几跳只收 `Set-Cookie`，别把无关的头也带过去
+            push_all(response.headers(), &mut bag);
+            let body = final_body(&url, response).await?;
+            return Ok((body, bag));
+        }
+        push_cookies(response.headers(), &mut bag);
+        let next = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        drop(response);
+        let Some(location) = next else {
+            // 3xx 却没有可跟的 Location：这一路要的就是头，把收着的交回去、正文留空。
+            // 走 Err 那一支的话，票就跟着一起丢了。
+            crate::runtime::log::debug(format!(
+                "[HTTP] 代发 {url} 停在 HTTP {status}（没有 Location），已收到 {} 个头",
+                bag.len()
+            ));
+            return Ok((Vec::new(), bag));
+        };
+        let next = resolve(&url, &location)
+            .ok_or_else(|| format!("请求 {url} 的重定向目标 {location} 解析不出来"))?;
+        if crosses_host(&url, &next) {
+            strip_sensitive(&mut request.headers);
+        }
+        if matches!(status.as_u16(), 301..=303) && request.method == Method::Post {
+            request.method = Method::Get;
+            request.body = Body::None;
+        }
+        url = next;
+    }
+    Err(format!("请求 {} 的重定向超过 {MAX_HOPS} 跳", request.url))
+}
+
+/// 摆一次请求出去。`url` 单独传是因为手动走跳转的那一路每跳的 URL 都不同，
+/// `request.url` 要留着当"这次请求"的名字报错。
+fn build(client: &reqwest::Client, request: &Request, url: &str) -> reqwest::RequestBuilder {
+    let mut call = client
+        .request(
+            match request.method {
+                Method::Get => reqwest::Method::GET,
+                Method::Post => reqwest::Method::POST,
+            },
+            url,
+        )
         .timeout(request.timeout.unwrap_or(DEFAULT_TIMEOUT));
     for (name, value) in &request.headers {
         call = call.header(name.as_str(), value.as_str());
     }
-    call = match &request.body {
+    match &request.body {
         Body::None => call,
         Body::Form(items) => call.form(items),
         Body::Raw { content_type, text } => call
             .header(reqwest::header::CONTENT_TYPE, content_type.as_str())
             .body(text.clone()),
-    };
-    let response = call
-        .send()
-        .await
-        .map_err(|err| format!("请求失败 {url}: {err}"))?;
+    }
+}
+
+/// 收完之后的收口：先按对端声明的长度拦一道（跑飞的接口或错误页回几百 MB 时连读都不该开始），
+/// 再在**读正文之前**判状态码（于是一个几百 MB 的错误页不会先占住几百 MB 再被原样丢掉），
+/// 最后才收正文并判实收长度——谎报 `content-length` 的兜底。
+async fn final_body(url: &str, response: reqwest::Response) -> Result<Vec<u8>, String> {
     let status = response.status();
-    // 先按对端声明的长度拦一道：跑飞的接口或错误页回几百 MB 时，连读都不该开始
-    guard_declared_len(&url, response.content_length())?;
-    // 非 2xx 在**读正文之前**就拒。原来这里是先把整份 body 读进内存再看状态码，
-    // 于是一个几百 MB 的错误页会先占住几百 MB，再被原样丢掉。
+    guard_declared_len(url, response.content_length())?;
     if !status.is_success() {
         return Err(format!("请求 {url} 返回 HTTP {status}"));
     }
@@ -542,9 +699,70 @@ async fn local(request: Request) -> Result<Vec<u8>, String> {
         .bytes()
         .await
         .map_err(|err| format!("读取响应失败 {url}: {err}"))?;
-    // 谎报 `content-length` 的兜底：实收长度再判一道
-    guard_actual_len(&url, bytes.len())?;
+    guard_actual_len(url, bytes.len())?;
     Ok(bytes.to_vec())
+}
+
+/// 一条响应里的 `Set-Cookie` 全收进袋：同名多条都要留，收进 `HashMap` 就只剩最后一条
+fn push_cookies(headers: &reqwest::header::HeaderMap, bag: &mut Headers) {
+    for value in headers.get_all(reqwest::header::SET_COOKIE).iter() {
+        if let Ok(text) = value.to_str() {
+            bag.push(("set-cookie".to_string(), text.to_string()));
+        }
+    }
+}
+
+/// 最终响应的全部头。名字统一小写（HTTP 头名不区分大小写，插件那边按名字取就不用自己再折一遍）；
+/// 值不是可见 ASCII 的那几条直接丢掉——一个二进制头不该把整条请求判失败。
+fn push_all(headers: &reqwest::header::HeaderMap, bag: &mut Headers) {
+    for (name, value) in headers {
+        if let Ok(text) = value.to_str() {
+            bag.push((name.as_str().to_ascii_lowercase(), text.to_string()));
+        }
+    }
+}
+
+/// 按 RFC 3986 把 `Location` 解到当前 URL 上：可以是绝对 URL，也可以是相对路径
+fn resolve(base: &str, location: &str) -> Option<String> {
+    reqwest::Url::parse(base)
+        .ok()?
+        .join(location)
+        .ok()
+        .map(|next| next.into())
+}
+
+/// 下一跳有没有换主机（域名或端口）——reqwest 自己跟进跳转时用的就是这个判据
+fn crosses_host(from: &str, to: &str) -> bool {
+    let (Ok(from), Ok(to)) = (reqwest::Url::parse(from), reqwest::Url::parse(to)) else {
+        return true; // 解析不出来就按最保守的办：当成跨站，凭据不带过去
+    };
+    from.host_str() != to.host_str() || from.port_or_known_default() != to.port_or_known_default()
+}
+
+/// 跨主机那一跳不带走凭据，与 reqwest 默认策略摘的同一批头
+fn strip_sensitive(headers: &mut Vec<(String, String)>) {
+    const SENSITIVE: [&str; 5] = [
+        "cookie",
+        "cookie2",
+        "authorization",
+        "proxy-authorization",
+        "www-authenticate",
+    ];
+    headers.retain(|(name, _)| !SENSITIVE.iter().any(|key| name.eq_ignore_ascii_case(key)));
+}
+
+/// 第二份常驻客户端：不自动跟随重定向，[`hopping`] 那一轮用它。
+///
+/// 重定向策略是**客户端级**的（`RequestBuilder` 上没有开关），所以这一路只能另建一份。跳转由
+/// 我们自己跟、攒的头是每次调用的局部变量，这份客户端本身不含任何每请求状态，因此并发共用没问题。
+fn no_follow_client() -> &'static reqwest::Client {
+    static NO_FOLLOW: OnceLock<reqwest::Client> = OnceLock::new();
+    NO_FOLLOW.get_or_init(|| {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    })
 }
 
 #[cfg(test)]
@@ -658,6 +876,124 @@ mod tests {
         assert!(reason.contains("/probe"), "失败原因里该带 URL: {reason}");
     }
 
+    /// 一台会跳一跳的服务器：`/start` 回 302 并把票下在**中间这一跳**的 `Set-Cookie` 上，
+    /// 跳到 `/end` 才回 200 与另一条 `Set-Cookie`。这正是 B 站 `crossDomain` 那副形状。
+    ///
+    /// 每一跳都回 `connection: close`，所以服务端只要按顺序多接几次连接就行，不必管连接复用。
+    async fn redirect_server() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            // 手动跟的那一路要 2 条连接，客户端自己跟的那一路又要 2 条，这里多留几条余量
+            for _ in 0..6 {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    if socket.read(&mut byte).await.unwrap_or(0) == 0 {
+                        break;
+                    }
+                    head.push(byte[0]);
+                }
+                let reply = if String::from_utf8_lossy(&head).starts_with("GET /start") {
+                    "HTTP/1.1 302 Found\r\nlocation: /end\r\nset-cookie: ticket=abc; Path=/\r\n\
+                     set-cookie: sid=1\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                } else {
+                    "HTTP/1.1 200 OK\r\nset-cookie: last=2\r\ncontent-length: 4\r\n\
+                     connection: close\r\n\r\npong"
+                };
+                let _ = socket.write_all(reply.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        format!("http://{addr}/start")
+    }
+
+    /// #143 的正例：票下在重定向链中间那一跳上，手动跟跳转的那一路必须把它收回来。
+    ///
+    /// 判据按**整串**比对，不写 `contains`——少收一条、收重了、或名字没折成小写，都当场看得见。
+    #[tokio::test]
+    async fn a_redirect_chain_hands_back_the_cookie_from_the_middle_hop() {
+        let url = redirect_server().await;
+        let (body, headers) = send_with_headers(Request::get(&url).wanting_headers())
+            .await
+            .unwrap();
+        assert_eq!(body, b"pong".to_vec(), "跟到最终那一跳的正文");
+        let cookies: Vec<&str> = headers
+            .iter()
+            .filter(|(name, _)| name == "set-cookie")
+            .map(|(_, value)| value.as_str())
+            .collect();
+        assert_eq!(
+            cookies,
+            vec!["ticket=abc; Path=/", "sid=1", "last=2"],
+            "中间那一跳的两条票加最终那条，一条都不能少: {headers:?}"
+        );
+        assert!(
+            headers
+                .iter()
+                .any(|(name, value)| name == "content-length" && value == "4"),
+            "最终响应的其余头也该在，名字统一折成小写: {headers:?}"
+        );
+
+        // 没举旗的那一路照旧由常驻客户端自己跟进跳转：正文一样，头一概不给
+        let (plain, none) = send_with_headers(Request::get(&url)).await.unwrap();
+        assert_eq!(plain, b"pong".to_vec(), "没举旗也要跟到最终那一跳");
+        assert!(none.is_empty(), "没举旗就不该花钱拷头");
+    }
+
+    /// 跳转链上的三个纯判据：相对 Location 的解析、跨主机的认定、凭据的剥离。
+    /// 手动跟跳转就等于自己担下了 reqwest 原本替做的事，这一条钉住它没做偏。
+    #[test]
+    fn a_manual_redirect_walk_follows_the_same_rules_as_the_client() {
+        assert_eq!(
+            resolve("https://passport.bilibili.com/x/y", "/z?ticket=1").as_deref(),
+            Some("https://passport.bilibili.com/z?ticket=1"),
+            "相对 Location 要按 RFC 3986 解到当前 URL 上"
+        );
+        assert_eq!(
+            resolve("https://x.invalid/a", "https://y.invalid/b").as_deref(),
+            Some("https://y.invalid/b"),
+            "绝对 Location 原样用"
+        );
+        assert_eq!(resolve("不是 URL", "/x"), None);
+
+        // 与 reqwest 同一判据：看主机与端口，不看 scheme
+        assert!(
+            crosses_host(
+                "https://passport.bilibili.com/a",
+                "https://www.bilibili.com/b"
+            ),
+            "换了域名就是跨站"
+        );
+        assert!(crosses_host(
+            "https://x.invalid:443/a",
+            "https://x.invalid:8443/b"
+        ));
+        assert!(!crosses_host(
+            "https://x.invalid:443/a",
+            "https://x.invalid/b"
+        ));
+        assert!(
+            crosses_host("https://x.invalid/a", "不是 URL"),
+            "解析不出来按跨站办"
+        );
+
+        let mut headers = vec![
+            ("cookie".to_string(), "SESSDATA=1".to_string()),
+            ("Authorization".to_string(), "Bearer 1".to_string()),
+            ("game-alias".to_string(), "ba".to_string()),
+        ];
+        strip_sensitive(&mut headers);
+        assert_eq!(
+            headers,
+            vec![("game-alias".to_string(), "ba".to_string())],
+            "跨站只留凭据之外的头"
+        );
+    }
+
     /// 对端**声明**的长度超上限时，连读都不该开始（`local()` 里这一道在读正文之前）。
     #[test]
     fn a_declared_response_over_the_cap_is_rejected_before_reading() {
@@ -763,11 +1099,12 @@ mod tests {
     // 的 `user` 指针，并发跑也就各查各的，不必再拿一把全局锁把自己串行化——那把锁在异步用例
     // 里还得跨 `await` 持着，正是 `await_holding_lock` 要拦的东西。
 
-    /// 一次回调拷回来的内容。两段字节都只在那次调用期内有效，所以当场拷走。
+    /// 一次回调拷回来的内容。三段字节都只在那次调用期内有效，所以当场拷走。
     #[derive(Clone, Default, Debug)]
     struct Report {
         reason: Option<String>,
         body: Vec<u8>,
+        headers: Vec<(String, String)>,
     }
 
     static CALLBACKS: Mutex<BTreeMap<usize, Vec<Report>>> = Mutex::new(BTreeMap::new());
@@ -778,6 +1115,8 @@ mod tests {
         error_len: usize,
         body: *const u8,
         body_len: usize,
+        headers: *const HttpPair,
+        header_count: usize,
     ) {
         // 这里刻意不 panic：`host_submit` 是 `extern "C"`，回调里的 panic 会 abort 整个测试
         // 二进制，把同批跑的其它用例一起带走。内容缺失就让用例里的断言去判。
@@ -792,6 +1131,8 @@ mod tests {
             // SAFETY: 同上，约定正文那段字节在本次调用期内可读
             report.body = unsafe { std::slice::from_raw_parts(body, body_len) }.to_vec();
         }
+        // SAFETY: 同上，约定那 count 项 [`HttpPair`] 在本次调用期内可读
+        report.headers = unsafe { copy_pairs(headers, header_count) };
         CALLBACKS
             .lock()
             .unwrap()
@@ -849,6 +1190,7 @@ mod tests {
             body: HttpText::default(),
             content_type: HttpText::default(),
             timeout_ms: 0,
+            want_headers: 0,
         };
 
         // 空指针描述
@@ -893,16 +1235,25 @@ mod tests {
             "失败要把原因原话带到"
         );
         assert!(reports[0].body.is_empty(), "失败不该给正文");
+        assert!(reports[0].headers.is_empty(), "失败不该给响应头");
 
         report(
             record_report,
             Ticket(credential(SUCCEEDED_LOCALLY)),
-            Ok(b"pong".to_vec()),
+            Ok((
+                b"pong".to_vec(),
+                vec![("set-cookie".to_string(), "ticket=abc".to_string())],
+            )),
         );
         let reports = callbacks_of(SUCCEEDED_LOCALLY);
         assert_eq!(reports.len(), 1, "成功也只该回调一次");
         assert!(reports[0].reason.is_none(), "成功不该给原因");
         assert_eq!(reports[0].body, b"pong", "正文指针要当场读得出来");
+        assert_eq!(
+            reports[0].headers,
+            vec![("set-cookie".to_string(), "ticket=abc".to_string())],
+            "响应头那一段指针也要当场读得出来"
+        );
     }
 
     /// 真发出去的那条路：回调一次、正文到位、没有错误段；传输失败同样只回一次。
@@ -921,6 +1272,7 @@ mod tests {
             body: HttpText::default(),
             content_type: HttpText::default(),
             timeout_ms: 0,
+            want_headers: 0,
         };
         host_submit(&call, record_report, credential(DELIVERED));
         await_callback(DELIVERED).await;
@@ -959,11 +1311,19 @@ mod tests {
             body: HttpText::default(),
             content_type: HttpText::default(),
             timeout_ms: 0,
+            want_headers: 0,
         };
         let request = unsafe { take_call(&good) }.unwrap();
         assert_eq!(request.method, Method::Get);
         assert_eq!(request.url, url);
         assert_eq!(request.timeout, None);
+        assert!(!request.want_headers, "没举旗就该当没要响应头");
+        // 旗子必须真过得了边界：编错偏移的话插件那头只是拿不到头，比崩更难查
+        let wanting = HttpCall {
+            want_headers: 1,
+            ..good
+        };
+        assert!(unsafe { take_call(&wanting) }.unwrap().want_headers);
 
         assert!(unsafe { take_call(null()) }.is_err_and(|reason| reason.contains("空指针")));
         let dangling = HttpCall {

@@ -44,6 +44,9 @@ use std::os::raw::c_char;
 ///     [`OneBotApi`](crate::onebot::api::OneBotApi) 由零宽单元类型变成持有实例引用的结构体。
 /// 6 = 排期改走宿主通道（[`HostBridge::jobs`]）。这一版**把定时任务的布局问题一次性了结**：
 ///     dll 不再编译进 `Scheduler`/`TaskEntry` 的读写代码，那两个结构以后随便改都不碰插件。
+/// 7 = 代发 HTTP 能带响应头回来了：[`HttpCall::want_headers`] 与 [`HttpDone`] 末尾那两段
+///     `headers`/`header_count`。B 站扫码那份票只在 `crossDomain` 跳转的 `Set-Cookie` 上，
+///     插件拿不到响应头就等于拿不到登录态——这条通道是补给插件的一个真缺口。
 ///
 /// **别以为改了 `HostBridge` 才算改 ABI**：[`HostBridge::framework`] 交出去的是擦成
 /// `*const c_void` 的实例指针，插件 dll 里那份框架代码按**它自己编译期的字段偏移**去读这个
@@ -52,7 +55,7 @@ use std::os::raw::c_char;
 /// 句柄去调自己那份 bundled sqlite）。所以 `Framework` 的字段序本身就是 ABI 的一部分，
 /// 动它必须抬这个版本号。同理，插件直接读的任何 `pub` 结构体/枚举（新变体、加字段、
 /// 改字段类型）也一样要抬，哪怕宿主侧的签名一个字都没动。
-pub const ABI_LAYOUT: u32 = 6;
+pub const ABI_LAYOUT: u32 = 7;
 
 /// 装载器名（写进 `plugins/<id>/plugin.yml` 的 `loader:` 与 GUI 插件列表）
 pub const DYNAMIC_LOADER: &str = "dynamic";
@@ -167,12 +170,22 @@ pub struct HttpCall {
     pub content_type: HttpText,
     /// 超时毫秒数；0 表示用宿主的默认值
     pub timeout_ms: u64,
+    /// 非 0 时把**响应头**一并交回（含重定向链上每一跳的 `Set-Cookie`）。
+    ///
+    /// 默认不要：多数插件只关心正文，逐条拷头是白花的钱。要拿登录票的插件才需要它——
+    /// B 站扫码成功那份回执里，票只在这条 `crossDomain` 跳转的 `Set-Cookie` 上。
+    pub want_headers: u8,
 }
 
 /// 宿主代发完成后回调插件：`error_len` 非 0 即为失败原因，成功时响应字节在
 /// `body`/`body_len` 里。`user` 原样带回插件提交时给的那个指针。
 ///
-/// 两段缓冲**只在这次调用期间有效**，插件要用得当场拷走。宿主保证**每次提交恰好回调一次**
+/// `headers`/`header_count` 是响应头（同名可多条，`Set-Cookie` 就是这种），只有请求里
+/// `want_headers` 非 0 才非空；没要或失败时给空指针与 0。头名一律小写（HTTP 头名不区分大小写，
+/// 宿主先折一次，插件按名字取就不用自己再折）。跟进去的每一跳只收 `Set-Cookie`，最终那一跳
+/// 给全部头——票常常只落在中间那一跳的 `Set-Cookie` 上，跳转由宿主手动跟才收得到它。
+///
+/// 三段缓冲**只在这次调用期间有效**，插件要用得当场拷走。宿主保证**每次提交恰好回调一次**
 /// （解析失败、运行时还没起来这类就地报错也一样补一次回调），插件因此可以把 `user`
 /// 当作一次性凭据，在回调里连同自己那份上下文一起销毁。
 pub type HttpDone = extern "C" fn(
@@ -181,9 +194,10 @@ pub type HttpDone = extern "C" fn(
     error_len: usize,
     body: *const u8,
     body_len: usize,
+    headers: *const HttpPair,
+    header_count: usize,
 );
 
-/// 宿主交给插件的**上行通道**：插件 dll 里静态链接的那份框架状态是空的，
 /// [`HostBridge::jobs`] 的操作号。一条通道带多个操作，是为了让这项能力以后加操作时
 /// 不必再动 `HostBridge` 的字段数——那才是要抬布局的事。
 pub const JOB_CREATE: u32 = 0;
@@ -402,12 +416,13 @@ mod tests {
         assert_eq!(std::mem::size_of::<JobInfo>(), 4 * WORD);
     }
 
-    /// 请求描述也是 ABI：两个 u8 凑满一个字，其余字段各占一个字。
+    /// 请求描述也是 ABI：两个 u8 凑满一个字，其余字段各占一个字，末尾的 `want_headers`
+    /// 自己占一个字（它前面是 u64，对齐到不了隔壁）。
     /// 少一个、多一个或者漂了 `repr(C)`，宿主读到的就是错位的数据。
     #[test]
-    fn http_call_is_twelve_words() {
+    fn http_call_is_thirteen_words() {
         use std::mem::size_of;
-        assert_eq!(size_of::<HttpCall>(), 12 * size_of::<usize>());
+        assert_eq!(size_of::<HttpCall>(), 13 * size_of::<usize>());
         assert_eq!(size_of::<HttpPair>(), 4 * size_of::<usize>());
     }
 
