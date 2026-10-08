@@ -321,35 +321,27 @@ impl PluginContext {
 
     /// 每天固定小时触发（任务组自动归属本插件，停用即整组取消）
     pub fn daily_job(&self, hour: u32, name: &str, run: crate::quartz::JobFn) {
-        self.framework()
-            .jobs()
-            .create_daily(hour, name, self.plugin_id(), run);
+        crate::quartz::submit_daily(self.framework(), hour, name, self.plugin_id(), run);
     }
 
     /// 固定间隔循环任务（首次立即执行）
     pub fn repeat_job(&self, interval_secs: u64, name: &str, run: crate::quartz::JobFn) {
-        self.framework()
-            .jobs()
-            .create_repeat(interval_secs, name, self.plugin_id(), run);
+        crate::quartz::submit_repeat(self.framework(), interval_secs, name, self.plugin_id(), run);
     }
 
     /// 单次定时任务
     pub fn single_job(&self, ts_ms: i64, name: &str, run: crate::quartz::JobFn) {
-        self.framework()
-            .jobs()
-            .create_single_at(ts_ms, name, self.plugin_id(), run);
+        crate::quartz::submit_single_at(self.framework(), ts_ms, name, self.plugin_id(), run);
     }
 
     /// 延迟任务（秒）
     pub fn delay_job(&self, delay_secs: u64, name: &str, run: crate::quartz::JobFn) {
-        self.framework()
-            .jobs()
-            .create_delay(delay_secs, name, self.plugin_id(), run);
+        crate::quartz::submit_delay(self.framework(), delay_secs, name, self.plugin_id(), run);
     }
 
     /// 取消本插件的一个定时任务
     pub fn remove_job(&self, name: &str) -> bool {
-        self.framework().jobs().remove(name)
+        crate::quartz::submit_remove(self.framework(), name)
     }
 
     /// 登记一条过期数据清理任务：每 `every_days` 天删掉 `keep_days` 天前的数据。

@@ -42,6 +42,8 @@ use std::os::raw::c_char;
 ///     多带一个 `MetaInfo`、[`BodyFilter`](crate::onebot::hooks::BodyFilter) 多两档、
 ///     [`CommandContext`](crate::runtime::dispatcher::CommandContext) 末尾多一个 `framework`、
 ///     [`OneBotApi`](crate::onebot::api::OneBotApi) 由零宽单元类型变成持有实例引用的结构体。
+/// 6 = 排期改走宿主通道（[`HostBridge::jobs`]）。这一版**把定时任务的布局问题一次性了结**：
+///     dll 不再编译进 `Scheduler`/`TaskEntry` 的读写代码，那两个结构以后随便改都不碰插件。
 ///
 /// **别以为改了 `HostBridge` 才算改 ABI**：[`HostBridge::framework`] 交出去的是擦成
 /// `*const c_void` 的实例指针，插件 dll 里那份框架代码按**它自己编译期的字段偏移**去读这个
@@ -50,7 +52,7 @@ use std::os::raw::c_char;
 /// 句柄去调自己那份 bundled sqlite）。所以 `Framework` 的字段序本身就是 ABI 的一部分，
 /// 动它必须抬这个版本号。同理，插件直接读的任何 `pub` 结构体/枚举（新变体、加字段、
 /// 改字段类型）也一样要抬，哪怕宿主侧的签名一个字都没动。
-pub const ABI_LAYOUT: u32 = 5;
+pub const ABI_LAYOUT: u32 = 6;
 
 /// 装载器名（写进 `plugins/<id>/plugin.yml` 的 `loader:` 与 GUI 插件列表）
 pub const DYNAMIC_LOADER: &str = "dynamic";
@@ -182,6 +184,81 @@ pub type HttpDone = extern "C" fn(
 );
 
 /// 宿主交给插件的**上行通道**：插件 dll 里静态链接的那份框架状态是空的，
+/// [`HostBridge::jobs`] 的操作号。一条通道带多个操作，是为了让这项能力以后加操作时
+/// 不必再动 `HostBridge` 的字段数——那才是要抬布局的事。
+pub const JOB_CREATE: u32 = 0;
+/// 按 `name` 取消一条任务，返回 1 表示确实删掉了一条
+pub const JOB_REMOVE: u32 = 1;
+/// 按 `name` 问有没有，返回 1 表示在表里
+pub const JOB_EXISTS: u32 = 2;
+/// 按 `group` 整组取消，返回收掉的条数
+pub const JOB_REMOVE_GROUP: u32 = 3;
+/// 按 `name` 立刻触发一次，返回 0 成 / 1 没这个名字 / 2 别的失败原因
+pub const JOB_TRIGGER: u32 = 4;
+/// 暂停/恢复全部任务，返回受影响的条数（**进程级**动作：一个插件按下去会连别人的一起停，
+/// 这是自由函数层一直的语义，GUI 的总暂停按钮用的就是它）
+pub const JOB_PAUSE_ALL: u32 = 5;
+/// 见 [`JOB_PAUSE_ALL`]
+pub const JOB_RESUME_ALL: u32 = 6;
+/// 逐条回调 `sink`，返回送出去的条数；`sink` 返回 false 就提前收尾
+pub const JOB_LIST: u32 = 7;
+
+/// [`JobSpec::kind`] 的三档，与 `quartz` 内部的 `TaskKind` 一一对应。
+/// 每天固定钟点，`at` 是 0-23
+pub const JOB_DAILY: u32 = 0;
+/// 固定间隔，`at` 是秒（宿主侧下限 1 秒，传 0 会退化成空转刷屏的死循环）
+pub const JOB_REPEAT: u32 = 1;
+/// 单次，`at` 是绝对毫秒时间戳
+pub const JOB_SINGLE_AT: u32 = 2;
+
+/// 一次任务操作的输入。
+///
+/// 与 [`HttpCall`] 同一条约定：`name`/`group` 指向插件自己内存里的 NUL 结尾 UTF-8，
+/// **只需在本次调用期间有效**，宿主在返回之前就把它们拷成自己的值。
+/// `user` 是插件那侧一个 `Box<JobFn>` 的裸指针，宿主全程只当不透明句柄握着，只做两件事：
+/// 到点调 `run(user)`，摘掉条目时调 `dispose(user)` 把那个 Box 还给插件自己释放——
+/// 后者必须发生在 dll 还映射着的时候，否则这条就断了：宿主拿着已经消失的代码地址回调。
+///
+/// 字段顺序与类型本身就是 ABI 的一部分，改动必须抬 [`ABI_LAYOUT`]。
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct JobSpec {
+    /// [`JOB_CREATE`] 到 [`JOB_LIST`] 之一
+    pub op: u32,
+    /// 任务形态，只有 [`JOB_CREATE`] 看它
+    pub kind: u32,
+    /// 形态参数：钟点 / 间隔秒 / 绝对毫秒，只有 [`JOB_CREATE`] 看它
+    pub at: i64,
+    pub name: *const c_char,
+    pub group: *const c_char,
+    /// 到点回调（[`JOB_CREATE`] 必填，其余档忽略）。返回 false 表示插件那一侧的处理器炸了——
+    /// panic 不能穿出 `extern "C"`（那是整个进程 abort），所以插件侧必须自己拦住并报这一笔，
+    /// 宿主这边照旧按"这条任务炸了一次"记账（连续炸到阈值就隔离停用）。
+    pub run: Option<extern "C" fn(user: *mut c_void) -> bool>,
+    /// 释放回调：宿主摘掉这条任务时调用一次（[`JOB_CREATE`] 必填）
+    pub dispose: Option<extern "C" fn(user: *mut c_void)>,
+    /// [`JOB_LIST`] 的收件口：`info` 只在本次回调期间有效，返回 false 提前收尾
+    pub sink: Option<extern "C" fn(info: *const JobInfo, user: *mut c_void) -> bool>,
+    /// 插件自己的句柄，宿主原样带回来
+    pub user: *mut c_void,
+}
+
+/// [`JOB_LIST`] 回调给插件的一条任务概览。
+///
+/// 两个字符串只在这次回调期间有效（宿主在本次回调内就把它们拷走），`-1` 表示"没有下一次/
+/// 还没跑过"——`i64` 里不会出现合法的 -1 时间戳，省掉一层 nullable。
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct JobInfo {
+    pub name: *const c_char,
+    pub group: *const c_char,
+    pub next_ms: i64,
+    pub last_ms: i64,
+}
+
+/// 宿主代管的排期通道。返回值见各操作号上的说明；负数留给"通道自己出错"。
+pub type Jobs = extern "C" fn(spec: *const JobSpec) -> i64;
+
 /// 装载时把宿主真正在跑的东西接过来，插件里的自由函数才不落空表。
 ///
 /// 字段顺序与签名就是 ABI 的一部分，改动必须抬 [`ABI_LAYOUT`]。
@@ -208,6 +285,13 @@ pub struct HostBridge {
     /// 请宿主的 HTTP 客户端代发一次请求（面向插件的封装见 [`crate::runtime::http`]）。
     /// 无论成功、失败还是当场就把请求描述判废了，`done` 都会被调用**恰好一次**。
     pub http: extern "C" fn(call: *const HttpCall, done: HttpDone, user: *mut c_void),
+    /// 把定时任务交给宿主代管（面向插件的封装见 [`crate::quartz`]）。
+    ///
+    /// 有了这条通道，插件里就不会再编译出读写 `Scheduler`/`TaskEntry` 的代码——那两个结构
+    /// 的字段布局从此不属于 ABI。这一条不是洁癖：`PluginContext::repeat_job` 这类固有方法
+    /// 编在 dll 里，dll 按自己编译期的偏移读写宿主的表，错位过一次的实测结果是「握手照放行、
+    /// 插件装载启动都正常，但它排的定时任务一条都不跑」，且不报任何错。
+    pub jobs: Jobs,
 }
 
 /// [`export_arona_plugin!`] 生成的 `arona_plugin_host` 的实现：把插件里的
@@ -234,6 +318,7 @@ pub unsafe fn attach_host(bridge: *const HostBridge) -> u8 {
     }
     crate::runtime::http::attach_host(bridge.http);
     crate::runtime::log::attach_host(bridge);
+    crate::quartz::attach_host(bridge.jobs);
     HOST_ACCEPTED
 }
 
@@ -302,10 +387,19 @@ mod tests {
     /// `HostBridge` 要跨 dll 边界传给插件，字段数量与顺序本身就是 ABI 的一部分：
     /// 布局漂了（多一个字段、忘了 `repr(C)`）宿主就会按错位的方式取函数指针。
     #[test]
-    fn host_bridge_is_exactly_four_function_pointers() {
+    fn host_bridge_is_exactly_five_function_pointers() {
         use std::mem::{align_of, size_of};
-        assert_eq!(size_of::<HostBridge>(), 4 * size_of::<usize>());
+        assert_eq!(size_of::<HostBridge>(), 5 * size_of::<usize>());
         assert_eq!(align_of::<HostBridge>(), align_of::<usize>());
+    }
+
+    /// 任务描述也是 ABI：`op` 与 `kind` 两个 u32 凑满一个字，其余七个字段各占一个字。
+    /// 少一个、多一个或者漂了 `repr(C)`，宿主读到的就是错位的回调指针——那比读错整数严重得多。
+    #[test]
+    fn job_spec_is_eight_words() {
+        const WORD: usize = std::mem::size_of::<usize>();
+        assert_eq!(std::mem::size_of::<JobSpec>(), 8 * WORD);
+        assert_eq!(std::mem::size_of::<JobInfo>(), 4 * WORD);
     }
 
     /// 请求描述也是 ABI：两个 u8 凑满一个字，其余字段各占一个字。

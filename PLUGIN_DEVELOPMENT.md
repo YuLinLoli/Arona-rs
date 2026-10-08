@@ -22,7 +22,7 @@ plugins/hello/             # 示例插件：name=hello-plugin, crate-type=["cdyl
 版本约定：框架与 host 同为 `1.1.0`，插件版本号各自演进。
 **插件接口的破坏性改动抬 `arona::plugin::FRAMEWORK_API_VERSION`**（与 crate 版本号无关），见 §6；
 **插件会读的那个类型换了布局**（`Framework`、`CommandContext`、`EventBody`、`BodyFilter`、`OneBotApi`
-这些，加字段/加变体/改字段类型）另抬 `arona::plugin::abi::ABI_LAYOUT`（当前 `5`），见 §22。
+这些，加字段/加变体/改字段类型）另抬 `arona::plugin::abi::ABI_LAYOUT`（当前 `6`），见 §22。
 
 运行期的落盘目录由框架统一规定（见 §7），插件不自己挑地方：
 
@@ -112,13 +112,13 @@ arona-host ──depends──▶ arona（框架）──启动时扫描──�
 | `DiContainer.declare` / `instance<T>()` | `ctx.declare_service::<T>(..)` / `ctx.service::<T>()` | `container.rs` |
 | —（原版 Arona 的 `StandaloneServiceInfo` 表） | `arona::services::ServiceManager`：`ctx.register_service(..)`，条目带归属、插件停用时一并撤销 | `services/mod.rs` |
 | `ConfigKey<T>` + `configManager[key]` | `PluginConfig` + `ctx.config::<T>(key)` → `ConfigEntry::<T>::get/set/update` | `config/arona.rs`、`config/plugin_config.rs` |
-| `JvmPluginManager` 扫描 `plugins/` 找 jar、独立 ClassLoader 隔离 | `plugin::dynamic::DynamicPluginLoader` 扫描 `plugins/` 找 dll，`libloading` 映射进宿主进程，按四个 C 导出符号握手，再把宿主的进程实例/日志出口/tokio 句柄交进 dll | `plugin/dynamic.rs`、`plugin/abi.rs` |
+| `JvmPluginManager` 扫描 `plugins/` 找 jar、独立 ClassLoader 隔离 | `plugin::dynamic::DynamicPluginLoader` 扫描 `plugins/` 找 dll，`libloading` 映射进宿主进程，按四个 C 导出符号握手，再把宿主的进程实例/日志出口/tokio 句柄/HTTP 代发/定时任务通道交进 dll | `plugin/dynamic.rs`、`plugin/abi.rs` |
 
 **与 mirai 最大的不同**：mirai 用独立 ClassLoader 把每个 jar 隔开，插件字节码与宿主各不相干；
 这里是把 dll 直接映射进宿主进程、并跨边界交换 `Arc<dyn AronaPlugin>`。省掉了进程外通信的开销与
 序列化边界，代价是两件事必须由框架自己补上：**"两边同一套工具链"这条前提由握手逐项把关**，
 以及 **ClassLoader 隔离顺带解决的"全局状态只有一份"这里不成立**——dll 静态链接了自己的那份
-`arona`，所以装载器在造实例前把宿主的进程默认实例、日志出口与 tokio 句柄交回插件
+`arona`，所以装载器在造实例前把宿主的进程默认实例、日志出口、tokio 句柄、HTTP 代发与定时任务通道交回插件
 （§22「宿主的上行通道」）。对插件作者的实际影响：写法与静态编译时完全一样，不用绕路。
 这份"一样"是框架换来的：凡是背后连着第三方库状态的能力（聊天记录库、OneBot 动作、HTTP 代发），
 框架都只把**宿主生成的 vtable** 或 `extern "C"` 函数交出去，绝不让 dll 自己动手——§22 那两道关讲的就是这件事。
@@ -695,11 +695,21 @@ fn start(&self, ctx: &PluginContext) -> Result<(), String> {
 上一轮上下文都不肯放手，反复热重载就是照这条攒内存台阶的。
 单次任务（`single_job` / `delay_job`）触发完不再占着表：表是按任务名长的，名字只要带消息号或
 用户号，就是每排一次长一格、永不回收——下一次排期时顺手把这些空壳收掉，插件不用自己记名清理。
-> 给框架维护者：`quartz` 的 `Scheduler`/`TaskEntry` 属于**插件 dll 会直接读布局**的那一类。
-> dll 里静态链接着框架同一份源码的另一份副本，它按自己编译期的偏移读写这两个结构体；加字段、
-> 改字段类型都会让旧 dll 的读写错位，而握手照样放行——实测症状是插件装载成功、`start` 正常返回，
-> 但它排上的定时任务一条都不跑。要么改成布局中性的写法（上面那两条就是），要么抬 `ABI_LAYOUT`
-> 并要求所有插件重编。
+> 给框架维护者：从布局 6 起，排期**走宿主的通道**（`HostBridge::jobs`，`plugin/abi.rs` 里的
+> `JobSpec`）。dll 里不再编译出读写 `Scheduler`/`TaskEntry` 的代码——那两条固有方法
+> （`PluginContext::repeat_job` 之类）过去会编进 dll 自己那份副本，按 dll 编译期的字段偏移读写
+> 宿主的表；实测错位过一次：握手照样放行「布局 5」、`start` 正常返回，但插件排的任务一条都不跑，
+> 且不报任何错。现在条目一律由宿主分配，插件交出去的只是一个回调句柄，这两个结构内部再改都不出界。
+>
+> 跨界那一句 `dispose` 是有讲究的：闭包是**插件的内存**，宿主在摘掉条目那一刻回调它把 `Box` 还回去，
+> 所以既不会把闭包漏在宿主手里（这一轮刚修的那类滞留，只是换个持有人），也不会在模块卸载之后才掉——
+> 装载器 `std::mem::forget` 掉了 `Library` 句柄，虚表与代码段随进程常驻（`plugin::dynamic`）。
+> 插件处理器 panic 由插件侧的 `extern "C"` 出口拦住、报 `false` 回来，宿主的 `invoke` 照旧吞掉并
+> 记健康度（连续炸到阈值就隔离停用），不会出现"panic 穿出 `extern "C"` → 整个进程 abort"。
+>
+> 一处语义要说清：`arona::quartz::pause_all()` / `resume_all()` 是**进程级**动作，一个插件按下去
+> 会把别人的任务一起停掉。这是自由函数层一直的行为，通道没有改它——插件要停自己的任务请用
+> `ctx.remove_job(name)` 或者整组归属（停用时框架自动 `remove_group`）。
 
 ## 11. 服务容器：插件之间共享能力
 
@@ -1093,7 +1103,7 @@ async fn demo(ctx: &arona::runtime::dispatcher::CommandContext) {
    ```
 
    宏负责导出四个 C 符号（`arona_plugin_abi` / `arona_plugin_toolchain` / `arona_plugin_host` /
-   `arona_plugin_new`），框架靠它们完成握手、把宿主的进程实例、日志出口和 HTTP 代发通道交进 dll，
+   `arona_plugin_new`），框架靠它们完成握手、把宿主的进程实例、日志出口、HTTP 代发与定时任务通道交进 dll，
    再取出实例。参数只要是「造出实例的表达式」即可：`MyPlugin` 有字段时写 `::default()` 或自己的
    `::new(..)`，是空单位结构体就直接写类型名（否则 clippy 的 `default_constructed_unit_structs` 会念一句）。
    **插件不要写 `main`、也不提供任何可执行入口**——
@@ -1111,12 +1121,12 @@ async fn demo(ctx: &arona::runtime::dispatcher::CommandContext) {
 装载成功的标志是这三行日志：
 
 ```
-[Arona] 插件 ABI 握手通过: 布局 5，契约 1.0.0
+[Arona] 插件 ABI 握手通过: 布局 6，契约 1.0.0
 [Arona] 已装载动态插件: HelloPlugin 0.1.0 (hello_plugin.dll)
 [Arona] 插件已启动: HelloPlugin v0.1.0
 ```
 
-那个「布局 5」是当前符号布局版本（§22），每次抬它这里的打印就跟着变，核对时以 §22 为准。
+那个「布局 6」是当前符号布局版本（§22），每次抬它这里的打印就跟着变，核对时以 §22 为准。
 
 `plugins/<id>/plugin.yml`、`config/<id>/arona.yml` 由框架在装载时自动写出来，GUI「插件管理」页
 立刻能开关它。换插件、删插件都不必重新编译框架，**但必须重启框架**——`plugins/` 只在启动时扫一遍，
@@ -1464,6 +1474,7 @@ mirai 的插件和框架在同一个 ClassLoader 树里，`MiraiInstance` 只有
 | 宿主的日志出口 | `arona::runtime::log::info(..)` 进同一个日志文件、同一个 GUI 实时日志，来源标注仍按 `[插件名:动作]` |
 | 宿主登记的 tokio 句柄 | 在 GUI 主线程上装配插件时（面板里关掉再打开），`ctx.spawn` / 定时任务照样投得出去 |
 | 宿主的 HTTP 代发通道 | `arona::runtime::http::*`（§14.1）把请求递给宿主那份 reqwest，插件不必自带客户端 |
+| 宿主的定时任务通道 | `ctx.daily_job`/`repeat_job`/`single_job`/`delay_job`/`remove_job` 与 `arona::quartz::*` 都落到宿主那张表；条目由宿主分配与释放，插件只交一个回调句柄（§10） |
 
 所以**插件写起来和同仓静态编译时一样**：能用 `ctx` 就用 `ctx`（下面那条禁令的真实含义）。
 接管由宏与装载器完成，插件代码里没有任何对应的手续。
@@ -1642,7 +1653,7 @@ tokio 也被静态链接成了两份，而"当前在哪个运行时里"这个上
 
 | 项 | 来源 | 不一致的后果 |
 | --- | --- | --- |
-| 符号布局版本 | `arona::plugin::abi::ABI_LAYOUT`（当前 5） | 四个导出符号的签名、或**插件会读的那个类型**（`Framework`、`CommandContext`、`EventBody`、`BodyFilter`、`OneBotApi`）换了布局，新旧不可混用 |
+| 符号布局版本 | `arona::plugin::abi::ABI_LAYOUT`（当前 6） | 四个导出符号的签名、或**插件会读的那个类型**（`Framework`、`CommandContext`、`EventBody`、`BodyFilter`、`OneBotApi`）换了布局，新旧不可混用。布局 6 起 `quartz` 的 `Scheduler`/`TaskEntry` **已经不出界**（排期走宿主通道，§10），那两个结构内部随便改 |
 | 框架契约版本 | `FRAMEWORK_API_VERSION`（主版本相等 + 框架次版本不低于插件要求） | 插件用到了宿主还没有的接口 |
 | rustc 版本与 host 三件套 | 两边各自 `rustc -vV` 的 `release` / `host` 两行 | `dyn Trait` 胖指针布局、泛型单态化产物可能对不上 |
 | 目标三元组 + profile + CRT 链接方式 | `TARGET` / `PROFILE` / `crt-static` | debug 与 release 混编会炸；两套 MSVC 运行库会各自分配释放内存 |
@@ -1671,7 +1682,7 @@ tokio 也被静态链接成了两份，而"当前在哪个运行时里"这个上
 ### 发布插件时必须写明的三件事
 
 ```
-适用于 Arona-rs 1.1.0（框架契约 1.0.0，符号布局 5）
+适用于 Arona-rs 1.1.0（框架契约 1.0.0，符号布局 6）
 构建工具链：rustc 1.98.0，x86_64-pc-windows-msvc，--release，crt-static
 下载后放进 <框架运行目录>/plugins/<你的id>/，重启框架
 ```
