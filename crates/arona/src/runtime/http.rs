@@ -26,8 +26,11 @@ use std::time::Duration;
 use tokio::sync::Semaphore;
 use tokio::sync::oneshot;
 
-/// 插件没指定超时时用这一档
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
+/// 插件没指定超时时用这一档。
+///
+/// 20 秒而不是更宽：插件侧常有「多个源依次试错」的取数逻辑，一次挂满超时的代价
+/// 会按源数与服务器数乘起来——原先 60 秒那一档让某个国内连不通的源把整点定时推送拖了二十几分钟。
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(20);
 /// 单段字节的长度上限：正常 URL 几十字节，这里只挡指针与长度写歪了的插件
 const TEXT_LIMIT: usize = 8 * 1024 * 1024;
 /// 一次请求最多带多少对请求头（或表单项）
@@ -97,7 +100,7 @@ pub struct Request {
     pub url: String,
     pub headers: Vec<(String, String)>,
     pub body: Body,
-    /// 整个请求的超时；`None` 用宿主的 60 秒
+    /// 整个请求的超时；`None` 用宿主的 20 秒
     pub timeout: Option<Duration>,
     /// 要不要把**响应头**一并拿回来（含重定向链上每一跳的 `Set-Cookie`）。
     ///

@@ -902,6 +902,35 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
 
+    /// 排定时刻与实际触发时刻的偏差。服务器上出现过「8:00 的推送 8:24 才发」与
+    /// 「23:00 的预警 23:32 才发」，先钉住调度器本身准不准。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn single_at_fires_on_the_scheduled_moment() {
+        let framework = crate::framework::Framework::new();
+        let base = chrono::Utc::now().timestamp_millis();
+        let drift = Arc::new(std::sync::Mutex::new(Vec::<i64>::new()));
+        for step in 1..=3i64 {
+            let at = base + step * 1_200;
+            let sink = drift.clone();
+            framework.jobs().create_single_at(
+                at,
+                &format!("QuartzProbe{step}"),
+                "QuartzProbePlugin",
+                Arc::new(move || {
+                    sink.lock().unwrap()
+                        .push(chrono::Utc::now().timestamp_millis() - at);
+                }),
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(5_000)).await;
+        let got = drift.lock().unwrap().clone();
+        println!("单次任务偏差(ms) = {got:?}");
+        assert_eq!(got.len(), 3, "三个单次任务只触发了 {} 个", got.len());
+        for d in &got {
+            assert!(d.abs() < 300, "单次任务比排定时刻偏了 {d} ms");
+        }
+    }
+
     /// 任务体 panic 只废掉那一次触发：循环必须继续按表走。
     /// 回归点：以前 panic 会顺着 async 块打死整个 tokio 任务，
     /// 表里却留一条状态正常、永远不会再触发的僵尸任务。
