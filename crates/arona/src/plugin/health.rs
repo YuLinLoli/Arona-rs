@@ -113,6 +113,16 @@ impl HealthBoard {
             return false;
         }
         self.failures.lock().unwrap().remove(plugin);
+        self.isolate(plugin, &format!("连续 {threshold} 次 panic"), threshold);
+        true
+    }
+
+    /// 把某个插件从路由上摘下来并走完整回收。
+    ///
+    /// `record_panic`（panic 达阈值）与定时任务的看门狗（执行超时）共用这一条：
+    /// 两者要的后果一样——别再让它接事件、别再让它占线程。
+    /// 返回 true 表示停用已生效。
+    pub fn isolate(&self, plugin: &str, reason: &str, threshold: u32) -> bool {
         // 先进停用名单：这一步就让它的命令与钩子从路由上消失，不必等下面的完整回收
         let mut list = self.gating.disabled_plugins();
         if !list.iter().any(|entry| entry == plugin) {
@@ -124,7 +134,7 @@ impl HealthBoard {
             // 没回填框架实例（单独一张注册表/测试）时，门控层面的停用已经生效
             None => {
                 crate::runtime::log::error(format!(
-                    "插件 {plugin} 连续 {threshold} 次 panic，已停用其命令与事件订阅"
+                    "插件 {plugin} {reason}，已停用其命令与事件订阅"
                 ));
                 true
             }

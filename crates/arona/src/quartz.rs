@@ -14,6 +14,12 @@ use std::time::Duration;
 
 pub type JobFn = Arc<dyn Fn() + Send + Sync + 'static>;
 
+/// 单次任务执行超过这么多秒，就判定为「卡住」：通报 `managers` 并停用该插件。
+///
+/// 3 分钟是用户 2026-10-12 定的。它比一轮正常检测（抓图、绘图、发若干条消息）宽，
+/// 又远小于"卡到把线程白占十分钟"。想关掉把 `framework.slowJobSecs` 配成 0。
+pub(crate) const SLOW_JOB_LIMIT_SECS: u64 = 180;
+
 #[derive(Clone)]
 enum TaskKind {
     /// 每天 hour(0-23) 触发一次

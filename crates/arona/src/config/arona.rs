@@ -48,6 +48,9 @@ pub struct FrameworkSettings {
     pub panic_disable_threshold: u32,
     /// 未显式声明 `with_prefix_match` 的命令，是否也允许最短前缀匹配
     pub prefix_match_by_default: bool,
+    /// 单次定时任务执行超过多少秒就判定为「卡住」：通报管理员并停用该插件。
+    /// 0 表示关掉看门狗（只按原样一直等）。
+    pub slow_job_secs: u64,
 }
 
 impl Default for FrameworkSettings {
@@ -56,6 +59,7 @@ impl Default for FrameworkSettings {
         FrameworkSettings {
             panic_disable_threshold: options.panic_disable_threshold,
             prefix_match_by_default: options.prefix_match_by_default,
+            slow_job_secs: crate::quartz::SLOW_JOB_LIMIT_SECS,
         }
     }
 }
