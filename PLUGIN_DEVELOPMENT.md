@@ -695,6 +695,14 @@ fn start(&self, ctx: &PluginContext) -> Result<(), String> {
 上一轮上下文都不肯放手，反复热重载就是照这条攒内存台阶的。
 单次任务（`single_job` / `delay_job`）触发完不再占着表：表是按任务名长的，名字只要带消息号或
 用户号，就是每排一次长一格、永不回收——下一次排期时顺手把这些空壳收掉，插件不用自己记名清理。
+
+任务体是**同步**跑在宿主的 worker 线程上的：它不返回，那一格线程就一直归它占着。所以框架给单次执行
+设了一道时限（`arona.yml` 的 `framework.slow_job_secs`，默认 180 秒）——拖过去了，归属插件被停用
+（命令与事件立刻不再路由），并把一份四项说明（插件 / 任务 / 内容 / 失败原因）私聊发给 `managers` 里
+配的 QQ。已经在跑的那一次**中断不了**，它占着的那格线程要等宿主重启才回收，所以这条是止损与报信，
+不是抢救。`slow_job_secs: 0` 关掉这道闸；`managers` 一个都没配时，那份通报整条落到日志，不会静默丢掉。
+长活儿的正确写法是任务体里只起个头、过程交给 `ctx.spawn(async { .. })`，或者把一轮拆成几次短触发。
+宿主也按 `plugins/` 里的插件数预留了 worker 线程，一家卡住不会把其余插件一起拖停。
 > 给框架维护者：从布局 6 起，排期**走宿主的通道**（`HostBridge::jobs`，`plugin/abi.rs` 里的
 > `JobSpec`）。dll 里不再编译出读写 `Scheduler`/`TaskEntry` 的代码——那两条固有方法
 > （`PluginContext::repeat_job` 之类）过去会编进 dll 自己那份副本，按 dll 编译期的字段偏移读写
@@ -1401,8 +1409,9 @@ framework.health().forget("voice-room");       // 插件重新装配时清空
 ```
 
 同一插件**连续** panic 到达阈值（默认 5 次）时，框架先把该插件写进停用名单（命令与钩子立刻不再路由，
-不需要 `Framework` 已 attach），再登记隔离原因（`framework.quarantine(id, threshold)` 返回 `true` 表示
-"本次从可用变隔离"，只有进程默认实例会把它写进 `arona.yml`），日志写明炸在哪个命令/钩子上。
+不需要 `Framework` 已 attach），再登记隔离原因（`framework.quarantine(id, reason)`，`reason` 原样进日志、
+由调用方说清是哪一族故障；返回 `true` 表示"本次从可用变隔离"，只有进程默认实例会把它写进
+`arona.yml`），日志写明炸在哪个命令/钩子上。
 `revoke_resources` 顺手 `health().forget(id)`，所以用户从 GUI 或 `arona.yml` 重新启用它时计数从零开始——
 **不会因为一个老计数被秒停用**。插件自己不需要 `catch_unwind`，但也不该拿 panic 当控制流。
 

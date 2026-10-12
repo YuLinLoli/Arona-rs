@@ -592,6 +592,13 @@ fn template(config: &AronaConfig) -> String {
         "  prefix_match_by_default: {}\n",
         config.framework.prefix_match_by_default
     ));
+    out.push_str(
+        "  # 单次定时任务执行超过多少秒判定为卡住：停用该插件并把说明发给 managers（0 = 关掉看门狗）\n",
+    );
+    out.push_str(&format!(
+        "  slow_job_secs: {}\n",
+        config.framework.slow_job_secs
+    ));
     out.push('\n');
     out.push_str("# ==================== 聊天记录缓存 ====================\n");
     out.push_str("# QQ 的引用只认 OneBot 实现端缓存里的近期消息，久了就引用不到。\n");

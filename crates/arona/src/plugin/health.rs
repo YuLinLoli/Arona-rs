@@ -113,16 +113,17 @@ impl HealthBoard {
             return false;
         }
         self.failures.lock().unwrap().remove(plugin);
-        self.isolate(plugin, &format!("连续 {threshold} 次 panic"), threshold);
+        self.isolate(plugin, &format!("连续 {threshold} 次 panic"));
         true
     }
 
     /// 把某个插件从路由上摘下来并走完整回收。
     ///
-    /// `record_panic`（panic 达阈值）与定时任务的看门狗（执行超时）共用这一条：
-    /// 两者要的后果一样——别再让它接事件、别再让它占线程。
+    /// `record_panic`（panic 达阈值）与定时任务的看护线程（执行超时）共用这一条：
+    /// 两者要的后果一样——别再让它接事件、别再让它占线程。`reason` 会原样进日志，
+    /// 所以调用方得说清是哪一族故障，别让超时停用读起来像 panic。
     /// 返回 true 表示停用已生效。
-    pub fn isolate(&self, plugin: &str, reason: &str, threshold: u32) -> bool {
+    pub fn isolate(&self, plugin: &str, reason: &str) -> bool {
         // 先进停用名单：这一步就让它的命令与钩子从路由上消失，不必等下面的完整回收
         let mut list = self.gating.disabled_plugins();
         if !list.iter().any(|entry| entry == plugin) {
@@ -130,7 +131,7 @@ impl HealthBoard {
             self.gating.set_disabled_plugins(list);
         }
         match self.framework.get().and_then(|weak| weak.upgrade()) {
-            Some(framework) => framework.quarantine(plugin, threshold),
+            Some(framework) => framework.quarantine(plugin, reason),
             // 没回填框架实例（单独一张注册表/测试）时，门控层面的停用已经生效
             None => {
                 crate::runtime::log::error(format!(
@@ -138,6 +139,42 @@ impl HealthBoard {
                 ));
                 true
             }
+        }
+    }
+
+    /// 看门狗阈值：读 arona.yml 的 `framework.slow_job_secs`。
+    ///
+    /// 走这条路而不是让任务条目自己拿框架实例，是因为条目（`TaskEntry`）的布局历史上被
+    /// 插件 dll 按编译期偏移直接读过——见 `quartz.rs` 里 `is_finished` 上面那段注释。
+    /// 没回填框架实例（单独一张注册表、单元测试）时退回编译期默认。
+    pub fn slow_job_limit(&self) -> std::time::Duration {
+        let secs = self
+            .framework
+            .get()
+            .and_then(|weak| weak.upgrade())
+            .map(|framework| framework.settings().config().framework.slow_job_secs)
+            .unwrap_or(crate::quartz::SLOW_JOB_LIMIT_SECS);
+        std::time::Duration::from_secs(secs)
+    }
+
+    /// 停用某插件，并把一份完整说明发到 `config/arona.yml` 的 managers 私聊。
+    ///
+    /// 通报只在**任务执行超时**这一族发；panic 停用仍按原样只写日志（2026-10-12 用户定的口径）。
+    pub fn isolate_and_report(&self, plugin: &str, reason: &str, detail: String) {
+        let host = self.framework.get().and_then(|weak| weak.upgrade());
+        self.isolate(plugin, reason);
+        let Some(framework) = host else {
+            // 单独一张注册表（测试）：停用已在门控层生效，没有连接可发，退化成日志
+            crate::runtime::log::warning(format!("{detail}\n（本次没有框架实例，通报发不出去）"));
+            return;
+        };
+        let for_log = detail.clone();
+        if crate::runtime::reactor::spawn(async move {
+            report_to_managers(&framework, &detail).await;
+        })
+        .is_none()
+        {
+            crate::runtime::log::warning(format!("{for_log}\n（运行时未就绪，通报发不出去）"));
         }
     }
 
@@ -154,6 +191,25 @@ impl HealthBoard {
     /// 撤销某插件的记账（停用时清干净）
     pub fn forget(&self, plugin: &str) {
         self.failures.lock().unwrap().remove(plugin);
+    }
+}
+
+/// 把一份说明逐个发到 `config/arona.yml` 的 managers 私聊。
+///
+/// 一个都没配时**必须留一条日志**：静默丢掉通报，等于看门狗白装——用户既收不到消息，
+/// 也不知道自己少配了一项。
+async fn report_to_managers(framework: &std::sync::Arc<crate::framework::Framework>, text: &str) {
+    let targets = framework.settings().config().managers;
+    if targets.is_empty() {
+        crate::runtime::log::warning(format!(
+            "{text}\n（config/arona.yml 的 managers 一个都没配，这条通报发不出去）"
+        ));
+        return;
+    }
+    let bot = crate::bot::Bot::of(framework);
+    for id in targets {
+        bot.send_text(crate::runtime::message::MessageTarget::Private(id), text)
+            .await;
     }
 }
 

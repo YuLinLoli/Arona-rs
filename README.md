@@ -185,6 +185,7 @@ group_settings:
 framework:
   panic_disable_threshold: 5     # 同一插件连续 panic 多少次就自动隔离停用（0 = 只记日志、不停用）
   prefix_match_by_default: false # 未声明 with_prefix_match 的命令是否也允许最短前缀匹配
+  slow_job_secs: 180             # 单次定时任务满多少秒算卡住：停用该插件并通报 managers（0 = 关掉看门狗）
 
 # 聊天记录缓存：插件做「引用回复」与「按存储 id 撤回」的依据（data/arona/chatlog.db）
 chatlog:

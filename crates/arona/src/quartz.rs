@@ -17,8 +17,121 @@ pub type JobFn = Arc<dyn Fn() + Send + Sync + 'static>;
 /// 单次任务执行超过这么多秒，就判定为「卡住」：通报 `managers` 并停用该插件。
 ///
 /// 3 分钟是用户 2026-10-12 定的。它比一轮正常检测（抓图、绘图、发若干条消息）宽，
-/// 又远小于"卡到把线程白占十分钟"。想关掉把 `framework.slowJobSecs` 配成 0。
+/// 又远小于"卡到把线程白占十分钟"。想关掉把 `framework.slow_job_secs` 配成 0。
 pub(crate) const SLOW_JOB_LIMIT_SECS: u64 = 180;
+
+/// 全局递增的触发序号，每次 [`TaskEntry::begin_fire`] 取一个。
+static FIRE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 看门狗线程的轮询步长：阈值最迟晚这么久才被兑现，对 180 秒这一档可以忽略。
+const WATCH_TICK_SECS: u64 = 1;
+
+/// 正在执行的那一次：任务名 → 到点该动用的处置凭据。
+///
+/// 特意做成旁路表而不是塞进 `TaskEntry`：那个结构体的布局历史上被插件 dll 按编译期偏移
+/// 直接读过（见 [`TaskEntry::is_finished`] 上面那段注释），加字段就得重做旧 dll 的兼容性实测。
+/// 它也不是插件可见的宿主状态——插件读不到、也不需要读这张表。
+#[derive(Clone)]
+struct FireRecord {
+    /// 本次触发的序号。同名任务的下一次触发会盖掉这条记录，`end_fire` 据此认出
+    /// 表里躺着的是不是自己那一次——别把别人的（或看门狗已经收走的那次）当成自己的摘掉。
+    seq: u64,
+    deadline: std::time::Instant,
+    group: String,
+    detail: String,
+    board: Arc<HealthBoard>,
+}
+
+fn in_flight() -> &'static std::sync::Mutex<std::collections::HashMap<String, FireRecord>> {
+    static TABLE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, FireRecord>>,
+    > = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// 扫一遍表：拖过 deadline 的那些停用、通报，并从表里收掉。
+fn sweep_in_flight() {
+    let now = std::time::Instant::now();
+    let overdue = {
+        let mut table = in_flight().lock().unwrap();
+        let mut hits = Vec::new();
+        table.retain(|_, record| {
+            if record.deadline <= now {
+                hits.push(record.clone());
+                false
+            } else {
+                true
+            }
+        });
+        hits
+    };
+    // 处置在锁外做：isolate 要拿门控与注册表的锁，绝不能一边持着这张表一边去
+    for record in overdue {
+        record
+            .board
+            .isolate_and_report(&record.group, "定时任务执行超时", record.detail);
+    }
+}
+
+/// 看门狗线程只起一次。
+///
+/// 计时**不能挂在 tokio 上**：任务体是同步跑的，它卡住一个 worker 线程时同一个 runtime 上的
+/// 定时器一起被拖住——实测 1 秒的阈值要 2.2 秒才醒。而"卡住 worker"正是这条看门狗要看护的
+/// 那种故障，拿被拖住的表去量它，等于在最该动手的那一刻闭眼。
+fn spawn_watcher_once() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        let started = std::thread::Builder::new()
+            .name("arona-job-watchdog".to_string())
+            .spawn(|| {
+                loop {
+                    std::thread::sleep(Duration::from_secs(WATCH_TICK_SECS));
+                    sweep_in_flight();
+                }
+            });
+        if let Err(err) = started {
+            crate::runtime::log::warning(format!(
+                "定时任务看门狗线程没起来：{err}——单次执行超时之后不会再有通报与停用"
+            ));
+        }
+    });
+}
+
+/// 这条任务类型的可读描述，进通报正文。
+fn kind_label(kind: &TaskKind) -> String {
+    match kind {
+        TaskKind::Daily { hour } => format!("每天 {hour:02} 点"),
+        TaskKind::Repeat { interval_secs } => format!("每 {interval_secs} 秒"),
+        TaskKind::SingleAt { ts_ms } => {
+            let at = chrono::DateTime::from_timestamp_millis(*ts_ms)
+                .map(|moment| {
+                    moment
+                        .with_timezone(&chrono::Local)
+                        .format("%Y-%m-%d %H:%M:%S")
+                        .to_string()
+                })
+                .unwrap_or_else(|| format!("{ts_ms}"));
+            format!("单次，排在 {at}")
+        }
+    }
+}
+
+/// 超时通报的正文：插件名 / 任务详情 / 内容 / 失败原因 四项各占一行。
+///
+/// 单独做成纯函数，是为了能用单测钉住"四项齐全"——这是运维唯一的现场证据，
+/// 缺一项就得让人去翻日志猜是哪家插件、哪条任务。
+fn slow_job_report(
+    name: &str,
+    plugin: &str,
+    kind: &TaskKind,
+    limit: std::time::Duration,
+) -> String {
+    format!(
+        "【Arona】定时任务执行超时，已停用该插件\n插件：{plugin}\n任务：{name}（{}）\n内容：单次执行满 {} 秒仍未返回，超过 arona.yml 里 framework.slow_job_secs 这一档\n失败原因：任务体阻塞或没在时限内结束；已停用 {plugin} 的命令与事件订阅，它占着的那个线程要等宿主重启才回收",
+        kind_label(kind),
+        limit.as_secs()
+    )
+}
 
 #[derive(Clone)]
 enum TaskKind {
@@ -128,16 +241,58 @@ impl TaskEntry {
         self.canceled.store(true, Ordering::SeqCst);
     }
 
+    /// 开始一次执行：把「到点该动用谁的哪份说明」登记进旁路表，交给看门狗线程去量。
+    /// 返回的序号交给 [`TaskEntry::end_fire`] 收尾。
+    ///
+    /// 计时必须握在任务体外部的线程上：如果等 JobFn 返回之后再测耗时，那真卡死的那一次
+    /// 永远测不到；而挂在 tokio 定时器上，任务体卡住 worker 时连定时器一起被拖住（实测
+    /// 1 秒阈值 2.2 秒才醒），正是它要看护的那种故障让自己闭眼。见 [`spawn_watcher_once`]。
+    ///
+    /// 局限要说清：超时后能做的是停用该插件（不再排它、摘掉它的路由），**没法中断已经在跑的那一次**，
+    /// 它占着的那个 worker 线程要等宿主重启才回来。所以这条是"止损 + 报信"，不是"抢救"。
+    fn begin_fire(&self) -> u64 {
+        let seq = FIRE_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+        let Some(health) = &self.health else {
+            return seq;
+        };
+        let limit = health.slow_job_limit();
+        if limit.as_secs() == 0 {
+            return seq;
+        }
+        in_flight().lock().unwrap().insert(
+            self.name.clone(),
+            FireRecord {
+                seq,
+                deadline: std::time::Instant::now() + limit,
+                group: self.group.clone(),
+                detail: slow_job_report(&self.name, &self.group, &self.kind, limit),
+                board: health.clone(),
+            },
+        );
+        spawn_watcher_once();
+        seq
+    }
+
+    /// 这一次执行返回了：若登记的还是本次序号就摘掉，看门狗线程醒来便知道不用动手。
+    fn end_fire(&self, seq: u64) {
+        let mut table = in_flight().lock().unwrap();
+        if table.get(&self.name).map(|record| record.seq) == Some(seq) {
+            table.remove(&self.name);
+        }
+    }
+
     /// 跑一次任务体，返回是否发生了 panic。
     ///
     /// 不吞的话异常会顺着循环把整个 tokio 任务打死，而表里还留着一条
     /// 看起来正常、永远不会再触发的僵尸任务。
     fn invoke(&self) -> bool {
+        let seq = self.begin_fire();
         // 任务体属于插件：它打的日志挂 `[插件名:定时 任务名]`，不混进 [Arona]
         let source = crate::plugin::log_source(&self.group, &format!("定时 {}", self.name));
         let outcome = crate::runtime::log::with_source(&source, || {
             std::panic::catch_unwind(AssertUnwindSafe(|| (self.run)()))
         });
+        self.end_fire(seq);
         if outcome.is_ok() {
             return false;
         }
@@ -923,7 +1078,8 @@ mod tests {
                 &format!("QuartzProbe{step}"),
                 "QuartzProbePlugin",
                 Arc::new(move || {
-                    sink.lock().unwrap()
+                    sink.lock()
+                        .unwrap()
                         .push(chrono::Utc::now().timestamp_millis() - at);
                 }),
             );
@@ -1164,5 +1320,89 @@ mod tests {
         );
         // 报回来之后同一个句柄还得能正常放掉
         relay_dispose(user);
+    }
+
+    /// 单次执行拖过阈值的任务，要把归属插件从路由上摘掉；按点返回的那条不许被牵连。
+    ///
+    /// 这一族没有 panic 可记：任务体只是不返回。改造前它会一直占着一个 worker 线程，
+    /// 而插件的命令与事件照旧全开，用户那边只看得到"机器人越来越慢"，日志里一句没有。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_job_outliving_the_limit_quarantines_its_plugin() {
+        let framework = crate::framework::Framework::new();
+        let dir = std::env::temp_dir().join(format!("arona-slow-job-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("arona.yml");
+        // 阈值写 1 秒：默认 180 秒没法在测试里等
+        std::fs::write(&path, "framework:\n  slow_job_secs: 1\n").expect("写入测试配置失败");
+        framework
+            .settings()
+            .init(path.clone())
+            .expect("测试配置应能加载");
+        assert_eq!(framework.settings().config().framework.slow_job_secs, 1);
+
+        framework.jobs().create_repeat(
+            3600,
+            "QuartzStuckJob",
+            "QuartzStuckPlugin",
+            Arc::new(|| std::thread::sleep(Duration::from_millis(1_600))),
+        );
+        framework.jobs().create_repeat(
+            3600,
+            "QuartzQuickJob",
+            "QuartzQuickPlugin",
+            Arc::new(|| {}),
+        );
+
+        let mut quarantined = false;
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if framework
+                .gating()
+                .disabled_plugins()
+                .iter()
+                .any(|entry| entry == "QuartzStuckPlugin")
+            {
+                quarantined = true;
+                break;
+            }
+        }
+        framework.jobs().remove("QuartzStuckJob");
+        framework.jobs().remove("QuartzQuickJob");
+        assert!(
+            quarantined,
+            "拖过 1 秒阈值的任务没有被停用——看门狗压根没动手"
+        );
+        let list = framework.gating().disabled_plugins();
+        assert!(
+            !list.iter().any(|entry| entry == "QuartzQuickPlugin"),
+            "按点返回的那条被一起停用了：看门狗误杀的正是它不该碰的插件"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 通报正文的四项是运维唯一的现场证据：少一项就得让人去翻日志猜是哪家插件、哪条任务。
+    #[test]
+    fn the_slow_job_report_carries_all_four_items() {
+        let text = slow_job_report(
+            "BiliDetectCycle",
+            "bilibili-dynamic",
+            &TaskKind::Repeat { interval_secs: 300 },
+            Duration::from_secs(180),
+        );
+        for item in [
+            "插件：bilibili-dynamic",
+            "任务：BiliDetectCycle",
+            "内容：",
+            "失败原因：",
+        ] {
+            assert!(
+                text.contains(item),
+                "通报正文缺了「{item}」这一项：\n{text}"
+            );
+        }
+        // 任务详情要说得出形态与间隔，阈值要说得出数字，否则收到消息也没法复现
+        assert!(text.contains("每 300 秒"), "{text}");
+        assert!(text.contains("180 秒"), "{text}");
     }
 }

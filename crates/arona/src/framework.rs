@@ -285,8 +285,11 @@ impl Framework {
     }
 
     /// 隔离停用某个插件：进停用名单（内存立即生效）→ 回收它登记的一切 → 尽力落盘。
-    /// 用于插件反复 panic 时止血；GUI 的「插件管理」页会看到它被关掉。
-    pub fn quarantine(&self, plugin: &str, threshold: u32) -> bool {
+    ///
+    /// `reason` 直接进日志，所以由调用方说清是哪一族故障（「连续 3 次 panic」/「定时任务执行超时」）：
+    /// 这里过去硬编码 panic 那句，于是超时停用被报成 panic 停用，按错的方向去查插件。
+    /// GUI 的「插件管理」页会看到它被关掉。
+    pub fn quarantine(&self, plugin: &str, reason: &str) -> bool {
         let mut list = self.gating.disabled_plugins();
         if !list.iter().any(|entry| entry == plugin) {
             list.push(plugin.to_string());
@@ -295,7 +298,7 @@ impl Framework {
         let disabled = self.plugins.disable_id(plugin);
         self.health.forget(plugin);
         crate::runtime::log::error(format!(
-            "插件 {plugin} 连续 {threshold} 次 panic，已隔离停用（回收它登记的全部资源）"
+            "插件 {plugin} {reason}，已隔离停用（回收它登记的全部资源）"
         ));
         // 落盘只在进程默认实例上做：隔离实例那份 Settings 没绑定任何真实文件，不该去动磁盘
         if self.is_process_default() {
