@@ -120,14 +120,33 @@ fn kind_label(kind: &TaskKind) -> String {
 ///
 /// 单独做成纯函数，是为了能用单测钉住"四项齐全"——这是运维唯一的现场证据，
 /// 缺一项就得让人去翻日志猜是哪家插件、哪条任务。
+///
+/// 归属为空的条目是**框架自己的维护任务**（见 `runtime::purge::schedule` 那个空 owner），
+/// 那里没有插件可停，所以最后一行不能照抄"已停用  的命令与事件订阅"——那是句谎话，
+/// 而且空格加空插件名看起来像配置坏了。
 fn slow_job_report(
     name: &str,
     plugin: &str,
     kind: &TaskKind,
     limit: std::time::Duration,
 ) -> String {
+    let owner = if plugin.is_empty() {
+        "（框架自身的维护任务）"
+    } else {
+        plugin
+    };
+    let headline = if plugin.is_empty() {
+        "【Arona】定时任务执行超时（框架自身的维护任务，没有插件可停）"
+    } else {
+        "【Arona】定时任务执行超时，已停用该插件"
+    };
+    let action = if plugin.is_empty() {
+        "任务体阻塞或没在时限内结束；它占着的那个线程要等宿主重启才回收"
+    } else {
+        "任务体阻塞或没在时限内结束；已停用该插件的命令与事件订阅，它占着的那个线程要等宿主重启才回收"
+    };
     format!(
-        "【Arona】定时任务执行超时，已停用该插件\n插件：{plugin}\n任务：{name}（{}）\n内容：单次执行满 {} 秒仍未返回，超过 arona.yml 里 framework.slow_job_secs 这一档\n失败原因：任务体阻塞或没在时限内结束；已停用 {plugin} 的命令与事件订阅，它占着的那个线程要等宿主重启才回收",
+        "{headline}\n插件：{owner}\n任务：{name}（{}）\n内容：单次执行满 {} 秒仍未返回，超过 arona.yml 里 framework.slow_job_secs 这一档\n失败原因：{action}",
         kind_label(kind),
         limit.as_secs()
     )
@@ -1404,5 +1423,39 @@ mod tests {
         // 任务详情要说得出形态与间隔，阈值要说得出数字，否则收到消息也没法复现
         assert!(text.contains("每 300 秒"), "{text}");
         assert!(text.contains("180 秒"), "{text}");
+    }
+
+    /// 归属留空的那条是**框架自己的维护任务**（`runtime::purge::schedule` 传的空 owner）。
+    /// 它越线时既不该被"停用"成一个空插件名——那份名单是插件 id 的表，写进一个空串就得靠人
+    /// 手工去 arona.yml 里擦——也不该在通报里说"已停用"，那是句谎话。
+    #[test]
+    fn an_ownerless_maintenance_job_is_reported_but_never_quarantined() {
+        let text = slow_job_report(
+            "PurgeChatLog",
+            "",
+            &TaskKind::Repeat {
+                interval_secs: 345_600,
+            },
+            Duration::from_secs(180),
+        );
+        for item in ["插件：", "任务：PurgeChatLog", "内容：", "失败原因："] {
+            assert!(
+                text.contains(item),
+                "通报正文缺了「{item}」这一项：\n{text}"
+            );
+        }
+        assert!(text.contains("（框架自身的维护任务）"), "{text}");
+        assert!(!text.contains("已停用"), "{text}");
+
+        let framework = crate::framework::Framework::new();
+        assert!(
+            !framework.health().isolate("", "定时任务执行超时"),
+            "空归属不该被当成一次成功的停用"
+        );
+        assert!(
+            framework.gating().disabled_plugins().is_empty(),
+            "停用名单里被塞进了一个空插件名：{:?}",
+            framework.gating().disabled_plugins()
+        );
     }
 }

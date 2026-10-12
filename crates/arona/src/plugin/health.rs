@@ -124,6 +124,13 @@ impl HealthBoard {
     /// 所以调用方得说清是哪一族故障，别让超时停用读起来像 panic。
     /// 返回 true 表示停用已生效。
     pub fn isolate(&self, plugin: &str, reason: &str) -> bool {
+        if plugin.is_empty() {
+            // 归属留空是**框架自己的维护任务**（`runtime::purge::schedule` 那个空 owner）：
+            // 没有插件可停，硬走下去只会往 arona.yml 的 disabled_plugins 里塞一个空串，
+            // 而那份名单是插件 id 的表——脏一行，GUI 的插件页和用户的手工启用都得跟着费解。
+            crate::runtime::log::warning(format!("框架自身的{reason}，没有归属插件可停用"));
+            return false;
+        }
         // 先进停用名单：这一步就让它的命令与钩子从路由上消失，不必等下面的完整回收
         let mut list = self.gating.disabled_plugins();
         if !list.iter().any(|entry| entry == plugin) {
@@ -219,5 +226,72 @@ impl Default for HealthBoard {
             Framework::DEFAULT_PANIC_THRESHOLD,
             Arc::new(Gating::default()),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::message::{
+        BoxFuture, MessageReceipt, MessageSegment, MessageSender, MessageTarget, OutgoingMessage,
+    };
+
+    /// 记下交给实现端的每一条出站目标与正文（端到端壳量不到这一路，见下面那条用例的说明）
+    #[derive(Default)]
+    struct Recorder(Mutex<Vec<(MessageTarget, String)>>);
+
+    impl MessageSender for Recorder {
+        fn send<'a>(
+            &'a self,
+            target: MessageTarget,
+            message: OutgoingMessage,
+        ) -> BoxFuture<'a, MessageReceipt> {
+            let text = match message.segments.first() {
+                Some(MessageSegment::Text(text)) => text.clone(),
+                Some(other) => format!("{other:?}"),
+                None => String::new(),
+            };
+            self.0.lock().unwrap().push((target, text));
+            Box::pin(async { MessageReceipt::new(Some(1)) })
+        }
+    }
+
+    /// 通报要真的落到**每一个** manager 的私聊里。少发一个，对那个人来说看门狗就是白装的：
+    /// 插件被停了手，他却什么也没收到。
+    ///
+    /// 这一路端到端壳量不到：插件的慢活儿是 `ctx.spawn` 出去的 async，同步任务体远短于阈值，
+    /// 所以壳那一轮只钉得住「不误杀」（实测把阈值压到 1 秒，检测主干一条都没被停用）。
+    /// 「报得出」只能在这里钉。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_timeout_report_reaches_every_manager() {
+        let framework = crate::framework::Framework::new();
+        let dir =
+            std::env::temp_dir().join(format!("arona-watchdog-report-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("arona.yml");
+        std::fs::write(&path, "managers: [111, 222]\n").expect("写入测试配置失败");
+        framework
+            .settings()
+            .init(path.clone())
+            .expect("测试配置应能加载");
+
+        let recorder = Arc::new(Recorder::default());
+        framework
+            .runtime_services()
+            .set_message_sender(recorder.clone());
+        report_to_managers(&framework, "标题\n插件：x\n失败原因：任务体没在时限内结束").await;
+
+        let sent = recorder.0.lock().unwrap().clone();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(sent.len(), 2, "两个 manager 只发出去 {}", sent.len());
+        for id in [111i64, 222] {
+            assert!(
+                sent.iter()
+                    .any(|(target, text)| *target == MessageTarget::Private(id)
+                        && text.contains("失败原因：")),
+                "manager {id} 没收到那条私聊：{sent:?}"
+            );
+        }
     }
 }
