@@ -292,7 +292,7 @@ fn install(&self, reg: &PluginRegistrar) -> Result<(), String> {
 }
 ```
 
-GUI「群管理 → 功能开关」与配置模板注释都据此生成。拿不到 `reg` 的地方（如自由函数）可用等价的
+GUI「插件管理 → 功能开关」与配置模板注释都据此生成。拿不到 `reg` 的地方（如自由函数）可用等价的
 `arona::admin::register_feature(feature, PLUGIN_ID)`。
 
 **这一层的字符串 key 全是 `&'static str`**：`Feature` 的三个字段、`reg.config::<T>(key)` 与 §12 的
@@ -853,22 +853,24 @@ notify.update(|c| c.every_day_hour = 20)?;           // 读—改—写：落盘
 
 | 层级 | 开关来源 | 生效点 |
 | --- | --- | --- |
+| 功能（全局） | `arona.yml` → `disabled_features` | `feature_enabled` 的第一道：所有群**加私聊**都不响应 |
 | 功能（分群） | `arona.yml` → `group_settings.<群号>.disabled_features` | `runtime::config::feature_enabled(group_id, key)`：命令路由，以及 `ctx.listen_feature(..)` 绑了该 key 的钩子 |
 | 插件（分群） | `arona.yml` → `group_settings.<群号>.disabled_plugins` | `plugin_enabled_in_group`，命令与钩子（入站、出站）一起停 |
 | 插件（全局） | `arona.yml` → `disabled_plugins` | 不 configure、不 start、不路由、不收事件、也不改写别人发的消息 |
 
-`feature_enabled` 先看功能归属插件是否启用（`feature_owner` → `plugin_enabled`），再看该群的功能/插件名单，
-所以「整体停用插件」自动覆盖它名下所有功能。命令路由的最后一道兜底是
-`plugin::dispatcher_active_in_group(group_id)`：插件被停用时，**没绑定功能 key 的命令也进不去**。
+`feature_enabled` 三道按写的顺序走：先看这个 key 有没有被**全局**关掉，再看归属插件是否启用
+（`feature_owner` → `plugin_enabled`），最后才看该群的功能/插件名单——所以「整体停用插件」自动覆盖它名下
+所有功能，而群名单只能在主开关之上继续往下减，**不能把全局关掉的 key 在某个群里翻案**。
+命令路由的最后一道兜底是 `plugin::dispatcher_active_in_group(group_id)`：插件被停用时，
+**没绑定功能 key 的命令也进不去**。
 
-展示层跟着收口，但不改任何判定：GUI「群管理」的功能清单走 `runtime::config::features()`，它会跳过
-被全局停用的插件的功能（摆一排永远勾不上的复选框没有意义，要恢复请到「插件管理」页）。
-`features_of(plugin)`（插件卡片上"本插件提供哪些功能"，卡片自带 `enabled`）与 `feature_keys_text()`
-（写进 `arona.yml` 的"可用功能 key"注释）**不过滤**——停用中也得看得见 key 叫什么名字。
+两份清单的分工照旧：`features_of(plugin)`（插件详情页那一列，卡片自带 `enabled`）与 `feature_keys_text()`
+（写进 `arona.yml` 的"可用功能 key"注释）**不过滤**——停用中也得看得见 key 叫什么名字；
+`features()` 留给"只列当前用得上"的展示层，它会跳过被全局停用的插件的功能。
 
-GUI 里这一栏按**提供它的插件分组**（用 `feature_owner` 归类），每组默认收起、点插件名展开/收起：组头的
-勾选框一次开关该插件在本群的全部功能（走 `admin::set_group_features`，一批 key 只落盘一次），展开后
-仍可单项开关；插件只在本群被停用时整组灰掉，因为那种情况下勾了也不生效。
+GUI 侧的功能开关现在按插件聚合在「插件管理」页：每个功能一行，那行上的勾选框管**全局**这一道，
+展开后是这个插件出现过的每个群单独关不关该项（走 `admin::set_group_feature`，落 `group_settings`）。
+「群管理」页不再编辑功能与插件，只在有事时报一行「本群的例外」并指路到这一页。
 
 **`stop()` 只需关掉自己持有的句柄**（数据库连接、文件句柄）。后台任务、定时任务、事件订阅
 （入站钩子与出站钩子一起收）、命令、共享能力（容器）、服务开关条目
@@ -1088,7 +1090,7 @@ async fn demo(ctx: &arona::runtime::dispatcher::CommandContext) {
 **收到的**消息只会是前两种；`Temp` 只在出站时用，`target.group()` 会把它报成来源群，
 门控（§13）与出站记账都按那个群算。
 
-### 14.3 会话展示板：让 GUI 的「群管理」页列出你的订阅条目
+### 14.3 会话展示板：让 GUI 的「插件管理」页列出你的订阅条目
 
 框架 GUI 只有一张群列表，它读不到、也不该去读插件自己的 `data/<插件>/store.yml`（框架本体里不许
 出现任何插件信息）。想让用户在面板里看见"这个群订了谁"，得**由你报上来**：
@@ -1549,7 +1551,7 @@ mirai 的插件和框架在同一个 ClassLoader 树里，`MiraiInstance` 只有
 | 宿主登记的 tokio 句柄 | 在 GUI 主线程上装配插件时（面板里关掉再打开），`ctx.spawn` / 定时任务照样投得出去 |
 | 宿主的 HTTP 代发通道 | `arona::runtime::http::*`（§14.1）把请求递给宿主那份 reqwest，插件不必自带客户端；举 `wanting_headers` 旗还能把响应头（含跳转链上每一跳的 `Set-Cookie`）一并拿回来 |
 | 宿主的定时任务通道 | `ctx.daily_job`/`repeat_job`/`single_job`/`delay_job`/`remove_job` 与 `arona::quartz::*` 都落到宿主那张表；条目由宿主分配与释放，插件只交一个回调句柄（§10） |
-| 宿主的会话展示板 | `ctx.publish_rows`/`clear_rows` 把"这个会话里我订了什么"交给宿主，GUI 的「群管理」页按通用形状列出来（§14.3）。框架不读插件的数据文件，也不解释这些文字 |
+| 宿主的会话展示板 | `ctx.publish_rows`/`clear_rows` 把"这个会话里我订了什么"交给宿主，GUI 的「插件管理」页按通用形状列出来（§14.3）。框架不读插件的数据文件，也不解释这些文字 |
 
 所以**插件写起来和同仓静态编译时一样**：能用 `ctx` 就用 `ctx`（下面那条禁令的真实含义）。
 接管由宏与装载器完成，插件代码里没有任何对应的手续。

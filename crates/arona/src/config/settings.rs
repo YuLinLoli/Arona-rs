@@ -138,6 +138,7 @@ impl Settings {
         gating.set_global_blacklist(new_config.global_blacklist.clone());
         gating.set_group_settings(new_config.group_settings.clone());
         gating.set_disabled_plugins(new_config.disabled_plugins.clone());
+        gating.set_disabled_features(new_config.disabled_features.clone());
         // 框架行为选项写进所属实例的活状态：阈值在健康度板上，前缀开关在命令表上
         framework.set_panic_disable_threshold(new_config.framework.panic_disable_threshold);
         framework.set_prefix_match_by_default(new_config.framework.prefix_match_by_default);
@@ -398,6 +399,21 @@ impl Settings {
         self.persist(&config)
     }
 
+    /// 全局启用/停用某个功能 key（GUI「插件管理」页按插件列出的那些开关）。
+    ///
+    /// 与分群那一份的差别在范围：这里关一次，所有群加**私聊**都不响应。而且它是主开关——
+    /// 群名单只能往上再减，不能把已全局关掉的 key 在某个群里翻案
+    /// （判据见 [`crate::runtime::config::Gating::feature_enabled`]）。
+    pub fn set_feature_enabled_globally(&self, key: &str, enabled: bool) -> Result<(), String> {
+        let mut config = self.config();
+        config.disabled_features.retain(|item| item != key);
+        if !enabled {
+            config.disabled_features.push(key.to_string());
+            config.disabled_features.sort();
+        }
+        self.persist(&config)
+    }
+
     /// 在某个群里启用/停用某个插件（GUI「群管理」页）。只影响路由，不动插件的后台任务。
     pub fn set_group_plugin_enabled(
         &self,
@@ -573,6 +589,11 @@ pub fn set_group_blacklist(group_id: i64, user_id: i64, blacklisted: bool) -> Re
 /// 写盘后 apply 会调 [`crate::plugin::sync_enabled_state`]：停用即 stop()，启用即补 configure()+start()。
 pub fn set_plugin_enabled(plugin: &str, enabled: bool) -> Result<(), String> {
     host().set_plugin_enabled(plugin, enabled)
+}
+
+/// 全局启用/停用某个功能 key（GUI「插件管理」页）。关一次，所有群加私聊都不响应。
+pub fn set_feature_enabled_globally(key: &str, enabled: bool) -> Result<(), String> {
+    host().set_feature_enabled_globally(key, enabled)
 }
 
 /// 在某个群里启用/停用某个插件（GUI「群管理」页）。只影响路由，不动插件的后台任务。

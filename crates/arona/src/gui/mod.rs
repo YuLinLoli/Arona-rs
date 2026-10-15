@@ -4,7 +4,6 @@
 //! 运行：arona-rs 默认打开本面板，arona-rs --nogui 只启动命令行(黑窗口)
 use crate::admin;
 use crate::config::onebot::{ConnectionType, OneBotConfig};
-use crate::runtime::config as runtime_config;
 use crate::runtime::paths;
 use eframe::egui;
 use std::sync::Arc;
@@ -252,6 +251,35 @@ fn card(dark: bool) -> egui::Frame {
 ///
 /// 单独抽成一个**纯函数**是因为：这段拼法一旦错行（漏了名字、把上限当成了总数），
 /// 在真实面板上要人肉盯才知道，而它又是唯一决定"这个群看上去订了谁"的地方。
+/// 插件页左栏的过滤：名字或 id 任一命中就算。关键字在这里自己归一（trim + 小写），
+/// 不靠调用方记得先转——否则"输入 BILI 一家都不显示"这种毛病只会在界面上冒出来。
+fn plugin_matches(info: &admin::PluginInfo, filter: &str) -> bool {
+    let needle = filter.trim().to_lowercase();
+    needle.is_empty()
+        || info.name.to_lowercase().contains(&needle)
+        || info.id.to_lowercase().contains(&needle)
+}
+
+/// 群号对应的群名。只有连着 OneBot 拉到群列表时才认得；拉不到返回空串，
+/// 调用方那就只显群号——预添加的群本来也可能还没被机器人加进去。
+fn group_name(groups: &[admin::GroupInfo], group_id: i64) -> String {
+    groups
+        .iter()
+        .find(|info| info.group_id == group_id)
+        .map(|info| info.name.clone())
+        .unwrap_or_default()
+}
+
+/// 一列群号的展示文案：有群名就跟在后面，读不到就只剩群号。
+/// 拼不出群名时不能留那个分隔符——那会让人以为群名被吞了，而不是"这台机器还没连上"。
+fn group_display(group_id: i64, name: &str) -> String {
+    if name.is_empty() {
+        group_id.to_string()
+    } else {
+        format!("{group_id}　{name}")
+    }
+}
+
 fn shown_preview(rows: &[(String, crate::views::ViewRow)]) -> String {
     const LINE_LIMIT: usize = 3;
     const ITEM_LIMIT: usize = 3;
@@ -430,6 +458,11 @@ struct AronaGui {
     only_blacklisted: bool,
     // 插件管理
     plugins: Vec<admin::PluginInfo>,
+    /// 左栏选中的插件 id：这一页改成与「群管理」同形的「列表 + 详情」，只是索引方向反过来
+    selected_plugin: Option<String>,
+    plugin_filter: String,
+    /// 「启用群」里那个待添加的群号输入框（填进去写的是 config.groups，机器人没在的群也能先填）
+    plugin_group_input: String,
     // OneBot 连接
     onebot: Option<OneBotConfig>,
     onebot_error: Option<String>,
@@ -469,6 +502,9 @@ impl AronaGui {
             member_filter: String::new(),
             only_blacklisted: false,
             plugins: Vec::new(),
+            selected_plugin: None,
+            plugin_filter: String::new(),
+            plugin_group_input: String::new(),
             onebot: None,
             onebot_error: None,
             new_type: ConnectionType::WebSocket,
@@ -802,7 +838,7 @@ impl AronaGui {
             self.empty_state(
                 ui,
                 "还没有选择群",
-                "在左侧点一个群，就能配置插件开关、功能开关与成员黑名单",
+                "在左侧点一个群，就能配置成员黑名单；插件与功能的开关请到「插件管理」页按插件改",
             );
             return;
         };
@@ -846,255 +882,21 @@ impl AronaGui {
                 }
             });
         });
-        // 插件在这个群登记的条目。框架只搬运：不认得这些标题与名字是什么，也不据它们做任何判定。
-        let shown = admin::peer_rows(group_id);
-        if !shown.is_empty() {
+        // 功能开关与插件开关都改到「插件管理」页编辑了（那一页按插件管它的功能与启用群）。
+        // 这里只报状态并指路：编辑口留一处，两处都能改同一份名单迟早互相打脸。
+        let off_features = info.as_ref().map(|item| item.disabled_count).unwrap_or(0);
+        let off_plugins = admin::group_disabled_plugins(group_id).len();
+        if off_features > 0 || off_plugins > 0 {
             ui.add_space(10.0);
             card_row(ui, dark, |ui| {
-                section_title(ui, "订阅条目");
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(
-                            "由各插件登记、框架只负责列出来。私聊/好友上的订阅这里不显示——\
-                             GUI 只有群这一张列表，那一路用插件自己的命令查。",
-                        )
-                        .size(12.0)
-                        .weak(),
-                    )
-                    .selectable(false),
-                );
-                ui.add_space(4.0);
-                // 来路不止一个插件时才标插件名：只有一家时那一行字是噪音
-                let many = shown
-                    .iter()
-                    .map(|(plugin, _)| plugin.as_str())
-                    .collect::<std::collections::BTreeSet<_>>()
-                    .len()
-                    > 1;
-                for (plugin, row) in &shown {
-                    if many {
-                        ui.weak(plugin);
-                    }
-                    let items = if row.items.is_empty() {
-                        "（现在没有）".to_string()
-                    } else {
-                        row.items.join("、")
-                    };
-                    ui.label(format!("{}：{items}", row.label));
-                }
+                section_title(ui, "本群的例外");
+                ui.weak(format!(
+                    "这个群单独关掉了 {off_features} 项功能、{off_plugins} 个插件。\n\
+                     要改请到「插件管理」页选中那家插件：功能在「功能开关」里展开本群，\
+                     插件本身在「启用的群」里勾回本群。"
+                ));
             });
         }
-        ui.add_space(10.0);
-        card_row(ui, dark, |ui| {
-            section_title(ui, "功能开关");
-            ui.add(
-                egui::Label::new(
-                    egui::RichText::new(
-                        "按插件分组（默认收起）：点插件名展开/收起，组头的「全部」一次开关该插件在本群\
-                         的所有功能，展开后也能只关其中一项",
-                    )
-                    .size(12.0)
-                    .weak(),
-                )
-                .selectable(false),
-            );
-            ui.add_space(4.0);
-            // 功能清单本身是登记顺序，按归属插件聚在一起即可（不重排插件先后）
-            let mut groups: Vec<(String, Vec<(runtime_config::Feature, bool)>)> = Vec::new();
-            for feature in admin::features() {
-                let enabled = runtime_config::feature_enabled(Some(group_id), feature.key);
-                let owner = runtime_config::feature_owner(feature.key).unwrap_or_default();
-                match groups.iter_mut().find(|(plugin, _)| *plugin == owner) {
-                    Some((_, rows)) => rows.push((feature, enabled)),
-                    None => groups.push((owner, vec![(feature, enabled)])),
-                }
-            }
-            let names = crate::plugin::metas();
-            if groups.is_empty() {
-                ui.weak(
-                    "这里没有可关的功能：功能由各插件登记，插件被整体停用时它名下功能不再列出\
-                     （要到「插件管理」页恢复启用）",
-                );
-            }
-            for (plugin, rows) in &groups {
-                let display = names
-                    .iter()
-                    .find(|meta| meta.id == plugin)
-                    .map(|meta| meta.name.to_string())
-                    .unwrap_or_else(|| {
-                        if plugin.is_empty() {
-                            "未归属插件".to_string()
-                        } else {
-                            plugin.clone()
-                        }
-                    });
-                // 插件在本群停用期间它的功能必然全关（门控连带判掉），整组开关点了也不会生效，
-                // 所以组头只留提示，勾不动
-                let plugin_on = plugin.is_empty()
-                    || runtime_config::plugin_enabled_in_group(plugin, Some(group_id));
-                let on = rows.iter().filter(|(_, enabled)| *enabled).count();
-                let mut all_on = on == rows.len();
-                let id = ui.make_persistent_id(("group_feature_panel", group_id, plugin));
-                // 默认收起：一个插件登记十几项功能，全展开会把群详情撑得看不到别的卡片
-                let mut state =
-                    egui::containers::collapsing_header::CollapsingState::load_with_default_open(
-                        ui.ctx(),
-                        id,
-                        false,
-                    );
-                let mut batch: Option<bool> = None;
-                let mut single: Option<(String, String, bool)> = None;
-                ui.horizontal(|ui| {
-                    // 展开箭头自绘：默认字体里没有 ▸/▾ 这个字形，画出来才不会出现方框
-                    let (caret_id, caret_rect) =
-                        ui.allocate_space(egui::vec2(ui.spacing().indent, ui.spacing().icon_width));
-                    let caret = ui.interact(caret_rect, caret_id, egui::Sense::click());
-                    egui::containers::collapsing_header::paint_default_icon(
-                        ui,
-                        if state.is_open() { 1.0 } else { 0.0 },
-                        &caret,
-                    );
-                    let title = ui.add(
-                        egui::Label::new(egui::RichText::new(display.as_str()).strong().size(14.5))
-                            .selectable(false)
-                            .sense(egui::Sense::click()),
-                    );
-                    if caret.clicked() || title.clicked() {
-                        state.toggle(ui);
-                    }
-                    title.on_hover_text("点一下展开/收起本组功能");
-                    if !plugin_on {
-                        ui.colored_label(warn_color(dark), "(本插件已在「插件开关」里停用)");
-                        return;
-                    }
-                    if ui
-                        .checkbox(&mut all_on, "全部")
-                        .on_hover_text("勾上=本组功能在该群全部开启，去掉=全部关闭")
-                        .changed()
-                    {
-                        batch = Some(all_on);
-                    }
-                    let off = rows.len() - on;
-                    if off == rows.len() {
-                        ui.weak("全部已关闭");
-                    } else if off > 0 {
-                        ui.colored_label(
-                            warn_color(dark),
-                            format!("已关 {off} / {} 项", rows.len()),
-                        );
-                    }
-                });
-                // 展开状态直接决定画不画，不走 show_body_indented：那条路径按动画插值取可见性，
-                // 插值首帧是 0，得靠重绘才推进，收起/展开的观感反而不确定
-                if state.is_open() {
-                    ui.indent(id, |ui| {
-                        if !plugin_on {
-                            ui.weak("以下开关要先到「插件开关」里启用该插件才会生效");
-                            ui.disable();
-                        }
-                        ui.horizontal(|ui| {
-                            if ui.button("全部启用").clicked() {
-                                batch = Some(true);
-                            }
-                            if ui.button("全部停用").clicked() {
-                                batch = Some(false);
-                            }
-                        });
-                        egui::Grid::new(("feature_grid", group_id, plugin))
-                            .num_columns(2)
-                            .spacing([16.0, 6.0])
-                            .show(ui, |ui| {
-                                for (feature, enabled) in rows {
-                                    let mut enabled = *enabled;
-                                    if ui.checkbox(&mut enabled, feature.name).changed() {
-                                        single = Some((
-                                            feature.key.to_string(),
-                                            feature.name.to_string(),
-                                            enabled,
-                                        ));
-                                    }
-                                    ui.weak(feature.description);
-                                    ui.end_row();
-                                }
-                            });
-                    });
-                }
-                state.store(ui.ctx());
-                let keys = rows
-                    .iter()
-                    .map(|(feature, _)| feature.key)
-                    .collect::<Vec<_>>();
-                if let Some(enabled) = batch {
-                    self.note(
-                        admin::set_group_features(group_id, &keys, enabled).map(|()| {
-                            format!(
-                                "{display} 在本群的 {} 项功能已{}",
-                                keys.len(),
-                                if enabled {
-                                    "全部启用"
-                                } else {
-                                    "全部停用"
-                                }
-                            )
-                        }),
-                    );
-                }
-                if let Some((key, name, enabled)) = single {
-                    self.note(admin::set_group_feature(group_id, &key, enabled).map(|()| {
-                        format!(
-                            "{name} 在本群已{}（写入 {}）",
-                            if enabled { "启用" } else { "关闭" },
-                            admin::arona_file()
-                        )
-                    }));
-                }
-            }
-        });
-        ui.add_space(10.0);
-        card_row(ui, dark, |ui| {
-            section_title(ui, "插件开关");
-            ui.add(
-                egui::Label::new(
-                    egui::RichText::new(
-                        "取消勾选即在本群停用该插件：它名下的命令与事件一律不响应，\
-                         配置和数据不受影响（在「插件管理」页整体停用时这里会显示为灰色）",
-                    )
-                    .size(12.0)
-                    .weak(),
-                )
-                .selectable(false),
-            );
-            ui.add_space(4.0);
-            let metas = crate::plugin::metas();
-            if metas.is_empty() {
-                ui.weak("未加载任何功能插件。");
-            }
-            let disabled = admin::group_disabled_plugins(group_id);
-            for meta in metas {
-                let mut enabled = !disabled.iter().any(|id| id.eq_ignore_ascii_case(meta.id));
-                ui.horizontal(|ui| {
-                    if !runtime_config::plugin_enabled(meta.id) {
-                        ui.colored_label(warn_color(dark), "●");
-                        ui.weak(meta.name);
-                        ui.weak("(已在「插件管理」页整体停用)");
-                    } else if ui
-                        .checkbox(&mut enabled, meta.name)
-                        .on_hover_text(meta.description)
-                        .changed()
-                    {
-                        self.note(
-                            admin::set_group_plugin_enabled(group_id, meta.id, enabled).map(|()| {
-                                format!(
-                                    "插件 {} 在本群已{}",
-                                    meta.name,
-                                    if enabled { "启用" } else { "停用" }
-                                )
-                            }),
-                        );
-                    }
-                });
-            }
-        });
         ui.add_space(10.0);
         card_row(ui, dark, |ui| {
             ui.horizontal(|ui| {
@@ -1229,125 +1031,364 @@ impl AronaGui {
         });
     }
 
-    // ==================== 插件管理 ====================
+    // ==================== 插件管理（列表 + 详情） ====================
 
-    /// 已编译进本程序的插件清单，以及每个插件的整体停用/启用开关
-    fn plugin_manager(&mut self, ui: &mut egui::Ui) {
-        let dark = ui.visuals().dark_mode;
-        section_title(ui, "插件管理");
-        ui.add_space(6.0);
-        ui.weak(
-            "插件随程序一起编译，安装/升级由安装包负责；这里的「停用」= 不装配、\
-             不接收任何消息与事件，配置和数据都原样保留，随时可以再打开。\n\
-             只想在某个群里停用某插件：去「群管理」→ 选中群 → 插件开关。",
-        );
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            if ui.button("刷新").clicked() {
-                self.plugins = admin::plugin_list();
-            }
-            ui.weak(format!(
-                "插件开关写在 {} 的 disabled_plugins，改完保存即热生效",
-                admin::arona_file()
-            ));
-        });
-        ui.add_space(6.0);
-
-        let plugins = self.plugins.clone();
-        if plugins.is_empty() {
-            ui.weak("未加载任何功能插件（框架只提供 OneBot 通道与管理面板）。");
-            return;
-        }
-        let mut toggle: Option<(String, bool)> = None;
-        for info in plugins {
-            let mut pending = None;
-            card_row(ui, dark, |ui| {
-                ui.horizontal(|ui| {
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(info.name.as_str()).strong().size(15.0),
-                        )
-                        .selectable(false),
-                    );
-                    ui.colored_label(accent(dark), format!("v{}", info.version));
-                    let mut enabled = info.enabled;
-                    let state = if enabled { "已启用" } else { "已停用" };
-                    if ui.checkbox(&mut enabled, state).changed() {
-                        pending = Some((info.id.clone(), enabled));
-                    }
-                    if !info.enabled {
-                        ui.colored_label(warn_color(dark), "(不装配、不响应事件)");
-                    }
-                });
-                if !info.description.is_empty() {
-                    ui.weak(info.description.as_str());
-                }
-                // 功能清单最长，塞进 Grid 会把列撑到超出面板，单独一行才跟着窗口宽度换行
-                ui.horizontal_wrapped(|ui| {
-                    ui.weak("功能");
-                    if info.features.is_empty() {
-                        ui.weak("无（不占用分群功能开关）");
-                    } else {
-                        let text = info
-                            .features
-                            .iter()
-                            .map(|feature| format!("{} {}", feature.key, feature.name))
-                            .collect::<Vec<_>>()
-                            .join(" / ");
-                        ui.label(text);
-                    }
-                });
-                ui.add_space(2.0);
-                egui::Grid::new(format!("plugin_{}_grid", info.id))
-                    .num_columns(2)
-                    .spacing([12.0, 4.0])
-                    .show(ui, |ui| {
-                        ui.weak("插件 id");
-                        ui.label(egui::RichText::new(info.id.as_str()).monospace().size(12.5));
-                        ui.end_row();
-                        ui.weak("事件钩子");
-                        ui.label(if info.hooks.is_empty() {
-                            "未订阅".to_string()
-                        } else {
-                            info.hooks.join(" / ")
-                        });
-                        ui.end_row();
-                        ui.weak("配置文件");
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                egui::RichText::new(info.config_file.display().to_string())
-                                    .monospace()
-                                    .size(12.0),
-                            );
-                            if ui.button("打开").clicked() {
-                                open_dir(&info.config_file);
-                            }
-                        });
-                        ui.end_row();
-                        ui.weak("数据目录");
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                egui::RichText::new(info.data_dir.display().to_string())
-                                    .monospace()
-                                    .size(12.0),
-                            );
-                            if ui.button("打开").clicked() {
-                                open_dir(&info.data_dir);
-                            }
-                        });
-                        ui.end_row();
-                    });
-            });
-            if let Some(changed) = pending {
-                toggle = Some(changed);
-            }
-            ui.add_space(8.0);
-        }
-        if let Some((id, enabled)) = toggle {
-            self.note(admin::set_plugin_enabled(&id, enabled));
-            // 停用会 stop() 掉定时任务、启用会补 configure()+start()：重新取一份列表才看得到
+    /// 左栏：插件列表。形状照「群管理」的群列表，只是索引方向反过来——
+    /// 这里一行是一个插件，点它到右栏管它的功能、启用群和订阅条目。
+    fn plugin_list_panel(&mut self, ui: &mut egui::Ui) {
+        section_title(ui, "插件列表");
+        ui.add_space(8.0);
+        if ui.button("刷新").clicked() {
             self.plugins = admin::plugin_list();
         }
+        ui.add_space(2.0);
+        ui.add(
+            egui::TextEdit::singleline(&mut self.plugin_filter)
+                .hint_text("搜索插件名或 id")
+                .desired_width(f32::INFINITY),
+        );
+        ui.add_space(4.0);
+        let filter = self.plugin_filter.clone();
+        let plugins = self.plugins.clone();
+        let matched = plugins
+            .iter()
+            .filter(|info| plugin_matches(info, &filter))
+            .count();
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(if filter.trim().is_empty() {
+                    format!("共 {} 个插件", plugins.len())
+                } else {
+                    format!("匹配 {matched} / {} 个插件", plugins.len())
+                })
+                .size(12.0)
+                .weak(),
+            )
+            .selectable(false),
+        );
+        ui.separator();
+        let mut clicked: Option<String> = None;
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 5.0;
+                if plugins.is_empty() {
+                    ui.weak("未加载任何功能插件（框架只提供 OneBot 通道与管理面板）。");
+                }
+                for info in &plugins {
+                    if !plugin_matches(info, &filter) {
+                        continue;
+                    }
+                    let mark = if info.enabled { "●" } else { "○" };
+                    let label = egui::RichText::new(format!(
+                        "{mark} {}\n　{} v{}",
+                        info.name, info.id, info.version
+                    ))
+                    .size(13.5);
+                    if ui
+                        .selectable_label(
+                            self.selected_plugin.as_deref() == Some(info.id.as_str()),
+                            label,
+                        )
+                        .clicked()
+                    {
+                        clicked = Some(info.id.clone());
+                    }
+                }
+            });
+        if let Some(id) = clicked {
+            self.selected_plugin = Some(id);
+        }
+    }
+
+    /// 右栏：选中插件的详情。四块——整体启停、功能开关、启用的群、订阅条目。
+    ///
+    /// 每块的写操作都只在闭包里记下意图、出闭包再落盘：`card_row` 只借 `ui`，
+    /// 而 `note` 与重新取列表都要动 `self`，在闭包里碰它就是双重借用。
+    fn plugin_detail(&mut self, ui: &mut egui::Ui) {
+        let dark = ui.visuals().dark_mode;
+        let Some(id) = self.selected_plugin.clone() else {
+            section_title(ui, "插件详情");
+            ui.add_space(8.0);
+            ui.weak("从左边选一个插件：这里管它的功能开关、在哪些群启用，以及它在各群登记的条目。");
+            return;
+        };
+        let Some(info) = self.plugins.iter().find(|plugin| plugin.id == id).cloned() else {
+            section_title(ui, "插件详情");
+            ui.weak("这个插件已经不在列表里了（刚被卸载或改过配置），点左边的「刷新」重取一份。");
+            return;
+        };
+        // 群名只在连着 OneBot 时才拉得回来，读不到就只显群号（用户要的正是这个降级）
+        let groups = self.groups.clone();
+
+        section_title(ui, &info.name);
+        ui.add_space(6.0);
+        let mut toggle: Option<bool> = None;
+        card_row(ui, dark, |ui| {
+            ui.horizontal(|ui| {
+                let mut enabled = info.enabled;
+                let state = if enabled { "已启用" } else { "已停用" };
+                if ui.checkbox(&mut enabled, state).changed() {
+                    toggle = Some(enabled);
+                }
+                ui.colored_label(accent(dark), format!("v{}", info.version));
+                if !info.enabled {
+                    ui.colored_label(warn_color(dark), "(不装配、不接收任何消息与事件)");
+                }
+            });
+            if !info.description.is_empty() {
+                ui.weak(info.description.as_str());
+            }
+            // 功能清单最长，单独一行才跟着窗口宽度换行，塞进 Grid 会把列撑出面板
+            egui::Grid::new(format!("plugin_{}_grid", info.id))
+                .num_columns(2)
+                .spacing([12.0, 4.0])
+                .show(ui, |ui| {
+                    ui.weak("插件 id");
+                    ui.label(egui::RichText::new(info.id.as_str()).monospace().size(12.5));
+                    ui.end_row();
+                    ui.weak("事件钩子");
+                    ui.label(if info.hooks.is_empty() {
+                        "未订阅".to_string()
+                    } else {
+                        info.hooks.join(" / ")
+                    });
+                    ui.end_row();
+                    ui.weak("配置文件");
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(info.config_file.display().to_string())
+                                .monospace()
+                                .size(12.0),
+                        );
+                        if ui.button("打开").clicked() {
+                            open_dir(&info.config_file);
+                        }
+                    });
+                    ui.end_row();
+                    ui.weak("数据目录");
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(info.data_dir.display().to_string())
+                                .monospace()
+                                .size(12.0),
+                        );
+                        if ui.button("打开").clicked() {
+                            open_dir(&info.data_dir);
+                        }
+                    });
+                    ui.end_row();
+                });
+        });
+        if let Some(enabled) = toggle {
+            self.note(admin::set_plugin_enabled(&info.id, enabled));
+            // 停用会 stop() 掉定时任务、启用会补 configure()+start()：重取列表才看得到
+            self.plugins = admin::plugin_list();
+        }
+
+        // ---- 功能：主开关在插件这一页，逐群那一层只能继续往下关 ----
+        ui.add_space(8.0);
+        let mut global_toggle: Option<(String, String, bool)> = None;
+        let mut feature_group: Option<(i64, String, String, bool)> = None;
+        card_row(ui, dark, |ui| {
+            section_title(ui, "功能开关");
+            ui.weak(
+                "「全局启用」这一道对所有群**和私聊**生效；展开后那一列是「这个群有没有单独关掉它」。\n\
+                 群那一层只能接着往下关，不能把这里关掉的功能在某个群里重新打开。",
+            );
+            ui.add_space(4.0);
+            if info.features.is_empty() {
+                ui.weak("这个插件没有登记功能开关（功能由各插件在登记阶段声明）。");
+            }
+            for feature in &info.features {
+                let mut global = admin::feature_enabled_globally(feature.key);
+                let off_groups = admin::feature_off_groups(feature.key);
+                let id = ui.make_persistent_id(("plugin_feature_panel", &info.id, feature.key));
+                let mut state =
+                    egui::containers::collapsing_header::CollapsingState::load_with_default_open(
+                        ui.ctx(),
+                        id,
+                        false,
+                    );
+                ui.horizontal(|ui| {
+                    // 展开箭头自绘：默认字体没有 ▸/▾ 这个字形，画出来才不出现方框
+                    let (caret_id, caret_rect) =
+                        ui.allocate_space(egui::vec2(ui.spacing().indent, ui.spacing().icon_width));
+                    let caret = ui.interact(caret_rect, caret_id, egui::Sense::click());
+                    egui::containers::collapsing_header::paint_default_icon(
+                        ui,
+                        if state.is_open() { 1.0 } else { 0.0 },
+                        &caret,
+                    );
+                    let title = ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(format!("{} {}", feature.key, feature.name))
+                                .strong()
+                                .size(14.0),
+                        )
+                        .selectable(false)
+                        .sense(egui::Sense::click()),
+                    );
+                    if caret.clicked() || title.clicked() {
+                        state.toggle(ui);
+                    }
+                    title.on_hover_text("点一下展开/收起各群的开关");
+                    if ui
+                        .checkbox(&mut global, "全局启用")
+                        .on_hover_text(feature.description)
+                        .changed()
+                    {
+                        global_toggle =
+                            Some((feature.key.to_string(), feature.name.to_string(), global));
+                    }
+                    if off_groups.is_empty() {
+                        ui.weak("没有群单独关掉");
+                    } else {
+                        ui.colored_label(
+                            warn_color(dark),
+                            format!("{} 个群单独关着", off_groups.len()),
+                        );
+                    }
+                });
+                // 展开状态直接决定画不画，不走 show_body_indented：那条按动画插值取可见性，
+                // 插值首帧是 0，收起/展开的观感反而不确定
+                if state.is_open() {
+                    ui.indent(id, |ui| {
+                        let rows = admin::plugin_group_rows(&info.id);
+                        if rows.is_empty() {
+                            ui.weak("列不出群：arona.yml 的 groups 是空的，也还没写过分群设置。");
+                        }
+                        for row in rows {
+                            let name = group_name(&groups, row.group_id);
+                            let mut enabled = !off_groups.contains(&row.group_id);
+                            let label = group_display(row.group_id, &name);
+                            if ui.checkbox(&mut enabled, label).changed() {
+                                feature_group = Some((
+                                    row.group_id,
+                                    feature.key.to_string(),
+                                    feature.name.to_string(),
+                                    enabled,
+                                ));
+                            }
+                        }
+                    });
+                }
+                state.store(ui.ctx());
+            }
+        });
+        if let Some((key, name, enabled)) = global_toggle {
+            self.note(
+                admin::set_feature_enabled_globally(&key, enabled).map(move |_| {
+                    format!(
+                        "功能 {name} 已{}（所有群与私聊一起）",
+                        if enabled { "启用" } else { "停用" }
+                    )
+                }),
+            );
+        }
+        if let Some((group_id, key, name, enabled)) = feature_group {
+            self.note(
+                admin::set_group_feature(group_id, &key, enabled).map(move |()| {
+                    format!(
+                        "功能 {name} 在群 {group_id} 已{}",
+                        if enabled { "启用" } else { "停用" }
+                    )
+                }),
+            );
+        }
+
+        // ---- 启用的群：群号集合 = 授权名单 ∪ 写过例外的群 ----
+        ui.add_space(8.0);
+        let mut plugin_group: Option<(i64, bool)> = None;
+        card_row(ui, dark, |ui| {
+            section_title(ui, "启用的群");
+            ui.weak(
+                "去掉勾 = 只在这个群里停用该插件（写 group_settings.<群>.disabled_plugins），\n\
+                 它在别的群照常跑。私聊不看这一层，也不看群名单。",
+            );
+            ui.add_space(4.0);
+            let rows = admin::plugin_group_rows(&info.id);
+            if rows.is_empty() {
+                ui.weak(
+                    "暂时列不出群：在下面填一个群号先加上（机器人还没在那个群也可以填，等它被拉进去就按这里的设置响应）。",
+                );
+            }
+            for row in rows {
+                let name = group_name(&groups, row.group_id);
+                let mut enabled = row.enabled;
+                if ui
+                    .checkbox(&mut enabled, group_display(row.group_id, &name))
+                    .changed()
+                {
+                    plugin_group = Some((row.group_id, enabled));
+                }
+                if !row.authorized {
+                    ui.colored_label(warn_color(dark), "(不在授权名单，机器人在这个群还不理)");
+                }
+            }
+        });
+        if let Some((group_id, enabled)) = plugin_group {
+            self.note(
+                admin::set_group_plugin_enabled(group_id, &info.id, enabled).map(move |()| {
+                    format!(
+                        "插件 {} 在群 {group_id} 已{}",
+                        info.name,
+                        if enabled { "启用" } else { "停用" }
+                    )
+                }),
+            );
+        }
+        ui.add_space(4.0);
+        let mut added: Option<i64> = None;
+        let mut invalid: Option<String> = None;
+        ui.horizontal(|ui| {
+            ui.weak("添加群号");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.plugin_group_input)
+                    .hint_text("比如 123456789")
+                    .desired_width(150.0),
+            );
+            if ui.button("加进来").clicked() {
+                let raw = self.plugin_group_input.trim().to_string();
+                match raw.parse::<i64>() {
+                    Ok(group_id) => {
+                        added = Some(group_id);
+                        self.plugin_group_input.clear();
+                    }
+                    Err(_) => invalid = Some(format!("「{raw}」不是群号：只填数字")),
+                }
+            }
+        });
+        if let Some(group_id) = added {
+            self.note(admin::set_group_enabled(group_id, true));
+        } else if let Some(err) = invalid {
+            self.note::<()>(Err(err));
+        }
+
+        // ---- 订阅条目：字全是插件给的，框架这边只搬运 ----
+        ui.add_space(8.0);
+        card_row(ui, dark, |ui| {
+            section_title(ui, "订阅条目");
+            ui.weak("插件自己上报的条目（「这个群订了谁」），框架不认识也不解释这些字。");
+            ui.add_space(4.0);
+            let rows = admin::plugin_rows(&info.id);
+            if rows.is_empty() {
+                ui.weak("这个插件还没上报任何条目。");
+            }
+            for (group_id, row) in rows {
+                let name = group_name(&groups, group_id);
+                let items = if row.items.is_empty() {
+                    "（现在没有）".to_string()
+                } else {
+                    row.items.join("、")
+                };
+                ui.label(format!(
+                    "{} · {}：{items}",
+                    group_display(group_id, &name),
+                    row.label
+                ));
+            }
+        });
     }
 
     // ==================== OneBot 连接 ====================
@@ -1772,10 +1813,17 @@ impl eframe::App for AronaGui {
                 if self.plugins.is_empty() {
                     self.plugins = admin::plugin_list();
                 }
+                // 与「群管理」同形：左边一列可以选，右边一栏做管理
+                egui::SidePanel::left("plugin_panel")
+                    .resizable(true)
+                    .default_width(260.0)
+                    .width_range(200.0..=420.0)
+                    .frame(pane_frame(ctx))
+                    .show(ctx, |ui| self.plugin_list_panel(ui));
                 egui::CentralPanel::default()
                     .frame(pane_frame(ctx))
                     .show(ctx, |ui| {
-                        scroll_y(ui, |ui| self.plugin_manager(ui));
+                        scroll_y(ui, |ui| self.plugin_detail(ui));
                     });
             }
             Tab::Connections => {
@@ -3382,6 +3430,76 @@ mod tests {
             "",
             "没登记过就是空串，列表行不该多出空白"
         );
+    }
+
+    /// 插件页左栏的过滤：名字与 id 任一命中就算（大小写不敏感），空串一律放行。
+    /// 插件只有几家，但"填了关键字结果整列消失"这类毛病正是这条能钉住的。
+    #[test]
+    fn the_plugin_list_filter_matches_name_and_id_case_insensitively() {
+        fn info(name: &str, id: &str) -> admin::PluginInfo {
+            admin::PluginInfo {
+                id: id.to_string(),
+                name: name.to_string(),
+                version: "0.1.0".to_string(),
+                description: String::new(),
+                enabled: true,
+                features: Vec::new(),
+                hooks: Vec::new(),
+                plugin_dir: std::path::PathBuf::new(),
+                config_file: std::path::PathBuf::new(),
+                data_dir: std::path::PathBuf::new(),
+            }
+        }
+        let bili = info("动态推送", "bilibili");
+        let petpet = info("Petpet 表情包", "petpet");
+        assert!(plugin_matches(&bili, ""), "没填关键字时一律放行");
+        assert!(plugin_matches(&bili, "bilibili"), "id 命中也算");
+        assert!(plugin_matches(&bili, "BILI"), "大小写不该影响");
+        assert!(plugin_matches(&bili, "动态"), "中文名里也能搜");
+        assert!(!plugin_matches(&bili, "petpet"));
+        assert!(plugin_matches(&petpet, "表情"));
+    }
+
+    /// 「启用的群」那一列的文案：OneBot 没连上、或这个群是预添加的（还没拉群列表）时，
+    /// 只能显群号。此时不能留那个分隔符——看着像群名被吞了，而不是"这台机器不认得它"。
+    #[test]
+    fn a_group_column_shows_only_the_number_when_the_name_is_unknown() {
+        assert_eq!(group_display(20001, "老番茄的群"), "20001　老番茄的群");
+        assert_eq!(group_display(20001, ""), "20001");
+        // 群名要问 OneBot：没连接、或这个群不在它报的列表里（预添加的那种）都是空串
+        let groups: Vec<admin::GroupInfo> = Vec::new();
+        assert_eq!(group_name(&groups, 20001), "");
+    }
+
+    /// 「启用的群」那一列画在 260 宽的左栏里：群名很长时 egui 要自己折行，
+    /// 光测字符串拼法测不出「群号被挤没」这一类只在版面上才看得见的问题。
+    #[test]
+    fn a_long_group_name_still_shows_the_number_inside_the_narrow_panel() {
+        let line = group_display(20001, "一个很长很长很长的小电视订阅群名");
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(260.0, 400.0));
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let mut on = true;
+                    let _ = ui.checkbox(&mut on, line.as_str());
+                });
+            },
+        );
+        let laid: String = output
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::epaint::Shape::Text(shape) => Some(shape.galley.text().to_string()),
+                _ => None,
+            })
+            .collect();
+        assert!(laid.contains("20001"), "群号被挤掉了：{laid:?}");
+        assert!(laid.contains("小电视订阅群名"), "长群名整列消失：{laid:?}");
     }
 
     /// 预览确实排得进那块 300 宽的左侧面板：多行 label 在 egui 里要自己折行，

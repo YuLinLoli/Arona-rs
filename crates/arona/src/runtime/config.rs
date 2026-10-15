@@ -42,6 +42,8 @@ pub struct RuntimeConfig {
     pub group_settings: RwLock<BTreeMap<String, GroupSetting>>,
     /// 全局禁用的插件名（arona.yml 的 disabled_plugins）
     pub disabled_plugins: RwLock<Vec<String>>,
+    /// 全局禁用的功能 key（arona.yml 的 disabled_features）
+    pub disabled_features: RwLock<Vec<String>>,
 }
 
 impl Default for RuntimeConfig {
@@ -56,6 +58,7 @@ impl Default for RuntimeConfig {
             send_image_as_file: RwLock::new(false),
             group_settings: RwLock::new(BTreeMap::new()),
             disabled_plugins: RwLock::new(Vec::new()),
+            disabled_features: RwLock::new(Vec::new()),
         }
     }
 }
@@ -145,12 +148,17 @@ impl Gating {
             .join(", ")
     }
 
-    /// 群功能开关默认开启；私聊(无群号)不受分群开关限制。
+    /// 功能开关默认开启。私聊(无群号)不受**分群**那一层限制，但仍受全局这一层约束。
     ///
-    /// 两道判断：提供这个功能的插件有没有被整体禁用（全局 + 该群），以及该群有没有单独关掉这个 key。
+    /// 三道判断，写的顺序就是语义：① 这个 key 被全局关掉了没有；② 提供它的插件有没有被
+    /// 整体禁用；③ 该群自己再往下减（群功能名单 + 群插件名单，一次持锁读完）。
+    /// 群名单只能减、不能翻案：全局关掉的 key 不会因为某个群还留着「启用」就活过来。
     pub fn feature_enabled(&self, group_id: Option<i64>, key: &str) -> bool {
         if key.is_empty() {
             return true;
+        }
+        if self.feature_disabled_globally(key) {
+            return false;
         }
         let owner = self.feature_owner(key);
         if let Some(plugin) = &owner {
@@ -314,6 +322,27 @@ impl Gating {
     pub fn set_disabled_plugins(&self, plugins: Vec<String>) {
         *self.config.disabled_plugins.write().unwrap() = plugins;
     }
+
+    /// 某个功能 key 是否被全局关掉（只看这一层，不看归属插件）
+    ///
+    /// key 比对是**精确**的，与分群那一份同口径；插件 id 的名单才忽略大小写。
+    pub fn feature_disabled_globally(&self, key: &str) -> bool {
+        self.config
+            .disabled_features
+            .read()
+            .unwrap()
+            .iter()
+            .any(|item| item == key)
+    }
+
+    /// 全局禁用的功能 key 列表（arona.yml 的 disabled_features）
+    pub fn disabled_features(&self) -> Vec<String> {
+        self.config.disabled_features.read().unwrap().clone()
+    }
+
+    pub fn set_disabled_features(&self, features: Vec<String>) {
+        *self.config.disabled_features.write().unwrap() = features;
+    }
 }
 
 /// 某份群设置里，这个插件是不是启用的（名单比对忽略大小写）
@@ -370,9 +399,19 @@ pub fn feature_keys_text() -> String {
     gating().feature_keys_text()
 }
 
-/// 群功能开关默认开启；私聊(无群号)不受分群开关限制
+/// 群功能开关默认开启；私聊(无群号)不受分群开关限制，但受全局那一层约束
 pub fn feature_enabled(group_id: Option<i64>, key: &str) -> bool {
     gating().feature_enabled(group_id, key)
+}
+
+/// 某个功能 key 是否被全局关掉（`feature_enabled` 的第一道，不看归属插件）
+pub fn feature_disabled_globally(key: &str) -> bool {
+    gating().feature_disabled_globally(key)
+}
+
+/// 全局禁用的功能 key 列表（arona.yml 的 disabled_features）
+pub fn disabled_features() -> Vec<String> {
+    gating().disabled_features()
 }
 
 /// 插件是否全局启用（不在 arona.yml 的 disabled_plugins 里就是启用）
@@ -525,6 +564,48 @@ mod tests {
             vec!["gacha".to_string()]
         );
         assert!(gating.group_setting(200).is_empty());
+    }
+
+    /// 全局功能开关是**主开关**：关掉之后所有群加私聊一起不响应，而群里没把这个 key 列进
+    /// 名单（等于"启用着"）也不能翻案。方向写反就是全线漏放或全线误杀，所以正反两头都钉。
+    #[test]
+    fn the_global_feature_switch_applies_everywhere_and_groups_cannot_override_it() {
+        let gating = Gating::default();
+        gating.register_feature(
+            Feature {
+                key: "gacha",
+                name: "抽卡",
+                description: "",
+            },
+            "hello",
+        );
+        let mut settings = BTreeMap::new();
+        // 100 什么都没关；200 自己在群名单里关了 gacha
+        settings.insert("100".to_string(), GroupSetting::default());
+        settings.insert(
+            "200".to_string(),
+            GroupSetting {
+                disabled_features: vec!["gacha".to_string()],
+                ..Default::default()
+            },
+        );
+        gating.set_group_settings(settings);
+        assert!(gating.feature_enabled(Some(100), "gacha"));
+        assert!(gating.feature_enabled(None, "gacha"));
+
+        gating.set_disabled_features(vec!["gacha".to_string()]);
+        assert!(gating.feature_disabled_globally("gacha"));
+        // 群 100 一条减法都没写，也照样停：这一层不分群
+        assert!(!gating.feature_enabled(Some(100), "gacha"));
+        // 私聊以前完全不看分群名单，现在归全局这一层管
+        assert!(!gating.feature_enabled(None, "gacha"));
+        // 没上名单的 key 不受牵连
+        assert!(gating.feature_enabled(Some(100), "name"));
+
+        // 恢复之后回到原状态：群 200 自己的那份减法仍然有效
+        gating.set_disabled_features(Vec::new());
+        assert!(gating.feature_enabled(Some(100), "gacha"));
+        assert!(!gating.feature_enabled(Some(200), "gacha"));
     }
 
     /// 授权名单为空 = 所有群都放行；非空时只认名单里的群

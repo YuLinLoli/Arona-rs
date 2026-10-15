@@ -292,12 +292,30 @@ impl TaskEntry {
         seq
     }
 
-    /// 这一次执行返回了：若登记的还是本次序号就摘掉，看门狗线程醒来便知道不用动手。
+    /// 这一次执行返回了。
+    ///
+    /// 没超时就摘掉登记，看门狗线程下一拍看见表里没这条自然不动手。**超了时才回来的那一次照样报**：
+    /// 那条线程按 [`WATCH_TICK_SECS`] 一拍一扫，任务恰好落在两拍之间返回的话，光靠扫描会把已经
+    /// 发生过的超时漏掉——它确实占着那一格线程超过了阈值，事后回来了不改变这件事。
     fn end_fire(&self, seq: u64) {
         let mut table = in_flight().lock().unwrap();
-        if table.get(&self.name).map(|record| record.seq) == Some(seq) {
-            table.remove(&self.name);
+        let Some(record) = table.get(&self.name) else {
+            return;
+        };
+        if record.seq != seq {
+            // 已经不是这一次触发的登记（同名任务重排过，或看门狗已经收走），别拿别人的记录动手
+            return;
         }
+        if record.deadline > std::time::Instant::now() {
+            table.remove(&self.name);
+            return;
+        }
+        let record = table.remove(&self.name).expect("刚在这张表里查到那一格");
+        // 处置要在锁外做：isolate 拿的是门控与注册表的锁
+        drop(table);
+        record
+            .board
+            .isolate_and_report(&record.group, "定时任务执行超时", record.detail);
     }
 
     /// 跑一次任务体，返回是否发生了 panic。

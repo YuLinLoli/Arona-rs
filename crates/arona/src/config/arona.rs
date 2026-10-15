@@ -106,6 +106,13 @@ pub struct AronaConfig {
     /// 全局禁用的插件 id（GUI「插件管理」的总开关）：列在这里的插件不装配、不接收任何事件。
     /// 取插件的 `meta().id`，大小写不敏感。
     pub disabled_plugins: Vec<String>,
+    /// 全局禁用的功能 key（GUI「插件管理」页里按插件列出的那些功能开关）。
+    ///
+    /// 与 `disabled_plugins` 的差别只在粒度：停插件是整家停，停功能是这个插件的某一项
+    /// 在**所有会话**里都不响应——包括私聊，那一分群名单管不到。
+    /// 与 `group_settings.*.disabled_features` 的差别在方向：全局这一道是主开关，
+    /// 群名单只能在它之上再往下减，**不能把全局关掉的 key 在某个群里翻案**。
+    pub disabled_features: Vec<String>,
     /// 框架行为选项（panic 隔离阈值、命令前缀匹配）
     pub framework: FrameworkSettings,
     /// 聊天记录缓存（引用还原与按存储 id 撤回的依据）
@@ -579,6 +586,15 @@ fn template(config: &AronaConfig) -> String {
         ));
     }
     out.push('\n');
+    out.push_str("# ==================== 全局功能开关 ====================\n");
+    out.push_str("# 列在这里的功能 key 在**所有群与私聊**都不响应（key 见各插件的「功能」清单，改动即时生效）。\n");
+    out.push_str("# 这是主开关：group_settings 里的群名单只能在此基础上再往下减，\n");
+    out.push_str("# 不会把这里关掉的 key 在某个群里重新打开。\n");
+    out.push_str(&format!(
+        "disabled_features: {:?}\n",
+        config.disabled_features
+    ));
+    out.push('\n');
     out.push_str("# ==================== 框架行为 ====================\n");
     out.push_str("# 同一插件连续 panic 多少次就自动隔离停用（0 = 只记日志、不停用）\n");
     out.push_str(&format!(
@@ -700,6 +716,26 @@ mod tests {
             partial.framework.panic_disable_threshold,
             crate::framework::Framework::DEFAULT_PANIC_THRESHOLD
         );
+        let _ = std::fs::remove_file(&file);
+    }
+
+    /// 全局功能开关要写得出、读得回；老文件没有这一行时读成**空名单**（全放行），
+    /// 绝不能缺省成"全关"——那会让升级一次就把所有插件的功能停干净。
+    #[test]
+    fn disabled_features_round_trips_through_the_template() {
+        let file = std::env::temp_dir().join("arona-disabled-features-test.yml");
+        let mut config = AronaConfig::default();
+        config.disabled_features = vec!["gacha".to_string(), "tarot".to_string()];
+        save(&file, &config).expect("写入模板失败");
+        let reloaded = load(&file).expect("disabled_features 应能读回强类型");
+        assert_eq!(
+            reloaded.disabled_features,
+            vec!["gacha".to_string(), "tarot".to_string()]
+        );
+
+        std::fs::write(&file, "groups: [10001]\n").expect("写入老格式配置失败");
+        let legacy = load(&file).expect("缺 disabled_features 这一行不该导致加载失败");
+        assert!(legacy.disabled_features.is_empty());
         let _ = std::fs::remove_file(&file);
     }
 

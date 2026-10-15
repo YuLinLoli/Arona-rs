@@ -55,12 +55,7 @@ pub struct ConnectionInfo {
     pub enable: bool,
 }
 
-/// 功能清单（GUI 展示）：整体停用的插件不在此列，恢复启用要到「插件管理」页
-pub fn features() -> Vec<runtime_config::Feature> {
-    runtime_config::features()
-}
-
-/// 某个群在会话展示板上的行（GUI「群管理」页那一块）。每一项是
+/// 某个群在会话展示板上的行（群列表那一行的预览与「插件管理」页的详情都用它）。每一项是
 /// `(提供它的插件展示名, 一行)`；展示名解析不到时退回插件 id。
 ///
 /// 框架这边只搬运，不解释：标题与条目文本都是插件经
@@ -81,6 +76,13 @@ pub fn peer_rows(group_id: i64) -> Vec<(String, crate::views::ViewRow)> {
             (display, row)
         })
         .collect()
+}
+
+/// 某个插件在所有群交上来的条目（GUI「插件管理」页详情）。同样只搬运不解释。
+pub fn plugin_rows(plugin: &str) -> Vec<(i64, crate::views::ViewRow)> {
+    crate::framework::Framework::global()
+        .views()
+        .rows_of_plugin(plugin)
 }
 
 /// 登记一个可分群开关的功能：插件在 install 阶段调用，GUI 的「功能开关」页会自动列出。
@@ -157,9 +159,96 @@ pub fn set_group_plugin_enabled(group_id: i64, plugin: &str, enabled: bool) -> R
     settings::set_group_plugin_enabled(group_id, plugin, enabled)
 }
 
+/// 某个功能 key 是否全局启用（GUI「插件管理」页画开关用）
+pub fn feature_enabled_globally(key: &str) -> bool {
+    !runtime_config::feature_disabled_globally(key)
+}
+
+/// 全局启用/停用某个功能 key：所有群加私聊一起受影响，比停一家插件细一档、比按群开关宽一档
+pub fn set_feature_enabled_globally(key: &str, enabled: bool) -> Result<String, String> {
+    settings::set_feature_enabled_globally(key, enabled)?;
+    Ok(format!(
+        "功能 {key} 已{}（写入 {}）",
+        if enabled { "启用" } else { "停用" },
+        arona_file()
+    ))
+}
+
 /// 某个群禁用的插件 id 列表（GUI「群管理」页画开关用）
 pub fn group_disabled_plugins(group_id: i64) -> Vec<String> {
     runtime_config::group_setting(group_id).disabled_plugins
+}
+
+/// 哪些群在群名单里单独关掉了这个功能 key（GUI「插件管理」页的功能行展开用）。
+/// 只看群这一层的减法，不含全局名单——全局那一层由 [`feature_enabled_globally`] 单独表达。
+pub fn feature_off_groups(key: &str) -> Vec<i64> {
+    let mut ids: Vec<i64> = crate::framework::Framework::global()
+        .gating()
+        .group_settings()
+        .iter()
+        .filter(|(_, setting)| setting.disabled_features.iter().any(|item| item == key))
+        .filter_map(|(group, _)| group.parse::<i64>().ok())
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
+/// 某个插件在一个群里的状态（GUI「插件管理」页的「启用群」列表）
+pub struct PluginGroupRow {
+    pub group_id: i64,
+    /// 这个群在不在框架的授权名单里（名单为空 = 所有群都授权）。
+    /// 不在名单里的群是"填了群号预添加、或只为这个插件写过例外"的那类，机器人还不会理它
+    pub authorized: bool,
+    /// 该插件在这个群是不是启用的
+    pub enabled: bool,
+}
+
+/// 某个插件在各群的启用状态。群号集合 = **授权名单 ∪ 写过分群设置的群**：前者是"机器人在
+/// 哪些群响应"，后者是"哪些群对这个插件有例外"，只看一边都会漏。
+///
+/// 机器人还没进去的群可以先填群号预添加——填的就是 `config.groups`，走 [`set_group_enabled`]，
+/// 不另造一份插件自己的群名单（那样就得在门控上叠第 7 层判定，代价远大于收益）。
+///
+/// 这里克隆整张分群表：只在面板打开与改完开关之后调用。事件热路径不走这里，
+/// 那条用的是 [`crate::runtime::config::Gating::plugin_enabled_in_group`] 的持锁就地读。
+pub fn plugin_group_rows(plugin: &str) -> Vec<PluginGroupRow> {
+    let gating = crate::framework::Framework::global().gating();
+    rows_for(gating.groups(), gating.group_settings(), plugin)
+}
+
+/// 上面那层的纯计算部分：拿授权名单 + 分群表算出每个群的状态。
+/// 单独拆出来是为了能用表驱动用例钉住（群号并集、空名单=全授权、插件名大小写），
+/// 而不必去动进程默认实例那份真值。
+fn rows_for(
+    allowed: Vec<i64>,
+    settings: std::collections::BTreeMap<String, crate::config::arona::GroupSetting>,
+    plugin: &str,
+) -> Vec<PluginGroupRow> {
+    let mut ids = allowed.clone();
+    for key in settings.keys() {
+        if let Ok(id) = key.parse::<i64>() {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+    }
+    ids.sort_unstable();
+    ids.into_iter()
+        .map(|group_id| PluginGroupRow {
+            // 名单为空 = 所有群都授权，与运行时那条判据同一个口径
+            authorized: allowed.is_empty() || allowed.contains(&group_id),
+            enabled: settings
+                .get(&group_id.to_string())
+                .map(|setting| {
+                    !setting
+                        .disabled_plugins
+                        .iter()
+                        .any(|name| name.eq_ignore_ascii_case(plugin))
+                })
+                .unwrap_or(true),
+            group_id,
+        })
+        .collect()
 }
 
 // ==================== OneBot API ====================
@@ -514,6 +603,39 @@ mod tests {
             gating.feature_enabled(None, "tarot"),
             "私聊不受分群开关限制"
         );
+    }
+
+    /// 插件详情页那张群表：群号是**授权名单 ∪ 写过分群设置的群**（只看一边都会漏），
+    /// 名单为空 = 所有群都授权，插件名比对忽略大小写。
+    #[test]
+    fn plugin_rows_merge_allowlist_and_group_exceptions() {
+        use crate::config::arona::GroupSetting;
+        let mut settings = std::collections::BTreeMap::new();
+        let mut disabled = GroupSetting::default();
+        disabled.disabled_plugins.push("Bilibili".to_string());
+        settings.insert("200".to_string(), disabled);
+        // 300 只写过群设置（比如拉黑过谁），并不在授权名单里：它照样得出现在表上
+        settings.insert("300".to_string(), GroupSetting::default());
+
+        let rows = rows_for(vec![100, 200], settings.clone(), "bilibili");
+        assert_eq!(
+            rows.iter().map(|row| row.group_id).collect::<Vec<_>>(),
+            vec![100, 200, 300],
+            "群号该取两边的并集并按序排"
+        );
+        let find = |id: i64| rows.iter().find(|row| row.group_id == id).unwrap();
+        assert!(find(100).enabled);
+        // 名单里存的是 "Bilibili"，查的是 "bilibili"：大小写不该改变结论
+        assert!(!find(200).enabled, "该群把这个插件关掉了");
+        assert!(find(200).authorized);
+        // 只为这个插件写过例外、还没进授权名单的群，要在表上如实标出来
+        assert!(!find(300).authorized, "预添加的群还没被授权");
+        assert!(find(300).enabled);
+
+        // 名单为空 = 全放行（与运行时那条判据同一个口径），此时表里只剩写过设置的群
+        let open = rows_for(Vec::new(), settings, "bilibili");
+        assert!(open.iter().all(|row| row.authorized), "空名单该全放行");
+        assert_eq!(open.len(), 2, "空名单时表里就只有写过设置的那两个群");
     }
 
     /// 黑名单：全局名单命中所有会话，群内名单只管那个群

@@ -116,6 +116,21 @@ impl ViewBoard {
         out
     }
 
+    /// 某个插件在所有会话上的行，按会话号升序（GUI「插件管理」页详情用）。
+    ///
+    /// 与 [`rows_of`](Self::rows_of) 同一份表、只是换个方向索引：框架照旧只搬运不解释，
+    /// `label` 与 `items` 里是什么字都由插件自己给。
+    pub fn rows_of_plugin(&self, plugin: &str) -> Vec<(i64, ViewRow)> {
+        let mut out = Vec::new();
+        for (peer, by_plugin) in self.lock().iter() {
+            if let Some(rows) = by_plugin.get(plugin) {
+                out.extend(rows.iter().cloned().map(|row| (*peer, row)));
+            }
+        }
+        out.sort_by_key(|(peer, _)| *peer);
+        out
+    }
+
     /// 该会话有没有东西（GUI 决定要不要在列表行里挂那个标记）
     pub fn has(&self, peer: i64) -> bool {
         self.lock().contains_key(&peer)
