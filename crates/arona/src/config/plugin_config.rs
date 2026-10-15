@@ -454,6 +454,17 @@ pub fn set_plugin_section(plugin: &str, key: &str, value: Value) -> Result<(), S
     store().set_plugin_section(plugin, key, value)
 }
 
+/// 某个插件配置文件里已经加载的全部大区（GUI 的「配置」那一块用）
+pub fn plugin_sections(plugin: &str) -> Option<BTreeMap<String, Value>> {
+    store().sections_of(plugin)
+}
+
+/// 按 (插件, 区) 读原样值。`section_value` 是插件自己那套（按区名全局找），
+/// GUI 要的是「指定插件的指定区」，所以另开一个口，别把两者混成一个。
+pub fn plugin_section_value(plugin: &str, key: &str) -> Option<Value> {
+    store().value_of(plugin, key)
+}
+
 /// 重新读取全部插件配置文件（GUI「重载配置」用）
 pub fn reload_all() {
     store().reload_all();

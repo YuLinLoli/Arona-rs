@@ -85,6 +85,109 @@ pub fn plugin_rows(plugin: &str) -> Vec<(i64, crate::views::ViewRow)> {
         .rows_of_plugin(plugin)
 }
 
+/// 一个能在 GUI 里直接改的插件配置项：`path` 是点号分隔的键路径（首段是区名），
+/// `value` 是文件里的原样值。
+pub struct Field {
+    pub path: String,
+    pub value: serde_yaml::Value,
+}
+
+/// 摊平某插件配置里的标量叶子，给 GUI 生成控件。
+///
+/// 框架仍然不认识任何插件的键名，这里只有两条框架自己的规矩：
+///
+/// 1. 只摊标量（布尔 / 数字 / 字符串），表与数组交给插件的指令或手改 YAML——
+///    没有类型信息就没有可信的控件；含换行的字符串也挡掉，单行框会把多行模板改坏。
+/// 2. **键名像凭据的那一个叶子一律不摊**（`cookie`/`token`/`secret`/`password`/`key`/`appid`/`ticket`）。
+///    这条是框架的安全线不是插件语义：这类值一旦显示出来就会进截图与录屏。
+///    挡的是那一个键本身，不牵连兄弟——`account.cookie` 不上屏，`account.uid` 照改。
+pub fn plugin_fields(plugin: &str) -> Vec<Field> {
+    let mut out = Vec::new();
+    let Some(sections) = crate::config::plugin_config::plugin_sections(plugin) else {
+        return out;
+    };
+    for (section, value) in sections {
+        flatten_fields(&section, &value, &mut out);
+    }
+    out
+}
+
+fn is_credential(key: &str) -> bool {
+    let low = key.to_lowercase();
+    [
+        "cookie", "token", "secret", "password", "passwd", "key", "appid", "ticket",
+    ]
+    .iter()
+    .any(|needle| low.contains(needle))
+}
+
+fn flatten_fields(prefix: &str, node: &serde_yaml::Value, out: &mut Vec<Field>) {
+    match node {
+        serde_yaml::Value::Mapping(map) => {
+            for (key, value) in map {
+                let Some(name) = key.as_str() else { continue };
+                if is_credential(name) {
+                    continue;
+                }
+                flatten_fields(&format!("{prefix}.{name}"), value, out);
+            }
+        }
+        // 空值与列表不给控件：填错了没有类型可校验，列表更是整段结构
+        serde_yaml::Value::Null | serde_yaml::Value::Sequence(_) => {}
+        scalar => {
+            let is_multiline = scalar.as_str().is_some_and(|text| text.contains('\n'));
+            if !is_multiline {
+                out.push(Field {
+                    path: prefix.to_string(),
+                    value: scalar.clone(),
+                });
+            }
+        }
+    }
+}
+
+/// 写回一个插件配置项：读出它所在的那一整区 → 只改这一条路径 → 整区写回。
+/// 落盘走 [`plugin_config::set_plugin_section`]，注释由插件自己的模板重新生成，
+/// 写完即回调插件的 `on_config_reload` 热生效，不需要重启。
+pub fn set_plugin_field(
+    plugin: &str,
+    path: &str,
+    value: serde_yaml::Value,
+) -> Result<String, String> {
+    let mut keys = path.split('.');
+    let section = keys
+        .next()
+        .filter(|first| !first.is_empty())
+        .ok_or("键路径是空的，不知道写去哪一区")?;
+    let mut root = crate::config::plugin_config::plugin_section_value(plugin, section)
+        .ok_or_else(|| format!("插件 {plugin} 的 {section} 区还没加载"))?;
+    patch_path(&mut root, keys, value)?;
+    crate::config::plugin_config::set_plugin_section(plugin, section, root)?;
+    Ok(format!("已写入 {path}"))
+}
+
+/// 沿着一串键名走到叶子并赋值，中间缺的表顺手补上。抽成纯函数是为了能单独验落点。
+fn patch_path<'a>(
+    root: &mut serde_yaml::Value,
+    keys: impl Iterator<Item = &'a str>,
+    value: serde_yaml::Value,
+) -> Result<(), String> {
+    let mut node = root;
+    for key in keys {
+        if node.is_null() {
+            *node = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+        }
+        let map = node
+            .as_mapping_mut()
+            .ok_or_else(|| "这一层的上一层不是表，写不进去".to_string())?;
+        node = map
+            .entry(serde_yaml::Value::String(key.to_string()))
+            .or_insert(serde_yaml::Value::Null);
+    }
+    *node = value;
+    Ok(())
+}
+
 /// 登记一个可分群开关的功能：插件在 install 阶段调用，GUI 的「功能开关」页会自动列出。
 /// 这就是框架留给插件的权限/开关接口——功能属于插件，开关与黑名单的存取由框架统一管理。
 ///
@@ -766,5 +869,93 @@ mod tests {
 
         let _ = std::fs::remove_file(&file);
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    /// 键名像凭据的一律不摊给 GUI；结构（表/数组/空值）也不摊；多行字符串不摊
+    #[test]
+    fn only_safe_scalars_reach_the_config_panel() {
+        let tree: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+image:
+  quality: 1000w
+  drawEnable: true
+  badgeEnable:
+    left: true
+    right: false
+  colorGenerator:
+    hueStep: 30
+account:
+  uid: 123
+  cookie: 'SECRETCOOKIE'
+  nickname: 老师
+template:
+  one: "第一行\n第二行"
+  list: [1, 2]
+  nothing: null
+"#,
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        flatten_fields("image", &tree["image"], &mut out);
+        flatten_fields("account", &tree["account"], &mut out);
+        flatten_fields("template", &tree["template"], &mut out);
+        let paths: Vec<&str> = out.iter().map(|f| f.path.as_str()).collect();
+        assert!(paths.contains(&"image.quality"), "{paths:?}");
+        assert!(paths.contains(&"image.drawEnable"), "{paths:?}");
+        assert!(paths.contains(&"image.badgeEnable.left"), "{paths:?}");
+        assert!(paths.contains(&"image.colorGenerator.hueStep"), "{paths:?}");
+        // 挡的是凭据那一个叶子：cookie 不上屏，但它旁边的 uid/nickname 照给控件
+        assert!(paths.contains(&"account.uid"), "{paths:?}");
+        assert!(paths.contains(&"account.nickname"), "{paths:?}");
+        assert!(!paths.iter().any(|p| p.contains("cookie")), "{paths:?}");
+        // 多行模板、数组、空值都没有控件
+        assert!(!paths.contains(&"template.one"), "{paths:?}");
+        assert!(!paths.contains(&"template.list"), "{paths:?}");
+        assert!(!paths.contains(&"template.nothing"), "{paths:?}");
+        assert!(
+            !out.iter()
+                .any(|f| format!("{:?}", f.value).contains("SECRETCOOKIE")),
+            "凭据值漏进来了"
+        );
+    }
+
+    /// 写回只改那一条路径，同区其它键必须原样留着
+    #[test]
+    fn a_patch_touches_only_the_named_leaf() {
+        let mut root: serde_yaml::Value =
+            serde_yaml::from_str("quality: 1000w\nbadgeEnable:\n  left: true\n  right: false\n")
+                .unwrap();
+        patch_path(
+            &mut root,
+            ["badgeEnable", "right"].into_iter(),
+            serde_yaml::Value::Bool(true),
+        )
+        .unwrap();
+        assert_eq!(root["badgeEnable"]["right"], serde_yaml::Value::Bool(true));
+        assert_eq!(root["badgeEnable"]["left"], serde_yaml::Value::Bool(true));
+        assert_eq!(root["quality"], serde_yaml::Value::from("1000w"));
+        // 中间缺的那一层顺手补出来，而不是报错
+        let mut sparse: serde_yaml::Value = serde_yaml::from_str("quality: 800w").unwrap();
+        patch_path(
+            &mut sparse,
+            ["footer", "footerAlign"].into_iter(),
+            serde_yaml::Value::from("LEFT"),
+        )
+        .unwrap();
+        assert_eq!(
+            sparse["footer"]["footerAlign"],
+            serde_yaml::Value::from("LEFT")
+        );
+        assert_eq!(sparse["quality"], serde_yaml::Value::from("800w"));
+        // 拿一个标量当表往下走要报错，不能悄悄覆盖
+        let mut scalar: serde_yaml::Value = serde_yaml::from_str("quality: 800w").unwrap();
+        assert!(
+            patch_path(
+                &mut scalar,
+                ["quality", "oops"].into_iter(),
+                serde_yaml::Value::Bool(false),
+            )
+            .is_err()
+        );
     }
 }

@@ -1389,6 +1389,64 @@ impl AronaGui {
                 ));
             }
         });
+
+        ui.add_space(8.0);
+        self.plugin_config_card(ui, dark, &info.id);
+    }
+
+    /// 插件自己的配置区。框架仍然不认识任何键名，只按值的类型给控件：
+    /// 布尔=勾选框，数字与字符串=文本框（颜色串旁边多一块色板）。
+    /// 键名像凭据的那一类根本到不了这里——`admin::plugin_fields` 就挡掉了。
+    fn plugin_config_card(&mut self, ui: &mut egui::Ui, dark: bool, plugin: &str) {
+        let fields = admin::plugin_fields(plugin);
+        let mut edit: Option<(String, serde_yaml::Value)> = None;
+        card_row(ui, dark, |ui| {
+            section_title(ui, "配置");
+            ui.weak(
+                "这一区由插件自己声明，框架只按值的类型给控件；键名像凭据的一律不显示。\
+                 改完立即写进该插件的配置文件并热生效，注释仍由插件的模板生成。",
+            );
+            ui.add_space(4.0);
+            if fields.is_empty() {
+                ui.weak("这个插件没有可以在这里改的配置项（要么全是结构，要么都挡掉了）。");
+                return;
+            }
+            egui::Grid::new(format!("plugin_fields_{plugin}"))
+                .num_columns(3)
+                .spacing([10.0, 6.0])
+                .show(ui, |ui| {
+                    for field in &fields {
+                        ui.label(&field.path);
+                        if let Some(next) = field_edit(ui, egui::Id::new(&field.path), &field.value)
+                        {
+                            edit = Some((field.path.clone(), next));
+                        }
+                        // 第三列只放色板（颜色串才有），其余留空，保证键名与输入框对齐
+                        match &field.value {
+                            serde_yaml::Value::String(text) => {
+                                if let Some(color) = swatch_color(text) {
+                                    let (rect, _) = ui.allocate_exact_size(
+                                        egui::vec2(46.0, 16.0),
+                                        egui::Sense::hover(),
+                                    );
+                                    ui.painter().rect_filled(rect, 3.0, color);
+                                } else {
+                                    ui.label("");
+                                }
+                            }
+                            _ => {
+                                ui.label("");
+                            }
+                        }
+                        ui.end_row();
+                    }
+                });
+        });
+        if let Some((path, value)) = edit {
+            self.note(admin::set_plugin_field(plugin, &path, value));
+            // 值是从文件里读出来的，写完重取一遍，界面上才不会停在旧值上
+            self.plugins = admin::plugin_list();
+        }
     }
 
     // ==================== OneBot 连接 ====================
@@ -1737,6 +1795,78 @@ fn int_edit<T: IntField>(
         }
     }
     ui.memory_mut(|memory| memory.data.insert_temp(text_id, text));
+}
+
+/// 一个配置值的控件。返回 `Some` 表示这一格被改成了这个值。
+///
+/// 数字保持原来的整数/小数形状写回：文件里是 `30` 就别改写成 `30.0`，
+/// 否则插件那边的强类型读取（`as_i64`）会突然拿不到值。
+fn field_edit(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    value: &serde_yaml::Value,
+) -> Option<serde_yaml::Value> {
+    match value {
+        serde_yaml::Value::Bool(current) => {
+            let mut next = *current;
+            ui.checkbox(&mut next, "")
+                .changed()
+                .then_some(serde_yaml::Value::Bool(next))
+        }
+        serde_yaml::Value::Number(current) => {
+            let shown = current.to_string();
+            let text = text_edit(ui, id, &shown);
+            if text == shown || text.is_empty() {
+                return None;
+            }
+            if current.is_i64() || current.is_u64() {
+                text.parse::<i64>()
+                    .ok()
+                    .and_then(|n| serde_yaml::to_value(n).ok())
+            } else {
+                text.parse::<f64>()
+                    .ok()
+                    .filter(|number| number.is_finite())
+                    .and_then(|n| serde_yaml::to_value(n).ok())
+            }
+        }
+        serde_yaml::Value::String(current) => {
+            let text = text_edit(ui, id, current);
+            (text != *current).then(|| serde_yaml::Value::String(text))
+        }
+        _ => None,
+    }
+}
+
+/// 单行文本框：编辑期间用 `ui.memory` 里的临时值，避免"打了一半被判非法又跳回原值"。
+/// 与 [`int_edit`] 同一套路子——配置项被误改很难发现，所以不给拖拽。
+fn text_edit(ui: &mut egui::Ui, id: egui::Id, value: &str) -> String {
+    let text_id = id.with("text");
+    let mut text = ui
+        .memory(|memory| memory.data.get_temp::<String>(text_id))
+        .unwrap_or_else(|| value.to_string());
+    let response = ui.add(
+        egui::TextEdit::singleline(&mut text)
+            .id(text_id)
+            .desired_width(220.0),
+    );
+    if !response.has_focus() && text != value {
+        text = value.to_string();
+    }
+    ui.memory_mut(|memory| memory.data.insert_temp(text_id, text.clone()));
+    text
+}
+
+/// 一块色板：认 `#RRGGBB` 与 B 站那套 alpha 在前的 `#AARRGGBB`。认不出来返回 None。
+fn swatch_color(hex: &str) -> Option<egui::Color32> {
+    let digits = hex.trim_start_matches('#');
+    let byte = |range: std::ops::Range<usize>| u8::from_str_radix(digits.get(range)?, 16).ok();
+    let color = match digits.len() {
+        6 => egui::Color32::from_rgb(byte(0..2)?, byte(2..4)?, byte(4..6)?),
+        8 => egui::Color32::from_rgb(byte(2..4)?, byte(4..6)?, byte(6..8)?),
+        _ => return None,
+    };
+    Some(color)
 }
 
 fn now_secs() -> f64 {
@@ -3500,6 +3630,79 @@ mod tests {
             .collect();
         assert!(laid.contains("20001"), "群号被挤掉了：{laid:?}");
         assert!(laid.contains("小电视订阅群名"), "长群名整列消失：{laid:?}");
+    }
+
+    /// 色板认两种写法：`#RRGGBB`，以及 B 站那套 alpha 在前的 `#AARRGGBB`
+    #[test]
+    fn the_swatch_reads_both_hex_orders() {
+        assert_eq!(
+            swatch_color("#ff8800"),
+            Some(egui::Color32::from_rgb(255, 136, 0))
+        );
+        assert_eq!(
+            swatch_color("#B4FFFFFF"),
+            Some(egui::Color32::from_rgb(255, 255, 255)),
+            "alpha 在前，色板取的是后面那三组"
+        );
+        assert_eq!(swatch_color(""), None);
+        assert_eq!(swatch_color("#12345"), None);
+        assert_eq!(swatch_color("#gggggg"), None);
+    }
+
+    /// 「配置」那一块的版面在 420 宽里排得下：键路径、值、色板三列都不许被挤没
+    #[test]
+    fn a_config_row_stays_readable_at_a_narrow_width() {
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(420.0, 300.0));
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |context| {
+                egui::CentralPanel::default().show(context, |ui| {
+                    egui::Grid::new("probe")
+                        .num_columns(3)
+                        .spacing([10.0, 6.0])
+                        .show(ui, |ui| {
+                            ui.label("image.cardColor");
+                            let color = serde_yaml::Value::String("#B4FFFFFF".to_string());
+                            let _ = field_edit(ui, egui::Id::new("cardColor"), &color);
+                            let (rect, _) = ui
+                                .allocate_exact_size(egui::vec2(46.0, 16.0), egui::Sense::hover());
+                            if let Some(painted) = swatch_color("#B4FFFFFF") {
+                                ui.painter().rect_filled(rect, 3.0, painted);
+                            }
+                            ui.end_row();
+                            ui.label("image.drawEnable");
+                            let _ = field_edit(
+                                ui,
+                                egui::Id::new("drawEnable"),
+                                &serde_yaml::Value::Bool(true),
+                            );
+                            ui.label("");
+                            ui.end_row();
+                        });
+                });
+            },
+        );
+        let laid: String = output
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::epaint::Shape::Text(shape) => Some(shape.galley.text().to_string()),
+                _ => None,
+            })
+            .collect();
+        assert!(laid.contains("image.cardColor"), "键路径被挤掉了：{laid:?}");
+        assert!(
+            laid.contains("#B4FFFFFF"),
+            "颜色值那一格没显示出来：{laid:?}"
+        );
+        assert!(
+            laid.contains("image.drawEnable"),
+            "第二行的键名没排上：{laid:?}"
+        );
     }
 
     /// 预览确实排得进那块 300 宽的左侧面板：多行 label 在 egui 里要自己折行，
