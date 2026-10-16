@@ -27,7 +27,6 @@ log = "0.4"
 # 运行期加载功能插件 dll（plugins/ 目录扫描）
 libloading = "0.8"
 zip = { version = "2", default-features = false, features = ["deflate"] }
-fontdue = "0.8"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 # GUI 管理面板（默认启用）: --no-default-features 可编译不含 GUI 的精简命令行版
 # glow(OpenGL) 为主，wgpu(DX12/Vulkan，可用 WARP 软件渲染) 作为服务器/无显卡环境的备选后端
