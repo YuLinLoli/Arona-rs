@@ -394,6 +394,7 @@ mod tests {
             "loader: builtin",
             "depends: []",
             "softDepends: []",
+            "groupScoped: true",
             "config: config/ContractAlpha/arona.yml",
             "data: data/ContractAlpha",
         ] {

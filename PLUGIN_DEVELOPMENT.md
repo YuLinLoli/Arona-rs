@@ -22,7 +22,7 @@ plugins/hello/             # 示例插件：name=hello-plugin, crate-type=["cdyl
 版本约定：框架与 host 同为 `1.1.0`，插件版本号各自演进。
 **插件接口的破坏性改动抬 `arona::plugin::FRAMEWORK_API_VERSION`**（与 crate 版本号无关），见 §6；
 **插件会读的那个类型换了布局**（`Framework`、`CommandContext`、`EventBody`、`BodyFilter`、`OneBotApi`
-这些，加字段/加变体/改字段类型）另抬 `arona::plugin::abi::ABI_LAYOUT`（当前 `8`），见 §22。
+这些，加字段/加变体/改字段类型）另抬 `arona::plugin::abi::ABI_LAYOUT`（当前 `9`），见 §22。
 
 运行期的落盘目录由框架统一规定（见 §7），插件不自己挑地方：
 
@@ -224,8 +224,17 @@ fn meta(&self) -> PluginMeta {
     // .requires_api(ApiVersion::new(1, 1, 0))          // 用到比当前框架新的接口时才抬
     // .depends_on(&["core-data"])                      // 硬依赖：任一缺失/停用则本插件不装配
     // .soft_depends_on(&["gacha"])                     // 软依赖：只决定装配先后，缺了照样跑
+    // .with_group_scoped(false)                        // 纯私聊插件：声明自己不按群生效
 }
 ```
+
+**`with_group_scoped(false)` 是给只收私聊的插件用的**（默认 `true`，不写就跟以前一字不差）。
+声明之后有三处跟着变：GUI「插件管理 → 详情」不再给它画「启用的群」那一格（连功能开关键进去
+也看不到各群勾选框），`admin::set_group_plugin_enabled` 对这家直接拒写，运行期
+`group_settings.<群>.disabled_plugins` 里就算残留着它的 id 也一律放行（§13）。理由是同一件事：
+一个只在私聊里干活的插件，按群的开关本来就没有可关的东西，摆一排勾了没用的复选框，
+用户只会把"勾不动"读成"没生效"。反过来，一家插件只要接群消息、群命令或群通知，
+就不该声明 `false`——那个开关是真能救急的。
 
 `id` 用小写短横线名（`voice-room`、`music` 这种），它是**磁盘上的身份**：
 `plugins/<id>/`、`config/<id>/arona.yml`、`data/<id>/`、`disabled_plugins: [<id>]`、
@@ -261,7 +270,7 @@ fn meta(&self) -> PluginMeta {
 
 这些接口都顺手 `create_dir_all`（`install_all()` 阶段已先建好三件套），插件取到路径就能直接写。
 `plugins/<id>/plugin.yml` 是框架自动生成的 mirai 风格清单
-（`id/name/version/author/description/apiVersion/loader/depends/softDepends/config/data/image`），
+（`id/name/version/author/description/apiVersion/loader/depends/softDepends/groupScoped/config/data/image`），
 `plugins/<id>/` 是推荐投放位置：dll 本身放这里，随包资源也放这里，
 `plugin.yml` 由框架按插件上报的元信息渲染出来（§22）。
 
@@ -863,7 +872,7 @@ notify.update(|c| c.every_day_hour = 20)?;           // 读—改—写：落盘
 | --- | --- | --- |
 | 功能（全局） | `arona.yml` → `disabled_features` | `feature_enabled` 的第一道：所有群**加私聊**都不响应 |
 | 功能（分群） | `arona.yml` → `group_settings.<群号>.disabled_features` | `runtime::config::feature_enabled(group_id, key)`：命令路由，以及 `ctx.listen_feature(..)` 绑了该 key 的钩子 |
-| 插件（分群） | `arona.yml` → `group_settings.<群号>.disabled_plugins` | `plugin_enabled_in_group`，命令与钩子（入站、出站）一起停 |
+| 插件（分群） | `arona.yml` → `group_settings.<群号>.disabled_plugins` | `plugin_enabled_in_group`，命令与钩子（入站、出站）一起停；**声明过 `with_group_scoped(false)` 的插件这一档直接放行**（§6） |
 | 插件（全局） | `arona.yml` → `disabled_plugins` | 不 configure、不 start、不路由、不收事件、也不改写别人发的消息 |
 
 `feature_enabled` 三道按写的顺序走：先看这个 key 有没有被**全局**关掉，再看归属插件是否启用
@@ -1204,12 +1213,12 @@ ctx.clear_all_rows();       // 全摘（一般用不上：插件被停用时框�
 装载成功的标志是这三行日志：
 
 ```
-[Arona] 插件 ABI 握手通过: 布局 8，契约 1.0.0
+[Arona] 插件 ABI 握手通过: 布局 9，契约 1.0.0
 [Arona] 已装载动态插件: HelloPlugin 0.1.0 (hello_plugin.dll)
 [Arona] 插件已启动: HelloPlugin v0.1.0
 ```
 
-那个「布局 8」是当前符号布局版本（§22），每次抬它这里的打印就跟着变，核对时以 §22 为准。
+那个「布局 9」是当前符号布局版本（§22），每次抬它这里的打印就跟着变，核对时以 §22 为准。
 
 `plugins/<id>/plugin.yml`、`config/<id>/arona.yml` 由框架在装载时自动写出来，GUI「插件管理」页
 立刻能开关它。换插件、删插件都不必重新编译框架，**但必须重启框架**——`plugins/` 只在启动时扫一遍，
@@ -1604,7 +1613,9 @@ dll 把 `arona` **连同它的全部依赖**静态链接成了第二份，所以
 `OneBotApi` 由零宽单元类型变成持有实例引用的结构体）；`5 → 6` 是 `HostBridge` 多一条排期通道，
 从此 `quartz` 的 `Scheduler`/`TaskEntry` 不再出界；`6 → 7` 是代发 HTTP 要能把**响应头**交回来
 （`HttpCall` 末尾多一个 `want_headers`、`HttpDone` 末尾多两段），§14.1；`7 → 8` 是多一条会话展示板
-   通道（`HostBridge::views` + `ViewSpec`），插件把自己的订阅条目报上来给 GUI 列，§14.3。**宿主侧的四个导出符号一个字都没改，
+   通道（`HostBridge::views` + `ViewSpec`），插件把自己的订阅条目报上来给 GUI 列，§14.3；`8 → 9` 是
+`PluginMeta` 末尾多一项 `group_scoped`（纯私聊插件声明自己不按群生效，§6）——元信息由 dll 造出、
+宿主来读，它同样是跨镜像的布局。**宿主侧的四个导出符号一个字都没改，
 也算改 ABI**——这条最容易漏。同理，给跨镜像 `trait` 追加方法（vtable 变长）也要抬。
 
 #### 还欠着的两处（不影响插件正常写法，但排查时值得知道）
@@ -1741,7 +1752,7 @@ tokio 也被静态链接成了两份，而"当前在哪个运行时里"这个上
 
 | 项 | 来源 | 不一致的后果 |
 | --- | --- | --- |
-| 符号布局版本 | `arona::plugin::abi::ABI_LAYOUT`（当前 8） | 四个导出符号的签名、或**插件会读的那个类型**（`Framework`、`CommandContext`、`EventBody`、`BodyFilter`、`OneBotApi`）换了布局，新旧不可混用。布局 6 起 `quartz` 的 `Scheduler`/`TaskEntry` **已经不出界**（排期走宿主通道，§10），那两个结构内部随便改；布局 7 起 `HttpCall`/`HttpDone` 多的那几段也在这一号里——**跨边界的结构体加字段就是抬布局的事**，私有与否不看；布局 8 起 `HostBridge` 多一条会话展示板通道（`ViewSpec`，§14.3），那张表的字段布局同样不出界 |
+| 符号布局版本 | `arona::plugin::abi::ABI_LAYOUT`（当前 9） | 四个导出符号的签名、或**插件会读的那个类型**（`Framework`、`CommandContext`、`EventBody`、`BodyFilter`、`OneBotApi`、`PluginMeta`）换了布局，新旧不可混用。布局 6 起 `quartz` 的 `Scheduler`/`TaskEntry` **已经不出界**（排期走宿主通道，§10），那两个结构内部随便改；布局 7 起 `HttpCall`/`HttpDone` 多的那几段也在这一号里——**跨边界的结构体加字段就是抬布局的事**，私有与否不看；布局 8 起 `HostBridge` 多一条会话展示板通道（`ViewSpec`，§14.3），那张表的字段布局同样不出界；布局 9 起 `PluginMeta` 多一项 `group_scoped`（§6），插件不写就是默认的 `true` |
 | 框架契约版本 | `FRAMEWORK_API_VERSION`（主版本相等 + 框架次版本不低于插件要求） | 插件用到了宿主还没有的接口 |
 | rustc 版本与 host 三件套 | 两边各自 `rustc -vV` 的 `release` / `host` 两行 | `dyn Trait` 胖指针布局、泛型单态化产物可能对不上 |
 | 目标三元组 + profile + CRT 链接方式 | `TARGET` / `PROFILE` / `crt-static` | debug 与 release 混编会炸；两套 MSVC 运行库会各自分配释放内存 |
@@ -1770,7 +1781,7 @@ tokio 也被静态链接成了两份，而"当前在哪个运行时里"这个上
 ### 发布插件时必须写明的三件事
 
 ```
-适用于 Arona-rs 1.1.0（框架契约 1.0.0，符号布局 8）
+适用于 Arona-rs 1.1.0（框架契约 1.0.0，符号布局 9）
 构建工具链：rustc 1.98.0，x86_64-pc-windows-msvc，--release，crt-static
 下载后放进 <框架运行目录>/plugins/<你的id>/，重启框架
 ```

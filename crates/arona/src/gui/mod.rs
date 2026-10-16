@@ -1254,21 +1254,28 @@ impl AronaGui {
                 // 插值首帧是 0，收起/展开的观感反而不确定
                 if state.is_open() {
                     ui.indent(id, |ui| {
-                        let rows = admin::plugin_group_rows(&info.id);
-                        if rows.is_empty() {
-                            ui.weak("列不出群：arona.yml 的 groups 是空的，也还没写过分群设置。");
-                        }
-                        for row in rows {
-                            let name = group_name(&groups, row.group_id);
-                            let mut enabled = !off_groups.contains(&row.group_id);
-                            let label = group_display(row.group_id, &name);
-                            if ui.checkbox(&mut enabled, label).changed() {
-                                feature_group = Some((
-                                    row.group_id,
-                                    feature.key.to_string(),
-                                    feature.name.to_string(),
-                                    enabled,
-                                ));
+                        // 主人声明过不按群生效 → 这一档根本没有可关的群，别摆一排勾了没用的框
+                        if !info.group_scoped {
+                            ui.weak("这个插件声明了自己不按群生效，功能开关只有上面那一个总开关。");
+                        } else {
+                            let rows = admin::plugin_group_rows(&info.id);
+                            if rows.is_empty() {
+                                ui.weak(
+                                    "列不出群：arona.yml 的 groups 是空的，也还没写过分群设置。",
+                                );
+                            }
+                            for row in rows {
+                                let name = group_name(&groups, row.group_id);
+                                let mut enabled = !off_groups.contains(&row.group_id);
+                                let label = group_display(row.group_id, &name);
+                                if ui.checkbox(&mut enabled, label).changed() {
+                                    feature_group = Some((
+                                        row.group_id,
+                                        feature.key.to_string(),
+                                        feature.name.to_string(),
+                                        enabled,
+                                    ));
+                                }
                             }
                         }
                     });
@@ -1298,71 +1305,81 @@ impl AronaGui {
         }
 
         // ---- 启用的群：群号集合 = 授权名单 ∪ 写过例外的群 ----
-        ui.add_space(8.0);
-        let mut plugin_group: Option<(i64, bool)> = None;
-        card_row(ui, dark, |ui| {
-            section_title(ui, "启用的群");
-            ui.weak(
-                "去掉勾 = 只在这个群里停用该插件（写 group_settings.<群>.disabled_plugins），\n\
-                 它在别的群照常跑。私聊不看这一层，也不看群名单。",
-            );
-            ui.add_space(4.0);
-            let rows = admin::plugin_group_rows(&info.id);
-            if rows.is_empty() {
+        // 声明过不按群生效的插件（纯私聊那一类）这一整格都不画：摆了就是永远勾不动的复选框，
+        // 而"勾不动"和"没作用"在界面上长得一模一样，用户只能猜
+        if info.group_scoped {
+            ui.add_space(8.0);
+            let mut plugin_group: Option<(i64, bool)> = None;
+            card_row(ui, dark, |ui| {
+                section_title(ui, "启用的群");
                 ui.weak(
+                    "去掉勾 = 只在这个群里停用该插件（写 group_settings.<群>.disabled_plugins），\n\
+                 它在别的群照常跑。私聊不看这一层，也不看群名单。",
+                );
+                ui.add_space(4.0);
+                let rows = admin::plugin_group_rows(&info.id);
+                if rows.is_empty() {
+                    ui.weak(
                     "暂时列不出群：在下面填一个群号先加上（机器人还没在那个群也可以填，等它被拉进去就按这里的设置响应）。",
                 );
-            }
-            for row in rows {
-                let name = group_name(&groups, row.group_id);
-                let mut enabled = row.enabled;
-                if ui
-                    .checkbox(&mut enabled, group_display(row.group_id, &name))
-                    .changed()
-                {
-                    plugin_group = Some((row.group_id, enabled));
                 }
-                if !row.authorized {
-                    ui.colored_label(warn_color(dark), "(不在授权名单，机器人在这个群还不理)");
-                }
-            }
-        });
-        if let Some((group_id, enabled)) = plugin_group {
-            self.note(
-                admin::set_group_plugin_enabled(group_id, &info.id, enabled).map(move |()| {
-                    format!(
-                        "插件 {} 在群 {group_id} 已{}",
-                        info.name,
-                        if enabled { "启用" } else { "停用" }
-                    )
-                }),
-            );
-        }
-        ui.add_space(4.0);
-        let mut added: Option<i64> = None;
-        let mut invalid: Option<String> = None;
-        ui.horizontal(|ui| {
-            ui.weak("添加群号");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.plugin_group_input)
-                    .hint_text("比如 123456789")
-                    .desired_width(150.0),
-            );
-            if ui.button("加进来").clicked() {
-                let raw = self.plugin_group_input.trim().to_string();
-                match raw.parse::<i64>() {
-                    Ok(group_id) => {
-                        added = Some(group_id);
-                        self.plugin_group_input.clear();
+                for row in rows {
+                    let name = group_name(&groups, row.group_id);
+                    let mut enabled = row.enabled;
+                    if ui
+                        .checkbox(&mut enabled, group_display(row.group_id, &name))
+                        .changed()
+                    {
+                        plugin_group = Some((row.group_id, enabled));
                     }
-                    Err(_) => invalid = Some(format!("「{raw}」不是群号：只填数字")),
+                    if !row.authorized {
+                        ui.colored_label(warn_color(dark), "(不在授权名单，机器人在这个群还不理)");
+                    }
                 }
+            });
+            if let Some((group_id, enabled)) = plugin_group {
+                self.note(
+                    admin::set_group_plugin_enabled(group_id, &info.id, enabled).map(move |()| {
+                        format!(
+                            "插件 {} 在群 {group_id} 已{}",
+                            info.name,
+                            if enabled { "启用" } else { "停用" }
+                        )
+                    }),
+                );
             }
-        });
-        if let Some(group_id) = added {
-            self.note(admin::set_group_enabled(group_id, true));
-        } else if let Some(err) = invalid {
-            self.note::<()>(Err(err));
+            ui.add_space(4.0);
+            let mut added: Option<i64> = None;
+            let mut invalid: Option<String> = None;
+            ui.horizontal(|ui| {
+                ui.weak("添加群号");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.plugin_group_input)
+                        .hint_text("比如 123456789")
+                        .desired_width(150.0),
+                );
+                if ui.button("加进来").clicked() {
+                    let raw = self.plugin_group_input.trim().to_string();
+                    match raw.parse::<i64>() {
+                        Ok(group_id) => {
+                            added = Some(group_id);
+                            self.plugin_group_input.clear();
+                        }
+                        Err(_) => invalid = Some(format!("「{raw}」不是群号：只填数字")),
+                    }
+                }
+            });
+            if let Some(group_id) = added {
+                self.note(admin::set_group_enabled(group_id, true));
+            } else if let Some(err) = invalid {
+                self.note::<()>(Err(err));
+            }
+        } else {
+            ui.add_space(8.0);
+            ui.weak(
+                "这个插件声明了自己不按群生效（只收私聊），所以这里没有「启用的群」那一格；\n\
+                 要停它就停整体。",
+            );
         }
 
         // ---- 订阅条目：字全是插件给的，框架这边只搬运 ----
@@ -3573,6 +3590,7 @@ mod tests {
                 version: "0.1.0".to_string(),
                 description: String::new(),
                 enabled: true,
+                group_scoped: true,
                 features: Vec::new(),
                 hooks: Vec::new(),
                 plugin_dir: std::path::PathBuf::new(),

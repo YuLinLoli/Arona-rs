@@ -68,6 +68,10 @@ impl Default for RuntimeConfig {
 pub struct Gating {
     /// key 用于 arona.yml 的 group_settings.disabled_features
     features: RwLock<Vec<RegisteredFeature>>,
+    /// 声明了自己不按群生效的插件 id（小写）。install 阶段由框架从
+    /// [`PluginMeta::group_scoped`](crate::plugin::PluginMeta) 记进来：分群停用名单
+    /// 对它们一律放行，所以手改 arona.yml 塞一个进去也不会起作用——那一格本该不存在。
+    group_exempt: RwLock<Vec<String>>,
     config: RuntimeConfig,
 }
 
@@ -169,10 +173,16 @@ impl Gating {
         let Some(group_id) = group_id else {
             return true;
         };
+        // 先在锁外算好豁免，免得持着分群设置的读锁再去拿豁免表的锁
+        let owner_exempt = owner
+            .as_deref()
+            .is_some_and(|plugin| self.group_exempt(plugin));
         // 功能开关与该群的插件名单在同一次持锁里读完
         self.with_group_setting(group_id, |setting| {
             setting.feature_enabled(key)
                 && match &owner {
+                    // 主人声明过不按群生效 → 这一档不参与判定，只看法上这个功能开没开
+                    Some(_) if owner_exempt => true,
                     Some(plugin) => setting_plugin_enabled(setting, plugin),
                     // 没人登记过的 key（老配置里的残留）不做插件判断，按功能开关结论放行
                     None => true,
@@ -189,11 +199,37 @@ impl Gating {
             .any(|name| name.eq_ignore_ascii_case(plugin))
     }
 
+    /// 记下插件自己声明的分群作用域（install 阶段由框架写入）。
+    /// `group_scoped = false` 的插件进豁免表：分群名单再也管不到它。
+    pub fn set_group_scoped(&self, plugin: &str, group_scoped: bool) {
+        let name = plugin.to_ascii_lowercase();
+        let mut exempt = self.group_exempt.write().unwrap();
+        exempt.retain(|item| *item != name);
+        if !group_scoped {
+            exempt.push(name);
+        }
+    }
+
+    /// 该插件是否声明过"不按群生效"
+    pub fn group_exempt(&self, plugin: &str) -> bool {
+        let name = plugin.to_ascii_lowercase();
+        self.group_exempt
+            .read()
+            .unwrap()
+            .iter()
+            .any(|item| *item == name)
+    }
+
     /// 插件在某个群里是否启用（私聊无群号，一律按启用处理，与 [`Gating::feature_enabled`] 一致）
     pub fn plugin_enabled_in_group(&self, plugin: &str, group_id: Option<i64>) -> bool {
         let Some(group_id) = group_id else {
             return true;
         };
+        // 声明过不按群生效的插件不看分群名单：那一格开关在 GUI 里已经不给它画了，
+        // 老配置里残留的条目也不该继续管事
+        if self.group_exempt(plugin) {
+            return true;
+        }
         self.with_group_setting(group_id, |setting| setting_plugin_enabled(setting, plugin))
             .unwrap_or(true)
     }
@@ -424,6 +460,11 @@ pub fn plugin_enabled_in_group(plugin: &str, group_id: Option<i64>) -> bool {
     gating().plugin_enabled_in_group(plugin, group_id)
 }
 
+/// 该插件是否声明过"不按群生效"（`PluginMeta::group_scoped = false`）
+pub fn group_exempt(plugin: &str) -> bool {
+    gating().group_exempt(plugin)
+}
+
 /// 用户是否被拉黑（管理员不参与判断，由调用方保证）
 pub fn is_blacklisted(user_id: i64, group_id: Option<i64>) -> bool {
     gating().is_blacklisted(user_id, group_id)
@@ -549,6 +590,18 @@ mod tests {
         assert!(gating.plugin_enabled_in_group("hello", Some(100)));
         assert!(gating.plugin_enabled_in_group("other", Some(200)));
         assert!(gating.feature_enabled(Some(200), "gacha"));
+        // 声明过自己不按群生效（纯私聊那一类）：分群停用名单再也管不到它，比对也忽略大小写
+        gating.set_group_scoped("other", false);
+        assert!(
+            gating.plugin_enabled_in_group("Other", Some(100)),
+            "豁免之后，100 群那份名单不该再挡住它"
+        );
+        // 功能那一档跟着主人一起豁免：只剩功能名单自己管事，200 群没关过 gacha
+        gating.set_group_scoped("hello", false);
+        assert!(gating.feature_enabled(Some(200), "gacha"));
+        // 改回按群生效，名单立刻重新管事——豁免是登记阶段按上报值写的，不是一次进门永久免检
+        gating.set_group_scoped("other", true);
+        assert!(!gating.plugin_enabled_in_group("other", Some(100)));
         // 群内黑名单只在那个群里成立
         assert!(gating.is_blacklisted(7, Some(100)));
         assert!(!gating.is_blacklisted(7, Some(200)));

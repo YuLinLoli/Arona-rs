@@ -50,6 +50,9 @@ use std::os::raw::c_char;
 /// 8 = 再多一条通道：会话展示板（[`HostBridge::views`] + [`ViewSpec`]）。GUI 要按群列出插件登记的
 ///     条目（"这个群订阅了谁"），而框架不许读插件的私有数据文件，所以只能由插件上报。
 ///     表本身挂在 [`Framework`](crate::framework::Framework) 实例上（那也是加字段），读写走通道。
+/// 9 = [`PluginMeta`](crate::plugin::PluginMeta) 末尾多一项 `group_scoped`：纯私聊插件要能声明
+///     自己不按群生效，好让框架收起「启用的群」那一格。元信息由 dll 造出、宿主来读，
+///     它的字段布局同样是跨镜像的 ABI 的一部分——宿主侧四个导出符号一个字都没改，也算改 ABI。
 ///
 /// **别以为改了 `HostBridge` 才算改 ABI**：[`HostBridge::framework`] 交出去的是擦成
 /// `*const c_void` 的实例指针，插件 dll 里那份框架代码按**它自己编译期的字段偏移**去读这个
@@ -58,7 +61,7 @@ use std::os::raw::c_char;
 /// 句柄去调自己那份 bundled sqlite）。所以 `Framework` 的字段序本身就是 ABI 的一部分，
 /// 动它必须抬这个版本号。同理，插件直接读的任何 `pub` 结构体/枚举（新变体、加字段、
 /// 改字段类型）也一样要抬，哪怕宿主侧的签名一个字都没动。
-pub const ABI_LAYOUT: u32 = 8;
+pub const ABI_LAYOUT: u32 = 9;
 
 /// 装载器名（写进 `plugins/<id>/plugin.yml` 的 `loader:` 与 GUI 插件列表）
 pub const DYNAMIC_LOADER: &str = "dynamic";

@@ -360,6 +360,11 @@ impl PluginManager {
                 self.fail(&plugin, reason, &mut failures);
                 continue;
             }
+            // 分群作用域先记进门控，再跑 install：GUI 与命令路由都在读这张表，
+            // 声明不按群生效的插件不该在任何一个群里被分群名单挡住
+            framework
+                .gating()
+                .set_group_scoped(plugin.id(), plugin.meta().group_scoped);
             let registrar = PluginRegistrar::new(plugin.id(), &framework);
             let outcome = guarded_call(&plugin, "登记", || plugin.instance.install(&registrar));
             if let Err(reason) = outcome {
@@ -688,6 +693,7 @@ pub(crate) fn describe(plugin: &ManagedPlugin) -> String {
          loader: {loader}\n\
          depends: {depends}\n\
          softDepends: {soft}\n\
+         groupScoped: {scoped}\n\
          config: config/{id}/arona.yml\n\
          data: data/{id}\n\
          image: data/{id}/image\n",
@@ -704,6 +710,7 @@ pub(crate) fn describe(plugin: &ManagedPlugin) -> String {
         loader = plugin.loader(),
         depends = list(meta.depends),
         soft = list(meta.soft_depends),
+        scoped = meta.group_scoped,
     )
 }
 

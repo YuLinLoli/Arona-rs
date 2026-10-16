@@ -208,6 +208,9 @@ pub struct PluginInfo {
     pub description: String,
     /// 全局启用状态（框架 arona.yml 的 disabled_plugins）
     pub enabled: bool,
+    /// 该插件是否按群生效（`PluginMeta::group_scoped`）。false 时这一页不画「启用的群」，
+    /// 因为分群停用名单对它不起作用——摆一排勾了也没用的复选框，只会让人以为关掉就能拦住它
+    pub group_scoped: bool,
     /// 该插件登记的功能开关
     pub features: Vec<runtime_config::Feature>,
     /// 该插件订阅的事件范围中文名（消息/通知:成员进群/请求/元事件）
@@ -237,6 +240,7 @@ pub fn plugin_list() -> Vec<PluginInfo> {
                 version: meta.version.to_string(),
                 description: meta.description.to_string(),
                 enabled: runtime_config::plugin_enabled(meta.id),
+                group_scoped: meta.group_scoped,
                 features: runtime_config::features_of(meta.id),
                 hooks,
                 plugin_dir: paths::plugin_dir(meta.id),
@@ -257,8 +261,14 @@ pub fn set_plugin_enabled(plugin: &str, enabled: bool) -> Result<String, String>
     ))
 }
 
-/// 某个群里启用/停用插件（按 id；只影响该群的路由，不动插件后台任务）
+/// 某个群里启用/停用插件（按 id；只影响该群的路由，不动插件后台任务）。
+/// 声明过不按群生效的插件在这里直接拒写：GUI 不给它画那一格，别的入口也不该偷偷写进名单
 pub fn set_group_plugin_enabled(group_id: i64, plugin: &str, enabled: bool) -> Result<(), String> {
+    if runtime_config::group_exempt(plugin) {
+        return Err(format!(
+            "插件 {plugin} 声明了自己不按群生效，没有「在这个群里停用」这一说；要停就停整体"
+        ));
+    }
     settings::set_group_plugin_enabled(group_id, plugin, enabled)
 }
 
