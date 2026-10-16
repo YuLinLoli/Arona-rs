@@ -33,6 +33,7 @@ plugins/hello/             # 示例插件：name=hello-plugin, crate-type=["cdyl
   config/onebot.yml         OneBot 连接配置
   config/<插件>/arona.yml   该插件自己的配置（如 config/hello/arona.yml）
   data/<插件>/…             该插件自己的数据（如 data/hello/image、arona.db、backups）
+  fonts/                    安装包与便携 zip 释出的随包中文字体（思源宋体简中，OFL 1.1）
   logs/                     按天滚动的日志
   plugins/                  用户放的插件 dll —— 框架扫描这一层以及它的每个一级子目录
   plugins/<插件>/           框架按 id 渲染的 plugin.yml；插件的随包资源也放这里
@@ -283,6 +284,19 @@ id 目录名在阶段之外也要用时（比如模块级函数），直接用
 `arona-standalone/` 下：框架的 `paths::prepare()` 会**复制**它认识的几项到新位置；
 插件独有的旧文件（图片、数据库、备份）由插件自己在 `install()` 里用
 `paths::migrate_file` / `paths::migrate_dir` 搬（只补缺、保留旧文件，旧目录不删）。
+
+**出图插件的字面不要自己填系统候选表**，用框架那一份：
+
+```rust
+if let Some((regular, bold)) = arona::runtime::assets::cjk_font() { … }
+```
+
+它给的是运行目录 `fonts/` 下安装包释出的思源宋体简中（常规 + 可选粗体，`.otf`/`.ttf`/`.ttc` 都认，
+按文件名里的大小写无关 `Regular` / `Bold` 分档）。GUI 面板读的是同一个出口，所以**面板上的字和插件画在
+图上的字是同一套**——过去每个出图插件各自去系统目录猜一份，观感随这台机器装了什么字体漂，没法验收。
+它不是 `HostBridge` 那类宿主通道：`paths::root()` 就是工作目录，宿主那份框架代码与每个 dll 里那份算出来
+的是同一个路径，所以这只是一个普通函数，**不动符号布局版本**。拿不到（`None`）就退回你自己的系统字体候选——
+没随包字体不该让功能挂掉。用户把自己那份字体丢进 `fonts/` 并按字重命名，就整体换掉了面板与所有卡片的字。
 
 ## 8. 登记功能与命令
 

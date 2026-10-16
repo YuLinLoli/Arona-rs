@@ -149,6 +149,14 @@ Source: "intro.txt"; DestDir: "{app}"; DestName: "安装说明.txt"; Flags: igno
 ;      功能插件各自再占一层子目录（config/<插件>/、data/<插件>/），由插件自己生成模板
 Source: "defaults\onebot.yml"; DestDir: "{app}\config"; Flags: onlyifdoesntexist uninsneveruninstall; Components: main
 Source: "defaults\arona.yml"; DestDir: "{app}\config"; Flags: onlyifdoesntexist uninsneveruninstall; Components: main
+; ---- 随包中文字体（思源宋体简中 Subset OTF，SIL OFL 1.1，允许随作品再分发）----
+;      框架 GUI 与所有出图插件都从这里取同一份（见 runtime::assets::cjk_font），
+;      观感因此与"这台机器装了什么字体"无关；用户想换字体就把自己那份放进 fonts\ 并按
+;      *Regular* / *Bold* 命名，程序与插件都会认它。always 覆盖官方那两份的时机是升级，
+;      用户自己换进来的文件名不同，不会被这条碰到
+Source: "fonts\SourceHanSerifCN-Regular.otf"; DestDir: "{app}\fonts"; Flags: ignoreversion; Components: main
+Source: "fonts\SourceHanSerifCN-Bold.otf"; DestDir: "{app}\fonts"; Flags: ignoreversion; Components: main
+Source: "fonts\LICENSE-SourceHanSerif.txt"; DestDir: "{app}\fonts"; Flags: ignoreversion; Components: main
 ; ---- CPU 软件渲染依赖（大体积依赖与 exe 分开存储，安装时释放到 {app}\softgl）----
 ;      程序在 exe 同级目录寻找 softgl\，找不到就跳过软渲染，不影响机器人功能
 #ifdef HasSoftgl

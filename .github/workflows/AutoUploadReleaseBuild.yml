@@ -161,6 +161,13 @@ jobs:
             $p = "target/release/$dll"
             if (Test-Path $p) { $paths += $p } else { Write-Warning "缺少 $dll, 压缩包内不含 DXC" }
           }
+          # 随包中文字体: 安装包从 installer/fonts 释放到 {app}\fonts, 便携版同样带上这一目录,
+          # 否则解压用法拿不到 fonts/ —— GUI 与出图插件会退回系统字体候选(能用, 但观感随机器漂)
+          if (Test-Path installer/fonts) {
+            $paths += "installer/fonts"
+          } else {
+            Write-Warning "缺少 installer/fonts, 压缩包内不含随包中文字体"
+          }
           $zip = "target/release/$($env:ARTIFACT_NAME)-win-x64.zip"
           Compress-Archive -Path $paths -DestinationPath $zip -Force
           Write-Host "打包完成: $zip"

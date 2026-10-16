@@ -2457,6 +2457,14 @@ fn install_fonts(ctx: &egui::Context) {
 }
 
 fn load_cjk_font() -> Option<Vec<u8>> {
+    // 先要随包那一份（运行目录 fonts/，思源宋体简中）：面板的字与插件画在卡片上的字
+    // 必须是同一套，否则用户在 GUI 里看着正常、发出去的图却是另一种观感，
+    // 而且没装中文字体的机器上面板会直接开天窗。取不到才退回系统字体目录。
+    if let Some((regular, _)) = crate::runtime::assets::cjk_font()
+        && let Ok(bytes) = std::fs::read(&regular)
+    {
+        return Some(bytes);
+    }
     const WINDOWS: [&str; 8] = [
         "simhei.ttf",
         "msyh.ttc",

@@ -74,7 +74,8 @@ Releases 里的安装包**只交付框架本体**（功能插件由各自的作�
    只在正常带显卡的机器上用时，选「自定义安装」可以取消 `softgl\` 这项，省下 62 MB。
 3. 安装目录（默认 `%LOCALAPPDATA%\Programs\Arona-rs`）的 `config\` 里会释放默认配置
    （`config\onebot.yml`、`config\arona.yml`）。这些文件**只在缺失时写入**，升级安装不会覆盖你改过的；
-   万一缺失或损坏，程序启动时也会按内置默认值自动补齐。
+   万一缺失或损坏，程序启动时也会按内置默认值自动补齐。同批释放的还有 `fonts\` 里那份思源宋体
+   （常规 + 粗体约 23 MB，见下文「运行目录」）——它每次安装都覆盖，好让升级能带上新的字面。
 4. **装上你要的功能插件**：把插件作者给的 dll 放进安装目录的 `plugins\`（装载后框架会在旁边建出
    同名目录，那是插件的身份目录，不用手改）。框架本身不带任何功能，一个插件都没有时连 `/帮助` 都没有。
 5. 从开始菜单启动「Arona-rs」打开管理面板：在「OneBot 连接」页加连接并「保存并热重载」，
@@ -108,7 +109,7 @@ HKEY_CURRENT_USER\Software\YuLinLoli\Arona-rs      # 选「为所有用户安装
 ### 方式二：便携版
 
 1. 从 [Releases](https://github.com/YuLinLoli/Arona-rs/releases) 下载 `arona-rs-<版本号>-win-x64.zip`
-   解压（里面是 `arona-rs.exe`、`dxcompiler.dll`、`dxil.dll` 与 `softgl/`，渲染运行库全部随包；
+   解压（里面是 `arona-rs.exe`、`dxcompiler.dll`、`dxil.dll`、`fonts/` 与 `softgl/`，渲染运行库全部随包；
    裸 exe 不再单独发布，需要单文件就用安装包）。解压后这些文件保持同级即可。
 2. 在你想作为运行目录的位置运行一次，会在**当前工作目录**下自动生成 `config/`、`data/`、`logs/`
    与 `plugins/`（见下文「运行目录」）。
@@ -246,6 +247,10 @@ chatlog:
   data/
     arona/chatlog.db        框架的聊天记录缓存（引用回复与按存储 id 撤回的依据，图片只存原链接）
     <插件>/                 插件数据（数据库、图片缓存、备份…）
+  fonts/
+    SourceHanSerifCN-Regular.otf   随包中文字体（思源宋体简中，SIL OFL 1.1）：安装包释出，
+    SourceHanSerifCN-Bold.otf      GUI 面板与所有出图插件读的都是这一份（`runtime::assets::cjk_font`）
+    LICENSE-SourceHanSerif.txt     它的许可证全文
   logs/                    按天滚动的日志
   plugins/
     <插件>.dll              功能插件本体：启动前放这里（放进一级子目录也认），框架扫描装载
@@ -256,6 +261,13 @@ chatlog:
 `plugins/` 是**装载目录**，`plugins/<插件>/` 是插件的**身份目录**：框架每装载一个 dll，就按它上报的
 元信息写出或刷新 `plugins/<id>/plugin.yml`，并顺手备好 `config/<id>/` 与 `data/<id>/`，
 用户数据一律按 id 归到这两处。删掉 dll 只是下次启动不再装载，身份目录与用户数据不会跟着消失。
+
+`fonts/` 是**随包中文字体**（安装包与便携 zip 都带）。过去 GUI 与每个出图插件各自去系统目录猜一份中文字体，
+结果是"这台机器装了才有、没装就画不出字"，而且每台机器的字都不一样，观感没法验收。现在框架把这一份的位置
+交给所有要画字的地方（`arona::runtime::assets::cjk_font()`），面板上的字和插件画在图上的字是同一套。
+想换成别的字体：把自己那份放进 `fonts/`，按文件名里带 `Regular` / `Bold` 命名（大小写无关，`.otf`/`.ttf`/`.ttc` 都认）即可；
+这一目录空着或没有带字重的那两份，程序与插件退回系统字体目录，**功能不受影响**。
+思源宋体用 SIL OFL 1.1 授权，允许随作品再分发；微软雅黑与黑体不允许，所以不能这样随包。
 
 早期版本把这一切放在工作目录的 `arona-standalone/` 下：升级后首次启动会把框架认识的
 `arona.yml` / `onebot.yml` / `gui.txt` / `logs/` **复制**进上面的新布局（旧目录原样保留，不删不改）。
