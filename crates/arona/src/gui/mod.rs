@@ -2439,10 +2439,7 @@ fn install_fonts(ctx: &egui::Context) {
         return;
     };
     let mut fonts = egui::FontDefinitions::default();
-    fonts.font_data.insert(
-        "cjk".to_owned(),
-        Arc::new(egui::FontData::from_owned(bytes)),
-    );
+    fonts.font_data.insert("cjk".to_owned(), Arc::new(bytes));
     fonts
         .families
         .entry(egui::FontFamily::Proportional)
@@ -2456,15 +2453,21 @@ fn install_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
-fn load_cjk_font() -> Option<Vec<u8>> {
-    // 先要随包那一份（运行目录 fonts/，思源宋体简中）：面板的字与插件画在卡片上的字
-    // 必须是同一套，否则用户在 GUI 里看着正常、发出去的图却是另一种观感，
-    // 而且没装中文字体的机器上面板会直接开天窗。取不到才退回系统字体目录。
-    if let Some((regular, _)) = crate::runtime::assets::cjk_font()
-        && let Ok(bytes) = std::fs::read(&regular)
-    {
-        return Some(bytes);
+/// 面板的中文字体。
+///
+/// 随包那一份**直接借**宿主常驻的字节（`from_static` 不复制，且与借给各插件 dll 的是同一份），
+/// 没有随包字体才去读系统字体目录——那一档只能自己拷一份进面板。
+fn load_cjk_font() -> Option<egui::FontData> {
+    // 面板的字与插件画在卡片上的字必须是同一套，否则用户在 GUI 里看着正常、发出去的图却是
+    // 另一种观感，而且没装中文字体的机器上面板会直接开天窗。取不到才退回系统字体目录。
+    if let Some((regular, _)) = crate::runtime::assets::cjk_font_bytes() {
+        return Some(egui::FontData::from_static(regular));
     }
+    let owned = |path: &std::path::Path| {
+        std::fs::read(path)
+            .ok()
+            .map(|bytes| egui::FontData::from_owned(bytes))
+    };
     const WINDOWS: [&str; 8] = [
         "simhei.ttf",
         "msyh.ttc",
@@ -2478,8 +2481,8 @@ fn load_cjk_font() -> Option<Vec<u8>> {
     for name in WINDOWS {
         let path = std::path::PathBuf::from("C:/Windows/Fonts").join(name);
         if path.is_file() {
-            if let Ok(bytes) = std::fs::read(&path) {
-                return Some(bytes);
+            if let Some(font) = owned(&path) {
+                return Some(font);
             }
         }
     }
@@ -2493,8 +2496,8 @@ fn load_cjk_font() -> Option<Vec<u8>> {
     for path in OTHERS {
         let path = std::path::PathBuf::from(path);
         if path.is_file() {
-            if let Ok(bytes) = std::fs::read(&path) {
-                return Some(bytes);
+            if let Some(font) = owned(&path) {
+                return Some(font);
             }
         }
     }

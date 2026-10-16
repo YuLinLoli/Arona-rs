@@ -53,6 +53,11 @@ use std::os::raw::c_char;
 /// 9 = [`PluginMeta`](crate::plugin::PluginMeta) 末尾多一项 `group_scoped`：纯私聊插件要能声明
 ///     自己不按群生效，好让框架收起「启用的群」那一格。元信息由 dll 造出、宿主来读，
 ///     它的字段布局同样是跨镜像的 ABI 的一部分——宿主侧四个导出符号一个字都没改，也算改 ABI。
+/// 10 = 上行通道 [`HostBridge`] 多一条 [`fonts`](HostBridge::fonts)：随包中文字体的**字节**由宿主
+///     读一次、常驻一份，借给每个 dll（[`crate::runtime::assets`]）。每个 dll 静态链接自己那份
+///     arona，各自 `fs::read` 就是各自 11 MB×档，三个出图插件加面板要四份；这条通道把它收成一份。
+///     插件侧源码不用改（`runtime::text` 内部改指借来的字节），但**必须重编**——布局 9 的 dll
+///     读不到这个新字段，装载那一步会拒。
 ///
 /// **别以为改了 `HostBridge` 才算改 ABI**：[`HostBridge::framework`] 交出去的是擦成
 /// `*const c_void` 的实例指针，插件 dll 里那份框架代码按**它自己编译期的字段偏移**去读这个
@@ -61,7 +66,7 @@ use std::os::raw::c_char;
 /// 句柄去调自己那份 bundled sqlite）。所以 `Framework` 的字段序本身就是 ABI 的一部分，
 /// 动它必须抬这个版本号。同理，插件直接读的任何 `pub` 结构体/枚举（新变体、加字段、
 /// 改字段类型）也一样要抬，哪怕宿主侧的签名一个字都没动。
-pub const ABI_LAYOUT: u32 = 9;
+pub const ABI_LAYOUT: u32 = 10;
 
 /// 装载器名（写进 `plugins/<id>/plugin.yml` 的 `loader:` 与 GUI 插件列表）
 pub const DYNAMIC_LOADER: &str = "dynamic";
@@ -312,6 +317,26 @@ pub struct ViewSpec {
 /// 宿主代管的会话展示通道。返回 `>=0` 是这次收下/摘掉的条数，负数是通道自己出错。
 pub type Views = extern "C" fn(spec: *const ViewSpec) -> i64;
 
+/// 宿主借出的一份随包字体：字节 + 它的来源路径。
+///
+/// 三个字段都是**借**：所有权全在宿主那份常驻里（见 [`crate::runtime::assets`]），dll 只读、
+/// 永不 free。`regular` 为空指针表示这台机器上没有随包字体，dll 那侧退回自己读盘。
+/// 路径以 NUL 结尾 UTF-8 给出，dll 用它判断"我按三级解析出来的那档是不是就是这一份"——
+/// 用户拿 `bili-image.font` 指到别的文件时**不能**用借来的字节。
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FontBytes {
+    pub regular: *const u8,
+    pub regular_len: usize,
+    pub regular_path: *const c_char,
+    pub bold: *const u8,
+    pub bold_len: usize,
+    pub bold_path: *const c_char,
+}
+
+/// 宿主侧的字体出口（面向 dll 的封装见 [`crate::runtime::text`]）。
+pub type Fonts = extern "C" fn(out: *mut FontBytes);
+
 /// 装载时把宿主真正在跑的东西接过来，插件里的自由函数才不落空表。
 ///
 /// 字段顺序与签名就是 ABI 的一部分，改动必须抬 [`ABI_LAYOUT`]。
@@ -352,6 +377,13 @@ pub struct HostBridge {
     /// 格式，硬边界不允许；为什么不是把表交给插件直接读写：与 [`Self::jobs`] 同一个理由，dll 会
     /// 按自己编译期的偏移去动宿主的表。所以这张表的字段布局同样不出边界。
     pub views: Views,
+    /// 把随包中文字体的字节借给这个 dll（面向插件的封装见 [`crate::runtime::text`]，
+    /// 宿主侧实现在 [`crate::runtime::assets::host_font_bytes`]）。
+    ///
+    /// 为什么走通道而不是让 dll 自己去读：每个 dll 静态链接自己那份 arona，`static` 缓存各自一份，
+    /// 各自 `fs::read` 就是各自 11 MB 量级的常驻——三个出图插件加面板要四份。字节由宿主读一次、
+    /// 常驻一份，dll 侧 `FontArc::try_from_slice` 是零拷贝借用，于是进程里真就只有一份。
+    pub fonts: Fonts,
 }
 
 /// [`export_arona_plugin!`] 生成的 `arona_plugin_host` 的实现：把插件里的
@@ -369,12 +401,14 @@ pub unsafe fn attach_host(bridge: *const HostBridge) -> u8 {
     }
     let bridge = unsafe { *bridge };
     // SAFETY: 约定 `framework` 指向宿主永不被释放的默认实例，`runtime` 指向它登记的句柄
-    // （或空指针表示宿主还没有句柄），插件这份代码只在此后借用它们。
+    // （或空指针表示宿主还没有句柄），插件这份代码只在此后借用它们。`fonts` 借出的字节
+    // 由宿主那份 `static` 持有、进程内不释放，所以 dll 侧可以按 `'static` 借。
     unsafe {
         if !crate::framework::Framework::adopt_host((bridge.framework)()) {
             return 2;
         }
         crate::runtime::reactor::adopt_host((bridge.runtime)());
+        crate::runtime::text::attach_host_fonts(bridge.fonts);
     }
     crate::runtime::http::attach_host(bridge.http);
     crate::runtime::log::attach_host(bridge);
@@ -448,10 +482,19 @@ mod tests {
     /// `HostBridge` 要跨 dll 边界传给插件，字段数量与顺序本身就是 ABI 的一部分：
     /// 布局漂了（多一个字段、忘了 `repr(C)`）宿主就会按错位的方式取函数指针。
     #[test]
-    fn host_bridge_is_exactly_six_function_pointers() {
+    fn host_bridge_is_exactly_seven_function_pointers() {
         use std::mem::{align_of, size_of};
-        assert_eq!(size_of::<HostBridge>(), 6 * size_of::<usize>());
+        assert_eq!(size_of::<HostBridge>(), 7 * size_of::<usize>());
         assert_eq!(align_of::<HostBridge>(), align_of::<usize>());
+    }
+
+    /// 借出去的字体形状也是 ABI：三对「指针 + 长度/指针」共六个字，漂一位 dll 就会
+    /// 把粗体的长度当常规的路径指针用。
+    #[test]
+    fn font_bytes_is_six_words() {
+        const WORD: usize = std::mem::size_of::<usize>();
+        assert_eq!(std::mem::size_of::<FontBytes>(), 6 * WORD);
+        assert_eq!(std::mem::align_of::<FontBytes>(), WORD);
     }
 
     /// 展示板上报也是 ABI：`op` 是 u32，后面跟着指针所以要补满一个字，其余三个字段各占一个字。

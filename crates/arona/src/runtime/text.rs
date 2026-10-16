@@ -17,10 +17,91 @@
 //! 而 ab_glyph 的 `px_bounds()` 是 y 向下的，取一次 `-(bottom)` 换回来，插件那一路不用动。
 
 use std::collections::{HashMap, VecDeque};
+use std::ffi::CStr;
+use std::os::raw::c_char;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use ab_glyph::{Font as _, Glyph, ScaleFont};
+
+use crate::plugin::abi::{FontBytes, Fonts};
+
+/// dll 侧：宿主借来的随包字体字节。宿主那份 `static` 持有它们，进程内不释放，
+/// 所以这里可以按 `'static` 借用（`FontArc::try_from_slice` 是零拷贝）。
+/// 宿主自己那份恒空——它不画字，面板走 [`crate::runtime::assets::host_font_bytes`] 同一份字节。
+static BORROWED: OnceLock<Option<Borrowed>> = OnceLock::new();
+
+struct Borrowed {
+    regular: (&'static [u8], PathBuf),
+    bold: Option<(&'static [u8], PathBuf)>,
+}
+
+/// 把路径那一段 C 串还原成 `PathBuf`。认不回来（非 UTF-8）就回 `None`，
+/// 那条字面于是退回自己读盘——**宁可多读一次，也不能把借来的字节安到别的文件头上**。
+unsafe fn path_of(pointer: *const c_char) -> Option<PathBuf> {
+    if pointer.is_null() {
+        return None;
+    }
+    // SAFETY: 约定这个指针是宿主给的、NUL 结尾的有效 C 串
+    let text = unsafe { CStr::from_ptr(pointer) }.to_str().ok()?;
+    (!text.is_empty()).then(|| PathBuf::from(text))
+}
+
+/// dll 侧：记下宿主借出的字体字节（由 [`crate::plugin::abi::attach_host`] 调用）。
+///
+/// # Safety
+/// `fonts` 必须是宿主给的有效的 [`Fonts`] 出口，且它填回来的指针在进程存活期内保持有效。
+pub(crate) unsafe fn attach_host_fonts(fonts: Fonts) {
+    let mut slot = FontBytes {
+        regular: std::ptr::null(),
+        regular_len: 0,
+        regular_path: std::ptr::null(),
+        bold: std::ptr::null(),
+        bold_len: 0,
+        bold_path: std::ptr::null(),
+    };
+    fonts(&mut slot);
+    if slot.regular.is_null() || slot.regular_len == 0 {
+        let _ = BORROWED.set(None);
+        return;
+    }
+    let Some(regular_path) = (unsafe { path_of(slot.regular_path) }) else {
+        // 认不出来源路径就不敢认这份字节：借错了对象比多读一次盘严重得多
+        let _ = BORROWED.set(None);
+        return;
+    };
+    // SAFETY: 上面挡过空指针；长度由宿主按同一份 `&[u8]` 填，进程内不失效
+    let regular = unsafe { std::slice::from_raw_parts(slot.regular, slot.regular_len) };
+    let bold = if slot.bold.is_null() || slot.bold_len == 0 {
+        None
+    } else {
+        // SAFETY: 同上，且只有常规与路径都成立才会走到这里
+        let bytes = unsafe { std::slice::from_raw_parts(slot.bold, slot.bold_len) };
+        unsafe { path_of(slot.bold_path) }.map(|path| (bytes, path))
+    };
+    let _ = BORROWED.set(Some(Borrowed {
+        regular: (regular, regular_path),
+        bold,
+    }));
+}
+
+/// 这个路径的字面是不是宿主借来的那一份。
+fn borrowed_face(borrowed: Option<&Borrowed>, path: &Path) -> Option<&'static [u8]> {
+    let borrowed = borrowed?;
+    if borrowed.regular.1 == path {
+        return Some(borrowed.regular.0);
+    }
+    borrowed
+        .bold
+        .as_ref()
+        .filter(|(_, bold_path)| bold_path == path)
+        .map(|(bytes, _)| *bytes)
+}
+
+/// 查本 dll 记下的那份借用。
+fn borrowed() -> Option<&'static Borrowed> {
+    BORROWED.get().and_then(Option::as_ref)
+}
 
 /// 字形缓存的上限。一张卡实际用到的 (字符, 字号) 组合在几百到一两千这一档，4096 条按 1~2 KB
 /// 算是几 MB——比全量预解析的 160~250 MB 差两个数量级，又足够让一整轮里反复出现的字都命中。
@@ -94,19 +175,35 @@ impl Face {
     /// 读一个字体文件成一份字面。`.ttc` 是字体集合，ab_glyph 取的是第 0 个 face。
     ///
     /// 装载只是把文件字节收下来（思源宋体 11.1 MB，实测 0.01 s），字形要等真画到那个字才解析。
+    ///
+    /// **随包那一份不读盘**：宿主经 [`crate::plugin::abi::HostBridge::fonts`] 把字节借给了本 dll，
+    /// 命中同一路径时直接 `try_from_slice`（零拷贝借用），于是三个出图插件 + 面板共用进程里那一份，
+    /// 而不是各持一份 11 MB。用户自己指定的别的文件不在这一档，照旧各读各的。
     pub fn open(path: &Path) -> Result<Face, String> {
-        let bytes =
-            std::fs::read(path).map_err(|err| format!("读字体 {} 失败：{err}", path.display()))?;
-        match ab_glyph::FontArc::try_from_vec(bytes) {
-            Ok(font) => Ok(Face {
-                font,
-                glyphs: Mutex::new(Glyphs {
-                    map: HashMap::new(),
-                    order: VecDeque::new(),
-                }),
+        Self::open_borrowing(borrowed(), path)
+    }
+
+    /// 上面那一条的"借用表当参数传进来"版本——逻辑一模一样，抽出来只为能被确定性地测：
+    /// `BORROWED` 是进程级单例，而 `plugin::abi` 的自检测试会在同一个进程里接管一次宿主通道，
+    /// 直接测单例的那条就会跟它抢。
+    fn open_borrowing(borrowed: Option<&Borrowed>, path: &Path) -> Result<Face, String> {
+        let font = match borrowed_face(borrowed, path) {
+            Some(bytes) => ab_glyph::FontArc::try_from_slice(bytes)
+                .map_err(|err| format!("字体 {} 解析失败：{err}", path.display()))?,
+            None => {
+                let bytes = std::fs::read(path)
+                    .map_err(|err| format!("读字体 {} 失败：{err}", path.display()))?;
+                ab_glyph::FontArc::try_from_vec(bytes)
+                    .map_err(|err| format!("字体 {} 解析失败：{err}", path.display()))?
+            }
+        };
+        Ok(Face {
+            font,
+            glyphs: Mutex::new(Glyphs {
+                map: HashMap::new(),
+                order: VecDeque::new(),
             }),
-            Err(err) => Err(format!("字体 {} 解析失败：{err}", path.display())),
-        }
+        })
     }
 
     /// 一个字占多宽（排版只用这一个数，不必解析轮廓）
@@ -432,24 +529,24 @@ mod tests {
     fn a_bare_font_name_finds_its_file_in_the_extra_folders() {
         let dir = sandbox(&["MyFont.ttf"]);
         assert_eq!(
-            locate("MyFont", &[dir.clone()]).as_deref(),
+            locate("MyFont", std::slice::from_ref(&dir)).as_deref(),
             Some(dir.join("MyFont.ttf").as_path())
         );
         assert_eq!(
-            locate("MyFont.ttf", &[dir.clone()]).as_deref(),
+            locate("MyFont.ttf", std::slice::from_ref(&dir)).as_deref(),
             Some(dir.join("MyFont.ttf").as_path())
         );
         assert_eq!(
-            locate("sub/MyFont", &[dir.clone()]).as_deref(),
+            locate("sub/MyFont", std::slice::from_ref(&dir)).as_deref(),
             Some(dir.join("MyFont.ttf").as_path()),
             "配置里手滑带上目录时，只认最后那一段"
         );
-        assert_eq!(locate("NoSuchFont", &[dir.clone()]), None);
+        assert_eq!(locate("NoSuchFont", std::slice::from_ref(&dir)), None);
         // 给了完整路径就当路径试，跟 folder 无关
         assert_eq!(
             locate(
                 dir.join("MyFont.ttf").to_string_lossy().as_ref(),
-                &[dir.clone()]
+                std::slice::from_ref(&dir)
             )
             .as_deref(),
             Some(dir.join("MyFont.ttf").as_path())
@@ -462,10 +559,10 @@ mod tests {
     fn the_configured_pair_splits_on_a_semicolon() {
         let dir = sandbox(&["A.ttf", "B.ttf"]);
         let configured = format!("A;{}", dir.join("B.ttf").display());
-        let (regular, bold) = resolve(&configured, &[dir.clone()]).unwrap();
+        let (regular, bold) = resolve(&configured, std::slice::from_ref(&dir)).unwrap();
         assert_eq!(regular, dir.join("A.ttf"));
         assert_eq!(bold, Some(dir.join("B.ttf")));
-        let missing = resolve("A;Nope", &[dir.clone()]).unwrap_err();
+        let missing = resolve("A;Nope", std::slice::from_ref(&dir)).unwrap_err();
         assert!(missing.contains("粗体"), "报错要说清缺的是哪一档");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -477,21 +574,29 @@ mod tests {
         assert!(!is_font_file(Path::new("LICENSE.txt")));
     }
 
-    /// 留空时那三级的顺序：随包那份命中就不去看系统候选。
-    /// 这一条要改工作目录，所以只在临时目录里当"没有随包字体"验一遍退回逻辑。
+    /// 留空时那三级的结果只许有两种：**命中一份真存在的文件**，或明确报"找不到"。
+    /// 不许 panic，也不许返回一个不存在的路径（那会让插件画卡时才炸，日志上看不出根因）。
+    /// 这里刻意不改工作目录去演"没有随包字体"那一档：`set_current_dir` 是进程级的，
+    /// 会跟同进程里其它读 cwd 的用例互踩。"目录里没有带字重的那两份"这一档由
+    /// `runtime::assets` 的测试拿临时目录当参数直接验，不碰全局状态。
     #[test]
-    fn without_a_bundled_face_it_falls_back_to_system_candidates() {
-        let dir = std::env::temp_dir().join(format!("arona-text-empty-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir.join("fonts"));
-        std::fs::create_dir_all(dir.join("fonts")).unwrap();
-        let previous = std::env::current_dir().ok();
-        if std::env::set_current_dir(&dir).is_ok() {
-            let back = resolve("", &[]);
-            let _ = previous.map(|path| std::env::set_current_dir(path));
-            // 这台机器上要么命中候选、要么明确报"找不到"，不能 panic
-            assert!(back.is_ok() || back.unwrap_err().contains("找不到中文字体"));
+    fn an_empty_setting_either_finds_a_real_file_or_says_so() {
+        match resolve("", &[]) {
+            Ok((regular, bold)) => {
+                assert!(
+                    regular.is_file(),
+                    "候选路径得是真文件：{}",
+                    regular.display()
+                );
+                if let Some(bold) = bold {
+                    assert!(bold.is_file(), "粗体那档给了就该存在：{}", bold.display());
+                }
+            }
+            Err(reason) => assert!(
+                reason.contains("找不到中文字体"),
+                "报错要说清是没字体，而不是别的原因：{reason}"
+            ),
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 真字面这一档：随包那两份在仓库里（`installer/fonts/`），拿不到才退到系统候选。
@@ -596,5 +701,45 @@ mod tests {
         // 全放手之后再来一次：允许是新装载的一份，只要不是同一份被按着不放就行
         let third = Typeface::acquire(key).unwrap();
         assert!(third.regular().renders('活'));
+    }
+
+    /// 借来的那份字节**真的**被用上了：把字体文件读进一块 leak 的内存、按借用表登记，
+    /// 然后把盘上那个文件删掉——还能打开并画出汉字，只可能是走了借来的字节。
+    /// 对照组同一路径、空借用表，必须打不开（否则这条判据是在骗人：文件根本没删掉）。
+    #[test]
+    fn a_borrowed_face_is_used_instead_of_reading_the_disk() {
+        let source = any_real_face().expect("这台机器上该有一份真字面");
+        let bytes: &'static [u8] = Box::leak(std::fs::read(&source).unwrap().into_boxed_slice());
+        let dir = std::env::temp_dir().join(format!("arona-borrow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let staged = dir.join("borrowed.otf");
+        std::fs::copy(&source, &staged).unwrap();
+        let borrowed = Borrowed {
+            regular: (bytes, staged.clone()),
+            bold: None,
+        };
+        std::fs::remove_file(&staged).unwrap();
+
+        let face = Face::open_borrowing(Some(&borrowed), &staged)
+            .expect("借用表里有这一档，文件删了也该打得开");
+        assert!(face.renders('活'), "借来的字节得真能画汉字");
+        assert!(
+            Face::open_borrowing(None, &staged).is_err(),
+            "空借用表时同一路径必须打不开——不然上面那条是假绿"
+        );
+
+        // 用户自己指的路径**不能**被借来的字节顶掉：路径不同就该老实去读盘
+        assert!(borrowed_face(Some(&borrowed), &source).is_none());
+        assert!(borrowed_face(Some(&borrowed), &staged).is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 没随包字体时宿主借不出东西（`regular` 留空指针），dll 那侧必须退回自己读盘而不是 panic
+    #[test]
+    fn an_empty_borrow_slot_falls_back_to_the_disk() {
+        let source = any_real_face().expect("这台机器上该有一份真字面");
+        assert!(borrowed_face(None, &source).is_none());
+        assert!(Face::open(&source).is_ok());
     }
 }
