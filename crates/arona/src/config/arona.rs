@@ -1,16 +1,16 @@
 //! arona 框架业务配置（`config/arona.yml`）
 //!
-//! 本文件只管框架自己认识的几项：groups / managers / global_blacklist / group_settings /
-//! disabled_plugins / framework / chatlog。功能插件的配置不住这里——每个插件各有一份 `config/<插件>/arona.yml`，
+//! 本文件只管 [`AronaConfig`] 的字段所对应的那几项顶层键（键名以 [`generic_top_keys`] 现取的为准，
+//! 不在注释里另抄一份）。功能插件的配置不住这里——每个插件各有一份 `config/<插件>/arona.yml`，
 //! 由 [`super::plugin_config`] 负责生成模板、加载与热重载。
 //! 插件在 install 阶段用 [`register_section`] 登记自己那几块配置（带上自己的插件 id），
 //! 框架据此识别合法键、生成带注释模板，并把旧版还写在框架 arona.yml 顶层的同名键
 //! 搬进插件自己的文件（见 [`super::plugin_config::absorb_legacy`]）。
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 /// 单个群的业务设置（群号 -> 设置）
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -366,16 +366,23 @@ fn write_text(path: &Path, content: &str) -> std::io::Result<()> {
     std::fs::write(path, content)
 }
 
-/// 框架自身认识的顶层键（除这些之外的顶层键交给插件配置区/未知键逻辑处理）
-const GENERIC_TOP_KEYS: [&str; 7] = [
-    "groups",
-    "managers",
-    "global_blacklist",
-    "group_settings",
-    "disabled_plugins",
-    "framework",
-    "chatlog",
-];
+/// 框架自身认识的顶层键（除这些之外的顶层键交给插件配置区/未知键逻辑处理）。
+///
+/// 名单问 `AronaConfig` 的序列化器要，不手抄：`disabled_features` 那一轮就是加了字段忘了加键，
+/// 于是框架自己生成的模板里写着这一行、加载器又回头报「无法识别的配置项，已忽略」。值照样生效，
+/// 只有日志在撒谎——而读日志的人正是靠这句话判断该改哪。
+fn generic_top_keys() -> &'static BTreeSet<String> {
+    static KEYS: OnceLock<BTreeSet<String>> = OnceLock::new();
+    KEYS.get_or_init(|| {
+        let value = serde_yaml::to_value(AronaConfig::default()).expect("AronaConfig 应可序列化");
+        value
+            .as_mapping()
+            .expect("AronaConfig 序列化后应是映射")
+            .keys()
+            .filter_map(|key| key.as_str().map(str::to_string))
+            .collect()
+    })
+}
 
 /// 曾经写在 arona.yml、现已迁到 onebot.yml 的键：单独提示，避免和普通笔误混在一条日志里
 const MOVED_TOP_KEYS: [&str; 1] = ["send_image_as_file"];
@@ -441,7 +448,7 @@ fn parse_in(framework: &crate::framework::Framework, file: &Path) -> Result<Aron
     if let Some(map) = value.as_mapping() {
         for (key, val) in map {
             let Some(name) = key.as_str() else { continue };
-            if GENERIC_TOP_KEYS.contains(&name) {
+            if generic_top_keys().contains(name) {
                 continue;
             } else if MOVED_TOP_KEYS.contains(&name) {
                 crate::runtime::log::warning(format!(
@@ -454,7 +461,11 @@ fn parse_in(framework: &crate::framework::Framework, file: &Path) -> Result<Aron
             } else {
                 crate::runtime::log::warning(format!(
                     "arona.yml 存在无法识别的配置项「{name}」，已忽略；可用配置项: {} / 插件配置区: {}",
-                    GENERIC_TOP_KEYS.join(" / "),
+                    generic_top_keys()
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>()
+                        .join(" / "),
                     registered.join(" / ")
                 ));
             }
@@ -531,7 +542,7 @@ fn template(config: &AronaConfig) -> String {
     let mut out = String::new();
     out.push_str("# ==================== Arona 框架配置 ====================\n");
     out.push_str("# 框架启动时读本文件，改完保存即自动热重载。\n");
-    out.push_str("# 本文件只放框架自身的项：授权、黑名单、分群开关、插件开关与聊天记录缓存。\n");
+    out.push_str("# 本文件只放框架自身的项：授权、黑名单、分群开关、插件开关、全局功能开关与聊天记录缓存。\n");
     out.push_str("# OneBot 协议连接配置见同目录 onebot.yml；功能插件的配置在各自的 config/<插件>/arona.yml。\n\n");
     out.push_str("# 允许响应的群号列表，留空表示响应所有群\n");
     out.push_str(&format!("groups: {:?}\n", config.groups));
@@ -737,6 +748,30 @@ mod tests {
         let legacy = load(&file).expect("缺 disabled_features 这一行不该导致加载失败");
         assert!(legacy.disabled_features.is_empty());
         let _ = std::fs::remove_file(&file);
+    }
+
+    /// 上一条只证得了「值读得回」，证不了日志不说谎：未知顶层键这一路只写日志，serde 仍把生效值
+    /// 填进结构体。`disabled_features` 那一轮就是加了字段没加白名单，于是全新运行目录一启动就被
+    /// 自己的模板报「无法识别的配置项，已忽略」。这里把口径钉死：**模板写得出的顶层键，加载器必须认**。
+    #[test]
+    fn the_template_only_writes_keys_the_loader_admits() {
+        let text = template(&AronaConfig::default());
+        let value: Value = serde_yaml::from_str(&text).expect("默认模板应是合法 YAML");
+        let unknown: Vec<&str> = value
+            .as_mapping()
+            .expect("模板顶层应是映射")
+            .keys()
+            .filter_map(|key| key.as_str())
+            .filter(|name| !generic_top_keys().contains(*name))
+            .collect();
+        assert!(
+            unknown.is_empty(),
+            "模板写出了加载器不认的顶层键: {unknown:?}"
+        );
+        assert!(
+            generic_top_keys().contains("disabled_features"),
+            "顶层 disabled_features 必须算认下的键"
+        );
     }
 
     /// 聊天记录段要写得出、读得回；老文件没有这一段时按默认值补，而不是
