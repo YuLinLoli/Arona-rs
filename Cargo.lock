@@ -101,6 +101,7 @@ dependencies = [
 name = "arona-rs"
 version = "1.1.0"
 dependencies = [
+ "ab_glyph",
  "axum",
  "base64",
  "chrono",

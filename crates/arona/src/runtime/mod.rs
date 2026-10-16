@@ -31,6 +31,8 @@ pub mod relaunch;
 pub mod services;
 #[cfg(feature = "gui")]
 pub mod softgl;
+/// 惰性字面：出图插件共用的「一份字体字节 + 有界字形缓存」，见模块头注释
+pub mod text;
 pub mod value;
 
 /// 构造 tokio 多线程运行时（机器人与 GUI 共用）。

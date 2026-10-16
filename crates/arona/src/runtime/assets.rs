@@ -13,9 +13,6 @@ use std::path::{Path, PathBuf};
 
 use crate::runtime::paths;
 
-/// 认的字形文件后缀（思源宋体是 `.otf`，用户换成 `.ttf`/`.ttc` 也该能用）
-const EXTENSIONS: [&str; 3] = ["otf", "ttf", "ttc"];
-
 /// 随包资源目录：运行目录下的 `fonts/`
 pub fn fonts_dir() -> PathBuf {
     paths::root().join("fonts")
@@ -44,7 +41,7 @@ fn face_in(dir: &Path, weight: &str) -> Option<PathBuf> {
     let mut any: Vec<PathBuf> = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
-        if !path.is_file() || !is_font(&path) {
+        if !path.is_file() || !crate::runtime::text::is_font_file(&path) {
             continue;
         }
         let named = path
@@ -64,12 +61,6 @@ fn face_in(dir: &Path, weight: &str) -> Option<PathBuf> {
         None if weight == "regular" && any.len() == 1 => Some(any[0].clone()),
         None => None,
     }
-}
-
-fn is_font(path: &Path) -> bool {
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
 }
 
 #[cfg(test)]

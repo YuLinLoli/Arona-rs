@@ -37,6 +37,8 @@ log = { workspace = true }
 # 启动时扫描 plugins/ 目录、把功能插件 dll 映射进进程（见 plugin::dynamic）
 libloading = { workspace = true }
 image = { workspace = true }
+# 惰性字面（runtime::text）：三个出图插件共用这一份实现，见该模块的头注释
+ab_glyph = { workspace = true }
 # GUI 管理面板：由 host 通过 `arona/gui` 打开（插件依赖本 crate 时不会强制启用）
 eframe = { workspace = true, optional = true }
 wgpu = { workspace = true, optional = true }

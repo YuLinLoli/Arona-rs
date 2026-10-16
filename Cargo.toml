@@ -28,6 +28,9 @@ log = "0.4"
 libloading = "0.8"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+# 出图插件共用的惰性字面（arona::runtime::text）：只收字体文件字节，画到哪个字才解析哪个字。
+# 不用 fontdue——它把每个码位的轮廓全量预解析后常驻，实测一份雅黑 307 MB、思源宋体 253 MB
+ab_glyph = "0.2.32"
 # GUI 管理面板（默认启用）: --no-default-features 可编译不含 GUI 的精简命令行版
 # glow(OpenGL) 为主，wgpu(DX12/Vulkan，可用 WARP 软件渲染) 作为服务器/无显卡环境的备选后端
 eframe = { version = "0.31", default-features = false, features = ["glow", "wgpu", "default_fonts"] }
