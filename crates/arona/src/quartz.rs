@@ -357,15 +357,22 @@ impl TaskEntry {
                     *entry.next_fire.write().unwrap() = None;
                     return;
                 };
-                // 分段睡：一觉睡到点的话（Daily 是最长 24 小时），被取消的任务在这期间不会醒
+                // 分段睡：一觉睡到点的话（Daily 是最长 24 小时），被取消的任务在这期间不会醒。
+                // 剩余量每段都按挂钟重算，而不是把请求的步长从预算里扣掉：唤醒总要比排定晚那么
+                // 几毫秒（本机 180 段实测偏 1727 ms，每段约 9.6 ms，见测试
+                // a_long_sleep_does_not_accumulate_wake_latency），
+                // 扣步长等于把这点晚量按段数累进迟到时间——Daily 睡到次日整点是 86400 段，
+                // 一晚上就能攒出十几分钟，8:00 的推送 8:09 才动身就是这么来的。
+                // 重算之后每段只是「晚几毫秒才看一眼钟」，一次触发的迟到上界是一段唤醒量。
+                let due_ms = now_ms + delay_ms;
                 let mut remain = delay_ms;
                 while remain > 0 {
                     let step = remain.min(CANCEL_POLL_MS);
                     tokio::time::sleep(Duration::from_millis(step as u64)).await;
-                    remain -= step;
                     if entry.canceled.load(Ordering::SeqCst) {
                         return;
                     }
+                    remain = due_ms - chrono::Utc::now().timestamp_millis();
                 }
                 if entry.canceled.load(Ordering::SeqCst) {
                     return;
@@ -1128,6 +1135,38 @@ mod tests {
         for d in &got {
             assert!(d.abs() < 300, "单次任务比排定时刻偏了 {d} ms");
         }
+    }
+
+    /// 分段睡**不许**把每段的唤醒延迟累进迟到时间。
+    ///
+    /// 上面那条用例只等 1.2~3.6 秒（一段一秒，也就 1~4 段），所以「按段数线性累积晚量」这种
+    /// 错法它照不出来——服务器上是 8:00 的推送 8:09 才动身、更早那版甚至 8:24，而这几条用例全绿。
+    /// 这里排一次 180 段之后的任务，本机实测：扣步长的写法偏 **1727 ms**（每段 9.6 ms，正好是
+    /// 一晚攒出十几分钟的那个量级），按挂钟重算偏 **3 ms**。慢，所以默认跳过。
+    /// 运行: cargo test --release quartz::tests::a_long_sleep -- --ignored --nocapture
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "要等三分钟, 手工跑: cargo test --release quartz::tests::a_long_sleep -- --ignored --nocapture"]
+    async fn a_long_sleep_does_not_accumulate_wake_latency() {
+        let framework = crate::framework::Framework::new();
+        let at = chrono::Utc::now().timestamp_millis() + 180_000;
+        let drift = Arc::new(std::sync::Mutex::new(None::<i64>));
+        let sink = drift.clone();
+        framework.jobs().create_single_at(
+            at,
+            "QuartzLongSleepProbe",
+            "QuartzLongSleepPlugin",
+            Arc::new(move || {
+                *sink.lock().unwrap() = Some(chrono::Utc::now().timestamp_millis() - at);
+            }),
+        );
+        tokio::time::sleep(Duration::from_millis(183_000)).await;
+        let drift = *drift.lock().unwrap();
+        println!("180 段之后偏差(ms) = {drift:?}");
+        let drift = drift.expect("单次任务排到三分钟后却没触发");
+        assert!(
+            drift.abs() < 300,
+            "长睡眠把每段的唤醒延迟累了起来：偏了 {drift} ms（180 段）"
+        );
     }
 
     /// 任务体 panic 只废掉那一次触发：循环必须继续按表走。
