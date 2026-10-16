@@ -28,7 +28,8 @@ plugins/hello/             # 示例插件：name=hello-plugin, crate-type=["cdyl
 
 ```
 <运行目录>/
-  config/arona.yml          框架配置：groups / managers / global_blacklist / group_settings / disabled_plugins / framework
+  config/arona.yml          框架配置：groups / managers / global_blacklist / group_settings /
+                            disabled_plugins / disabled_features / framework / chatlog
   config/onebot.yml         OneBot 连接配置
   config/<插件>/arona.yml   该插件自己的配置（如 config/hello/arona.yml）
   data/<插件>/…             该插件自己的数据（如 data/hello/image、arona.db、backups）
@@ -778,7 +779,8 @@ if let Some(service) = board.find_by_name("活动推送") {
 
 ## 12. 类型化配置 `config/<插件>/arona.yml`
 
-框架的 `config/arona.yml` 只认 `groups` / `managers` / `global_blacklist` / `group_settings` / `disabled_plugins`。
+框架的 `config/arona.yml` 只认 `AronaConfig` 的那几个字段：`groups` / `managers` / `global_blacklist` /
+`group_settings` / `disabled_plugins` / `disabled_features` / `framework` / `chatlog`（名单由结构体现取，加字段不必另抄）。
 插件的业务配置各住各的文件。对应 mirai-console 的 `ConfigKey<T>` + `configManager`：**插件只写一个 serde 结构 + 字段注释**，
 模板渲染、默认值补齐、未知子键过滤全部由框架完成，不再手写 YAML。
 
