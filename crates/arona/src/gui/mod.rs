@@ -2245,7 +2245,7 @@ impl AronaGui {
             );
             ui.hyperlink_to(
                 "插件开发指南 PLUGIN_DEVELOPMENT.md",
-                "https://github.com/YuLinLoli/Arona-rs/blob/Arona-Dev/PLUGIN_DEVELOPMENT.md",
+                "https://github.com/YuLinLoli/Arona-rs/blob/main/PLUGIN_DEVELOPMENT.md",
             );
         });
         ui.add_space(10.0);
