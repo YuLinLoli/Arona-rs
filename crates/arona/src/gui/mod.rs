@@ -474,6 +474,11 @@ struct AronaGui {
     log_auto_scroll: bool,
     log_filter: String,
     log_errors_only: bool,
+    /// 三类勾选：「全部日志」是另两档的父集，勾上它时另两格直接禁用，
+    /// 免得出现"全都勾了却以为在筛"的第三种状态
+    log_scope_all: bool,
+    log_scope_chat: bool,
+    log_scope_plugin: bool,
     log_max: usize,
 }
 
@@ -514,6 +519,9 @@ impl AronaGui {
             log_auto_scroll: true,
             log_filter: String::new(),
             log_errors_only: false,
+            log_scope_all: true,
+            log_scope_chat: false,
+            log_scope_plugin: false,
             log_max: 500,
         }
     }
@@ -2061,6 +2069,16 @@ impl AronaGui {
             }
             ui.checkbox(&mut self.log_auto_scroll, "自动滚动");
             ui.checkbox(&mut self.log_errors_only, "只看告警/错误");
+            ui.checkbox(&mut self.log_scope_all, "全部日志");
+            let scoped = !self.log_scope_all;
+            ui.add_enabled_ui(scoped, |ui| {
+                ui.checkbox(&mut self.log_scope_chat, "仅聊天")
+                    .on_hover_text(
+                        "聊天收发与公告那一路印的行（带 V/Bot.<号>: 前缀），含机器人自己发出去的",
+                    );
+                ui.checkbox(&mut self.log_scope_plugin, "插件")
+                    .on_hover_text("插件自己打的日志，加上框架替插件代发 HTTP 时印的那几条");
+            });
             egui::ComboBox::from_id_salt("log_max")
                 .selected_text(format!("最近 {} 行", self.log_max))
                 .show_ui(ui, |ui| {
@@ -2084,15 +2102,28 @@ impl AronaGui {
         // 过滤词先折成 char 表，整帧就这一份小拷贝；逐行再拷一份全文是几百 MB 瞬时的主要来源
         let needle: Vec<char> = filter.chars().map(fold_char).collect();
         let errors_only = self.log_errors_only;
+        let (scope_all, scope_chat, scope_plugin) = (
+            self.log_scope_all,
+            self.log_scope_chat,
+            self.log_scope_plugin,
+        );
         let auto_scroll = self.log_auto_scroll;
         let dark = ui.visuals().dark_mode;
         let start = self.log_lines.len().saturating_sub(self.log_max);
         let raw_empty = self.log_lines[start..].is_empty();
         let lines: Vec<&crate::runtime::log::LiveLine> = self.log_lines[start..]
             .iter()
+            .filter(|line| log_line_kept(&line.text, scope_all, scope_chat, scope_plugin))
             .filter(|line| !errors_only || is_alert_line(line))
             .filter(|line| contains_ci(&line.text, &needle))
             .collect();
+        let empty_hint = if raw_empty {
+            "暂无日志（机器人启动后这里会实时刷新）"
+        } else if !(scope_all || scope_chat || scope_plugin) {
+            "三类都没勾：勾「全部日志」，或在「仅聊天」「插件」里至少勾一类"
+        } else {
+            "没有匹配的日志行"
+        };
         // 日志区单独一块「终端」底色的圆角面板：和页面其它部分拉开层次，长时间阅读时不刺眼
         let visuals = ui.visuals().clone();
         egui::Frame::NONE
@@ -2105,7 +2136,7 @@ impl AronaGui {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .stick_to_bottom(auto_scroll)
-                    .show(ui, |ui| draw_log_lines(ui, &lines, dark, raw_empty));
+                    .show(ui, |ui| draw_log_lines(ui, &lines, dark, empty_hint));
             });
     }
 }
@@ -2121,7 +2152,7 @@ fn draw_log_lines(
     ui: &mut egui::Ui,
     lines: &[&crate::runtime::log::LiveLine],
     dark: bool,
-    raw_empty: bool,
+    empty_hint: &str,
 ) {
     ui.spacing_mut().item_spacing.y = 2.0;
     // 左右留白：文字紧贴面板边缘 / 滚动条会被裁掉
@@ -2129,11 +2160,7 @@ fn draw_log_lines(
         .inner_margin(egui::Margin::symmetric(6, 2))
         .show(ui, |ui| {
             if lines.is_empty() {
-                ui.weak(if raw_empty {
-                    "暂无日志（机器人启动后这里会实时刷新）"
-                } else {
-                    "没有匹配的日志行"
-                });
+                ui.weak(empty_hint);
                 return;
             }
             let body = ui
@@ -2369,8 +2396,8 @@ fn warn_color(dark: bool) -> egui::Color32 {
 }
 
 /// 日志行颜色：普通行跟随外观（黑夜白色 / 白天黑色），
-/// [Arona]/[OneBot] 绿色、[插件名] 淡紫、WARNING/ERROR 黄/红——这些特殊色只是按背景深浅调暗，
-/// 保证在白色背景上同样看得清。
+/// [Arona]/[OneBot] 绿色、[插件名] 淡紫、机器人发出的那条聊天亮粉、WARNING/ERROR 黄/红——
+/// 这些特殊色只是按背景深浅调暗，保证在白色背景上同样看得清。
 fn log_line_color(text: &str, stderr: bool, dark: bool) -> egui::Color32 {
     use crate::runtime::console::Color;
     match crate::runtime::console::color_for_line(text) {
@@ -2382,9 +2409,19 @@ fn log_line_color(text: &str, stderr: bool, dark: bool) -> egui::Color32 {
             }
         }
         Some(Color::BrightMagenta) => plugin_color(dark),
+        Some(Color::BrightPink) => outgoing_color(dark),
         Some(Color::BrightYellow) | Some(Color::Yellow) => warn_color(dark),
         None if stderr => error_color(dark),
         None => default_text_color(dark),
+    }
+}
+
+/// 机器人发出去的那条聊天的亮粉：白底上压深一档，否则浅粉在白背景上几乎发白
+fn outgoing_color(dark: bool) -> egui::Color32 {
+    if dark {
+        egui::Color32::from_rgb(255, 122, 190)
+    } else {
+        egui::Color32::from_rgb(206, 32, 132)
     }
 }
 
@@ -2395,6 +2432,13 @@ fn plugin_color(dark: bool) -> egui::Color32 {
     } else {
         egui::Color32::from_rgb(112, 60, 176)
     }
+}
+
+/// 「全部日志 / 仅聊天 / 插件」三格的口径：`全部` 是父集，另两格各挑一类，同时勾就是两类的并。
+/// 判据本身在 `runtime::console`——控制台染色与这里筛的是同一套行形，不另写一份。
+fn log_line_kept(text: &str, all: bool, chat: bool, plugin: bool) -> bool {
+    all || (chat && crate::runtime::console::is_chat_line(text))
+        || (plugin && crate::runtime::console::is_plugin_line(text))
 }
 
 /// 是否属于告警/错误（「只看告警/错误」过滤用）
@@ -3807,6 +3851,38 @@ mod tests {
         );
     }
 
+    /// 「全部日志 / 仅聊天 / 插件」三格的口径。全部是父集；另两格同勾取并；都不勾什么都不给
+    /// （这时面板上那句提示由 `empty_hint` 说清楚，不留一块看不出原因的空白）。
+    #[test]
+    fn the_three_log_scope_checkboxes_keep_what_they_say() {
+        let incoming = "V/Bot.100: [测试群(1)] 某人(2) -> 早";
+        let outgoing = "2026-10-17 10:35:27 V/Bot.100: Group(1) <- 卡片[arona:image,url=x]";
+        let proxy = "[Arona] [HTTP] 插件请求代发 https://x";
+        let framework = "[Arona] 管理面板启动中";
+
+        assert!(log_line_kept(framework, true, false, false));
+        assert!(!log_line_kept(framework, false, false, false));
+        assert!(log_line_kept(incoming, false, true, false));
+        assert!(log_line_kept(outgoing, false, true, false));
+        assert!(!log_line_kept(proxy, false, true, false));
+        assert!(log_line_kept(proxy, false, false, true));
+        assert!(!log_line_kept(framework, false, true, true));
+        assert!(
+            log_line_kept(incoming, false, true, true) && log_line_kept(proxy, false, true, true)
+        );
+
+        // 机器人发出去的那条得是亮粉，而且不能和普通行/插件行撞成同一个色
+        assert_eq!(log_line_color(outgoing, false, true), outgoing_color(true));
+        assert_eq!(
+            log_line_color(outgoing, false, false),
+            outgoing_color(false)
+        );
+        assert_ne!(
+            log_line_color(outgoing, false, true),
+            log_line_color(framework, false, true)
+        );
+    }
+
     /// 实时日志的渲染：超长行（QQ 图片 URL 里没有空格）必须整行折行、不丢字，
     /// 也不能溢出面板。之前用 `horizontal_wrapped` 时，超长行会被整条挤到下一行、
     /// 续行直接顶到面板最左边，看起来就像日志左侧被切掉了一块。
@@ -3831,8 +3907,9 @@ mod tests {
                 ..Default::default()
             },
             |ctx| {
-                egui::CentralPanel::default()
-                    .show(ctx, |ui| draw_log_lines(ui, &lines, true, false));
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    draw_log_lines(ui, &lines, true, "没有匹配的日志行")
+                });
             },
         );
 
@@ -3926,8 +4003,9 @@ mod tests {
                 ..Default::default()
             },
             |ctx| {
-                egui::CentralPanel::default()
-                    .show(ctx, |ui| draw_log_lines(ui, &lines, true, false));
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    draw_log_lines(ui, &lines, true, "没有匹配的日志行")
+                });
             },
         );
         let drawn: String = output

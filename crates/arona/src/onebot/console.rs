@@ -220,8 +220,9 @@ pub fn print_outgoing(self_id: i64, target: MessageTarget, message: &OutgoingMes
         Local::now().format("%Y-%m-%d %H:%M:%S"),
         sanitize(&content)
     );
-    // 原版 OneBotConsole.printOutgoing: 自身发送的消息统一黄色(33)
-    color::print_colored_line(color::Color::Yellow, &line);
+    // 原版 OneBotConsole.printOutgoing 用普通黄(33)，与告警同档；这里改成亮粉，
+    // 一屏里"机器人说的话"要能一眼挑出来（GUI 的实时日志页认的是同一条判据）
+    color::print_colored_line(color::Color::BrightPink, &line);
 }
 
 pub fn print_notice(self_id: i64, text: &str) {

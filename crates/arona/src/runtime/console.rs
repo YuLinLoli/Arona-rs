@@ -1,11 +1,15 @@
 //! 控制台颜色支持（对应原版 AronaStandalone.ColoredPrintStream + RuntimeLog 的 ANSI 常量）。
 //!
-//! 原版独立模式对标准输出/错误流做统一染色，判定顺序与优先级完全一致：
-//! 1. 以 `[Arona` / `[OneBot` 开头的行                     -> 亮绿（优先，即使含 WARNING）
-//! 2. 前缀是某个插件的显示名（`[HelloPlugin] …`）    -> 淡紫
-//! 3. 含 `WARNING:` / `WARNING：` / `SLF4J`，
+//! 原版独立模式对标准输出/错误流做统一染色，判定顺序与优先级照搬，只在两处偏离：
+//! 1. 机器人发出去的那条聊天（`… V/Bot.<号>: Group(…) <- …`）  -> 亮粉（原版印普通黄 33，和告警同档）
+//! 2. 以 `[Arona` / `[OneBot` 开头的行                     -> 亮绿（优先，即使含 WARNING）
+//! 3. 前缀是某个插件的显示名（`[HelloPlugin] …`）    -> 淡紫
+//! 4. 含 `WARNING:` / `WARNING：` / `SLF4J`，
 //!    或含被空白包裹的 `INFO|DEBUG|WARN|ERROR|TRACE`       -> 亮黄
-//! 4. 其它行                                              -> 原样
+//! 5. 其它行                                              -> 原样
+//!
+//! [`is_chat_line`] / [`is_plugin_line`] 这两条判据同时供 GUI 实时日志页的「仅聊天」「插件」
+//! 两个筛选勾选框用——染色与筛选认的是同一套行形，不在两处各写一份。
 //!
 //! 与原版「无条件输出 ANSI 转义码」不同：Windows 控制台默认改用原生 API
 //! `SetConsoleTextAttribute`，因此 cmd.exe(经典 conhost)、PowerShell、Windows Terminal
@@ -18,7 +22,8 @@
 
 use once_cell::sync::OnceCell;
 
-/// 控制台颜色（与原版 ANSI 色一致：亮绿 92 / 亮黄 93 / 普通黄 33；插件日志另用淡紫 95）
+/// 控制台颜色（与原版 ANSI 色一致：亮绿 92 / 亮黄 93 / 普通黄 33；插件日志另用淡紫 95；
+/// 机器人发出的那一条用亮粉，控制台里它原来跟告警同为黄字，混在一块看不出是消息）
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Color {
     BrightGreen,
@@ -26,6 +31,10 @@ pub enum Color {
     Yellow,
     /// 插件打的日志（`[插件名] …`）：和框架的亮绿一眼分得开
     BrightMagenta,
+    /// 机器人自己发出去的那条聊天（`… V/Bot.<号>: Group(…) <- …`）：亮粉。
+    /// 256 色终端里它是淡粉、与插件那档淡紫分得开；只认 16 色的 Windows 原生控制台里
+    /// 属性位只能表达到亮品红，那一档与 [`Color::BrightMagenta`] 同色——这时两者的分辨靠行形。
+    BrightPink,
 }
 
 impl Color {
@@ -36,6 +45,7 @@ impl Color {
             Color::BrightYellow => "\u{1b}[93m",
             Color::Yellow => "\u{1b}[33m",
             Color::BrightMagenta => "\u{1b}[95m",
+            Color::BrightPink => "\u{1b}[38;5;212m",
         }
     }
 
@@ -51,6 +61,7 @@ impl Color {
             Color::BrightYellow => RED | GREEN | INTENSITY,
             Color::Yellow => RED | GREEN,
             Color::BrightMagenta => RED | BLUE | INTENSITY,
+            Color::BrightPink => RED | BLUE | INTENSITY,
         }
     }
 }
@@ -186,6 +197,11 @@ pub fn color_for_line(line: &str) -> Option<Color> {
     if line.is_empty() {
         return None;
     }
+    // 机器人自己发出去的那条聊天：亮粉。原版把它印成普通黄(33)，和告警同一档，
+    // 一屏里分不清哪条是"机器人说的话"、哪条是"出问题了"
+    if is_outgoing_chat_line(line) {
+        return Some(Color::BrightPink);
+    }
     // [Arona] / [OneBot] 统一亮绿，且优先级高于 WARNING 判定
     if line.starts_with("[Arona") || line.starts_with("[OneBot") {
         return Some(Color::BrightGreen);
@@ -198,6 +214,21 @@ pub fn color_for_line(line: &str) -> Option<Color> {
         return Some(Color::BrightYellow);
     }
     None
+}
+
+/// 聊天行：OneBotConsole 那一路印出来的收发文本都带 `V/Bot.<号>:` 这个前缀
+pub fn is_chat_line(line: &str) -> bool {
+    line.contains("V/Bot.")
+}
+
+/// 机器人**发出**的那一条：出站是「地址 <- 内容」，入站是「发送者 -> 内容」
+pub fn is_outgoing_chat_line(line: &str) -> bool {
+    is_chat_line(line) && line.contains(" <- ")
+}
+
+/// 「插件」这一档：插件自己打的日志，加上框架替插件代发 HTTP 时印的那几条 `[HTTP] …`
+pub fn is_plugin_line(line: &str) -> bool {
+    source_of(line).is_some_and(crate::plugin::is_plugin_name) || line.contains("[HTTP]")
 }
 
 /// 取出行首 `[…]` 里的来源名（`[Arona] xxx` -> `Some("Arona")`），没有前缀时 None。
@@ -580,7 +611,32 @@ mod tests {
         assert_eq!(Color::BrightYellow.ansi(), "\u{1b}[93m");
         assert_eq!(Color::Yellow.ansi(), "\u{1b}[33m");
         assert_eq!(Color::BrightMagenta.ansi(), "\u{1b}[95m");
+        assert_eq!(Color::BrightPink.ansi(), "\u{1b}[38;5;212m");
         assert_eq!(RESET, "\u{1b}[0m");
+    }
+
+    /// 「仅聊天」「插件」两个勾选框认的就是这三条判据；染色与筛选共用一套行形，不两处各写一份。
+    #[test]
+    fn chat_and_plugin_lines_are_told_apart_from_framework_noise() {
+        let incoming = "V/Bot.1493074321: [测试群(993871966)] 岚凛凛(739549669) -> 早";
+        let outgoing = "2026-10-17 10:35:27 V/Bot.1493074321: Group(993871966) <- \
+                        「11-2」共 1 张图片[arona:image,file=C:\\data\\11-2.png]";
+        assert!(is_chat_line(incoming) && is_chat_line(outgoing));
+        assert!(!is_outgoing_chat_line(incoming));
+        assert!(is_outgoing_chat_line(outgoing));
+        // 出站那一档必须比 WARNING 先判，否则一条正文里带 "ERROR" 的消息会被染成告警黄
+        assert_eq!(color_for_line(outgoing), Some(Color::BrightPink));
+        assert_eq!(color_for_line(incoming), None);
+
+        // 框架替插件代发 HTTP 那几条挂在 [Arona] 下，按用户的口径也算「插件」这一档
+        assert!(is_plugin_line(
+            "[Arona] [HTTP] 插件请求代发 https://api.bilibili.com/x"
+        ));
+        let plain = "[Arona] 已启用软件 OpenGL(llvmpipe)";
+        assert!(!is_chat_line(plain) && !is_plugin_line(plain));
+        // 另一半判据（行首 `[插件显示名]` 命中登记表）这里没法钉：登记表是进程级全局，
+        // 测试里 register 一家就摘不掉，会脏了同进程其它用例。那一路与淡紫染色共用同一个
+        // 表达式，所以由「插件日志染淡紫」那条现行行为 + 起界面那轮肉眼一起保证。
     }
 
     #[test]
