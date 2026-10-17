@@ -485,7 +485,7 @@ installer/               Windows 安装包：arona-rs.iss、intro.txt、defaults
 crate-type = ["cdylib", "rlib"]   # cdylib 出 dll；rlib 那份只给 cargo test 用
 
 [dependencies]
-arona = { package = "arona-rs", version = "1.1.0", default-features = false }
+arona = { package = "arona-rs", version = "1.2.0", default-features = false }
 # 同源联调改成 path：arona = { package = "arona-rs", path = "../Arona-rs/crates/arona", default-features = false }
 ```
 

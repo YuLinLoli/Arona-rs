@@ -11,15 +11,15 @@
 
 ```
 Cargo.toml                 # 虚拟 workspace（resolver=2）
-crates/arona/              # 框架库 crate：包名 arona-rs（库名仍是 arona，见 §15），version=1.1.0
-crates/arona-host/         # 宿主可执行：name=arona-host, version=1.1.0, 产物 bin=arona-rs
+crates/arona/              # 框架库 crate：包名 arona-rs（库名仍是 arona，见 §15），version=1.2.0
+crates/arona-host/         # 宿主可执行：name=arona-host, version=1.2.0, 产物 bin=arona-rs
 plugins/hello/             # 示例插件：name=hello-plugin, crate-type=["cdylib", "rlib"]
 ```
 
 框架仓库里不含任何功能插件（示例除外），宿主也不链接插件：功能插件是**各自独立的 crate**，
 编译出 `xxx_plugin.dll` 后由用户放进运行目录的 `plugins/`，框架启动时扫描装载（§22）。
 
-版本约定：框架与 host 同为 `1.1.0`，插件版本号各自演进。
+版本约定：框架与 host 同为 `1.2.0`，插件版本号各自演进。
 **插件接口的破坏性改动抬 `arona::plugin::FRAMEWORK_API_VERSION`**（与 crate 版本号无关），见 §6；
 **插件会读的那个类型换了布局**（`Framework`、`CommandContext`、`EventBody`、`BodyFilter`、`OneBotApi`
 这些，加字段/加变体/改字段类型）另抬 `arona::plugin::abi::ABI_LAYOUT`（当前 `9`），见 §22。
@@ -1199,7 +1199,7 @@ ctx.clear_all_rows();       // 全摘（一般用不上：插件被停用时框�
 
    [dependencies]
    # 务必 default-features = false（§16）。arona 的版本必须与目标宿主完全一致
-   arona = { package = "arona-rs", version = "1.1.0", default-features = false }
+   arona = { package = "arona-rs", version = "1.2.0", default-features = false }
    # 类型化配置要 derive（§12）；命令/钩子的 async 体里要 tokio::time::sleep、select! 也得直依赖
    # （§22 的"两份 tokio"小节：框架按帧给这类任务补装运行时上下文）。
    # 起后台任务请用 ctx.spawn（§10），别裸 tokio::spawn，更不要 #[tokio::main]——运行时是宿主那一个
@@ -1823,7 +1823,7 @@ tokio 也被静态链接成了两份，而"当前在哪个运行时里"这个上
 ### 发布插件时必须写明的三件事
 
 ```
-适用于 Arona-rs 1.1.0（框架契约 1.0.0，符号布局 9）
+适用于 Arona-rs 1.2.0（框架契约 1.0.0，符号布局 10）
 构建工具链：rustc 1.98.0，x86_64-pc-windows-msvc，--release，crt-static
 下载后放进 <框架运行目录>/plugins/<你的id>/，重启框架
 ```
