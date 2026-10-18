@@ -15,6 +15,8 @@ pub mod elevate;
 /// 框架内置的 HTTP 出口：插件请宿主代发，自己不必带 reqwest
 pub mod http;
 pub mod log;
+/// 进程自己的内存占用（面板右上角那一格，5 秒一采样）
+pub mod memory;
 pub mod message;
 pub mod paths;
 /// 远端资料的按需读缓存（群成员/陌生人），挂在框架实例上

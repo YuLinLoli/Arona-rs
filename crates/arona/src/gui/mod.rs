@@ -370,8 +370,9 @@ fn theme_combo(ui: &mut egui::Ui, theme: &mut ThemePref) -> bool {
     *theme != before
 }
 
-/// 右上角运行状态：绿点=已有活动连接，灰点=还没连上任何 OneBot 实现
-fn status_chip(ui: &mut egui::Ui) {
+/// 右上角运行状态：绿点=已有活动连接，灰点=还没连上任何 OneBot 实现；
+/// 这一组最左边那一格是本进程的工作集内存（`None` 就不画，例如非 Windows 上没有实现）
+fn status_chip(ui: &mut egui::Ui, mem: Option<u64>) {
     let dark = ui.visuals().dark_mode;
     let connections = crate::framework::Framework::global()
         .onebot()
@@ -402,6 +403,20 @@ fn status_chip(ui: &mut egui::Ui) {
             )
             .selectable(false),
         );
+        if let Some(bytes) = mem {
+            ui.add_space(10.0);
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(crate::runtime::memory::format_working_set(bytes))
+                        .size(12.0)
+                        .weak(),
+                )
+                .selectable(false),
+            )
+            .on_hover_text(
+                "框架进程自己的工作集内存（与任务管理器「内存」同一口径），每 5 秒采样一次",
+            );
+        }
     });
 }
 
@@ -468,6 +483,8 @@ struct AronaGui {
     onebot_error: Option<String>,
     new_type: ConnectionType,
     expanded: Option<String>,
+    /// 右上角那一格的进程内存采样器（5 秒问一次操作系统）
+    mem: crate::runtime::memory::Sampler,
     // 实时日志
     log_lines: Vec<crate::runtime::log::LiveLine>,
     log_version: u64,
@@ -514,6 +531,7 @@ impl AronaGui {
             onebot_error: None,
             new_type: ConnectionType::WebSocket,
             expanded: None,
+            mem: crate::runtime::memory::Sampler::new(crate::runtime::memory::SAMPLE_GAP),
             log_lines: Vec::new(),
             log_version: 0,
             log_auto_scroll: true,
@@ -719,7 +737,7 @@ impl AronaGui {
                 ui.add_space(10.0);
                 ui.separator();
                 ui.add_space(10.0);
-                status_chip(ui);
+                status_chip(ui, self.mem.peek());
             });
         });
         ui.add_space(9.0);
@@ -1914,6 +1932,9 @@ impl eframe::App for AronaGui {
             self.palette_applied = Some(dark);
             apply_palette(ctx, dark);
         }
+        // 右上角那格内存：到点才问操作系统；空闲时 egui 不会自己醒来，所以按剩余时间挂一次重绘
+        self.mem.read();
+        ctx.request_repaint_after(self.mem.next_in());
         self.ensure_icon(ctx);
         self.drain(ctx);
         if self.onebot.is_none() {
@@ -3883,6 +3904,65 @@ mod tests {
         );
     }
 
+    /// 「只看告警/错误」这一档不该把机器人发出去的消息算进去：
+    /// 那一行原来印成普通黄，与告警同档，改亮粉之后这条才站得住
+    #[test]
+    fn an_outgoing_chat_line_is_not_an_alert() {
+        let outgoing = crate::runtime::log::LiveLine {
+            time: "10:35:27".to_string(),
+            text: "2026-10-17 10:35:27 V/Bot.1493074321: Group(993871966) <- 「11-2」共 1 张图片"
+                .to_string(),
+            stderr: false,
+        };
+        assert!(
+            !is_alert_line(&outgoing),
+            "机器人发的那条不该进「只看告警/错误」"
+        );
+    }
+
+    /// 右上角那一格：有值就画得出「内存 …」，取不到值就整段不占位
+    #[test]
+    fn the_header_shows_the_memory_chip_only_when_it_has_a_value() {
+        let render = |mem: Option<u64>| {
+            let ctx = egui::Context::default();
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(900.0, 60.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| status_chip(ui, mem));
+                },
+            );
+            output
+                .shapes
+                .iter()
+                .filter_map(|clipped| match &clipped.shape {
+                    egui::epaint::Shape::Text(shape) => Some(shape.galley.text()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+
+        let with_value = render(Some(312 * 1024 * 1024));
+        assert!(
+            with_value.contains("内存 312 MiB"),
+            "头部没画出内存那一格: {with_value}"
+        );
+        assert!(
+            with_value.contains("个连接"),
+            "内存格不该把连接状态挤掉: {with_value}"
+        );
+        let without = render(None);
+        assert!(
+            !without.contains("内存"),
+            "取不到值时这一格该整段不画: {without}"
+        );
+    }
     /// 实时日志的渲染：超长行（QQ 图片 URL 里没有空格）必须整行折行、不丢字，
     /// 也不能溢出面板。之前用 `horizontal_wrapped` 时，超长行会被整条挤到下一行、
     /// 续行直接顶到面板最左边，看起来就像日志左侧被切掉了一块。
