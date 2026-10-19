@@ -370,6 +370,12 @@ fn theme_combo(ui: &mut egui::Ui, theme: &mut ThemePref) -> bool {
     *theme != before
 }
 
+/// 这一帧该不该为内存那一格去问操作系统并挂下一次定时器。
+/// 平台没报最小化状态（`None`）时按"没最小化"处理——宁可多问一次，也别把这一格永久冻住。
+fn should_poll_memory(minimized: Option<bool>) -> bool {
+    !minimized.unwrap_or(false)
+}
+
 /// 右上角运行状态：绿点=已有活动连接，灰点=还没连上任何 OneBot 实现；
 /// 这一组最左边那一格是本进程的工作集内存（`None` 就不画，例如非 Windows 上没有实现）
 fn status_chip(ui: &mut egui::Ui, mem: Option<u64>) {
@@ -1932,9 +1938,13 @@ impl eframe::App for AronaGui {
             self.palette_applied = Some(dark);
             apply_palette(ctx, dark);
         }
-        // 右上角那格内存：到点才问操作系统；空闲时 egui 不会自己醒来，所以按剩余时间挂一次重绘
-        self.mem.read();
-        ctx.request_repaint_after(self.mem.next_in());
+        // 右上角那格内存：到点才问操作系统。窗口最小化时连定时器都不挂——面板空闲时
+        // 不该被自己的定时器叫醒（实时日志页是非虚拟化排版，一次重排几百到几千行）。
+        // 恢复可见后第一帧就会重采：缓存那个时间点早就过 5 秒了。
+        if should_poll_memory(ctx.input(|i| i.viewport().minimized)) {
+            self.mem.read();
+            ctx.request_repaint_after(self.mem.next_in());
+        }
         self.ensure_icon(ctx);
         self.drain(ctx);
         if self.onebot.is_none() {
@@ -3917,6 +3927,17 @@ mod tests {
         assert!(
             !is_alert_line(&outgoing),
             "机器人发的那条不该进「只看告警/错误」"
+        );
+    }
+
+    /// 最小化时不采样也不挂定时器；平台没报状态时按"没最小化"处理，别把这一格冻住
+    #[test]
+    fn a_minimized_panel_stops_polling_memory() {
+        assert!(!should_poll_memory(Some(true)));
+        assert!(should_poll_memory(Some(false)));
+        assert!(
+            should_poll_memory(None),
+            "拿不到最小化状态时不该把这一格永久冻住"
         );
     }
 
