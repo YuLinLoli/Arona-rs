@@ -37,17 +37,24 @@ fn build_release(root: &Path) -> PathBuf {
 
 /// 可选目标三元组的发布构建（`None` = 当前主机）
 ///
-/// **跨平台时用 `cargo zigbuild` 而不是 `cargo build`**：给 Linux 目标编 C 代码
-/// （`ring` 的加密实现、`libsqlite3-sys` 的 sqlite3.c）需要一套 Linux 的 libc 头与
-/// 链接器，Windows 上没有。zig 自带这些，`cargo zigbuild` 会把 `zig cc` 包装成 cc-rs
-/// 认得的形态（直接用 `CC="zig cc -target ..."` 会被 cc-rs 的编译器家族探测打回，
-/// 它探测时只调 `zig -E`，把 `cc` 子命令丢了）。在 Linux 原生构建时仍走普通
-/// `cargo build`，链接器由 musl-tools / 系统 gcc 提供。
+/// 什么时候必须改用 `cargo zigbuild` 而不是 `cargo build`，有两个互不相干的原因：
+///
+/// 1. **目标带 glibc 版本后缀**（`x86_64-unknown-linux-gnu.2.17`）。这个写法是
+///    cargo-zigbuild 自己的语法，普通 cargo 会直接报
+///    「could not find specification for target "…"」。**与构建机是什么系统无关**——
+///    Linux 原生机器上同样得走 zigbuild。
+/// 2. **在非 Linux 主机上构建 Linux 目标**：给 Linux 编 C 代码（`ring` 的加密实现、
+///    `libsqlite3-sys` 的 sqlite3.c）需要一套 Linux 的 libc 头与链接器，其它平台上
+///    没有。zig 自带这些，`cargo zigbuild` 会把 `zig cc` 包装成 cc-rs 认得的形态
+///    （直接用 `CC="zig cc -target ..."` 会被 cc-rs 的编译器家族探测打回，它探测时
+///    只调 `zig -E`，把 `cc` 子命令丢了）。
+///
+/// 其余情况走普通 `cargo build`，链接器由系统提供。
 fn build_release_for(root: &Path, target: Option<&str>) -> PathBuf {
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
-    let crossing_to_linux = target.is_some_and(|t| t.contains("linux")) && !cfg!(target_os = "linux");
-    let subcommand = if crossing_to_linux {
-        println!("[dist] 交叉编译到 Linux 目标，改用 cargo zigbuild");
+    let zigbuild = needs_zigbuild_for(target, cfg!(target_os = "linux"));
+    let subcommand = if zigbuild {
+        println!("[dist] 这一档需要用 cargo zigbuild");
         "zigbuild"
     } else {
         "build"
@@ -126,6 +133,21 @@ fn cargo_target_dir_name(target: &str) -> &str {
         }
         _ => target,
     }
+}
+
+/// 这一档要不要走 `cargo zigbuild`（详见 [`build_release_for`] 的注释）。
+///
+/// `host_is_linux` 由调用方传入而不是直接读 `cfg!`，这样两个方向都能在任意平台上被单测覆盖。
+fn needs_zigbuild_for(target: Option<&str>, host_is_linux: bool) -> bool {
+    let Some(target) = target else {
+        return false;
+    };
+    // ① 带 glibc 版本后缀的写法只有 cargo-zigbuild 认，跟构建机无关
+    if cargo_target_dir_name(target) != target {
+        return true;
+    }
+    // ② 在非 Linux 主机上编 Linux 目标 = 交叉编译，需要 zig 提供 libc 头与链接器
+    target.contains("linux") && !host_is_linux
 }
 
 fn target_release_dir(root: &Path) -> PathBuf {
@@ -207,6 +229,33 @@ mod tests {
             cargo_target_dir_name("weird.target-name"),
             "weird.target-name"
         );
+    }
+
+    /// 什么时候必须走 `cargo zigbuild`。这条是 CI 抓出来的教训：最初只按「是否跨平台」
+    /// 判断，于是在 Linux 原生机器上构建 compat 包时走了普通 `cargo build`，cargo 当场
+    /// 报 `could not find specification for target "x86_64-unknown-linux-gnu.2.17"`——
+    /// 那个后缀**本来就只有 cargo-zigbuild 认**，跟构建机是什么系统无关。
+    #[test]
+    fn zigbuild_is_required_for_the_glibc_suffix_and_for_cross_builds() {
+        // ① 带 glibc 版本后缀：两种主机上都得走 zigbuild
+        assert!(needs_zigbuild_for(
+            Some("x86_64-unknown-linux-gnu.2.17"),
+            true
+        ));
+        assert!(needs_zigbuild_for(
+            Some("x86_64-unknown-linux-gnu.2.17"),
+            false
+        ));
+
+        // ② 不带后缀的 Linux 目标：Linux 主机走普通 build，跨平台走 zigbuild
+        assert!(!needs_zigbuild_for(Some("x86_64-unknown-linux-gnu"), true));
+        assert!(needs_zigbuild_for(Some("x86_64-unknown-linux-gnu"), false));
+
+        // ③ 主机自身平台一律普通 build
+        assert!(!needs_zigbuild_for(None, true));
+        assert!(!needs_zigbuild_for(None, false));
+        // Windows 目标不涉及 zig
+        assert!(!needs_zigbuild_for(Some("x86_64-pc-windows-msvc"), false));
     }
 
     /// 旧产物清理的两个方向都得钉住：
