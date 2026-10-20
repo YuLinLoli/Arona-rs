@@ -2908,8 +2908,53 @@ fn wgpu_options(flavor: WgpuFlavor) -> eframe::egui_wgpu::WgpuConfiguration {
             eframe::wgpu::Dx12Compiler::Fxc
         };
         setup.native_adapter_selector = Some(Arc::new(select_adapter));
+        setup.device_descriptor = Arc::new(chip_friendly_device);
     }
     config
+}
+
+/// 交给 wgpu 的设备描述：与 egui 的默认值只差 `memory_hints` 一项。
+///
+/// 为什么必须改这一项：egui 每帧往顶点/索引/统一缓冲里写数据，而 `wgpu-core` 会给每个
+/// 非 `mapped_at_creation` 的缓冲补上 `COPY_DST`（`device/resource.rs`），到 D3D12 侧就被判成
+/// "CPU 可写"，落进 gpu_allocator 的 `CpuToGpu` 内存类型。该类型的**首块**大小由
+/// `MemoryHints` 决定，默认的 `Performance` 给的是 device 256 MiB + host 64 MiB，并且是
+/// **分配第一笔就整块建出来**（`gpu_allocator::d3d12` 的 `MemoryType::allocate`），不管
+/// 实际只用了其中几 MB。面板画的是一个 2D 界面，这几百 MiB 全程空着白占：
+/// 实测同一份界面，wgpu(DX12) 私有内存 709 MiB，走 glow 只有 91 MiB。
+///
+/// `MemoryUsage` 档对应 8 MiB / 4 MiB 的块。分配块大小不参与任何渲染状态——着色器、管线、
+/// 纹理、顶点数据都还是同一份字节，只是被装进更小的块里，所以画面逐像素不变。
+/// 想再调可以换成 `Manual { suballocated_device_memory_block_size: .. }`。
+///
+/// 其余字段照抄 egui `WgpuSetupCreateNew::default()` 的闭包：GL 后端拿 WebGL2 的降级
+/// limits，`max_texture_dimension_2d` 抬到 8192 以便 4K 屏下建出够大的面纹理——
+/// 这两条与内存无关，动它会改掉既有后端的行为。那份默认闭包是**拷过来**的，egui 升级时
+/// 若改了它，`the_panel_device_descriptor_only_relaxes_memory_hints` 会先报出来。
+fn chip_friendly_device(adapter: &eframe::wgpu::Adapter) -> eframe::wgpu::DeviceDescriptor<'static> {
+    panel_device_descriptor(adapter.get_info().backend)
+}
+
+/// [`chip_friendly_device`] 的纯函数版：后端由参数传入，单测因此不必先有一块显卡
+fn panel_device_descriptor(
+    backend: eframe::wgpu::Backend,
+) -> eframe::wgpu::DeviceDescriptor<'static> {
+    let base_limits = if backend == eframe::wgpu::Backend::Gl {
+        eframe::wgpu::Limits::downlevel_webgl2_defaults()
+    } else {
+        eframe::wgpu::Limits::default()
+    };
+    eframe::wgpu::DeviceDescriptor {
+        label: Some("egui wgpu device"),
+        required_features: eframe::wgpu::Features::default(),
+        required_limits: eframe::wgpu::Limits {
+            // 与 egui 默认闭包同一个理由：面纹理要盖得住 4K 屏
+            max_texture_dimension_2d: 8192,
+            ..base_limits
+        },
+        // 唯一与本函数其它部分不同的一项：别再按 Performance 预占几百 MiB
+        memory_hints: eframe::wgpu::MemoryHints::MemoryUsage,
+    }
 }
 
 /// exe 同级的某个文件（渲染运行库都平铺放在那里）
@@ -3475,6 +3520,52 @@ mod tests {
         let hardware = candidates_for(Some("glow"), true, true, false, true);
         assert_eq!(hardware.len(), 1);
         assert!(!hardware[0].softgl);
+    }
+
+    /// 面板交给 wgpu 的设备描述只许在 `memory_hints` 上偏离 egui 的默认值。
+    ///
+    /// 这条管的是**拷贝**：`panel_device_descriptor` 把 egui `WgpuSetupCreateNew::default()`
+    /// 那个闭包抄了一份，只换掉 `memory_hints`。egui 升级后若默认 limits 变了（比如哪天它把
+    /// `max_texture_dimension_2d` 提到 16384），我们这份就悄悄落后——那时 4K 屏上的表现
+    /// 会变成"别人好着、我们糊了"，而没有任何编译错误提示。所以把两档 limits 钉在这里。
+    ///
+    /// 反面也必须钉住：`memory_hints` 不能退回默认的 `Performance`，那是这一整轮内存优化的
+    /// 全部内容（实测 709 MiB → 401 MiB），改回去界面照常、只是白占几百 MiB。
+    #[test]
+    fn the_panel_device_descriptor_only_relaxes_memory_hints() {
+        use eframe::wgpu::{Backend, MemoryHints};
+
+        for backend in [Backend::Dx12, Backend::Vulkan, Backend::Metal] {
+            let described = panel_device_descriptor(backend);
+            assert_eq!(
+                described.required_limits,
+                eframe::wgpu::Limits {
+                    max_texture_dimension_2d: 8192,
+                    ..eframe::wgpu::Limits::default()
+                },
+                "{backend:?} 的 limits 与 egui 默认值漂移了"
+            );
+            assert_eq!(
+                described.required_features,
+                eframe::wgpu::Features::default()
+            );
+            assert_eq!(described.label, Some("egui wgpu device"));
+        }
+
+        // GL 那档 egui 给的是 WebGL2 的降级 limits，只有面纹理这一项被抬到 8192
+        assert_eq!(
+            panel_device_descriptor(Backend::Gl).required_limits,
+            eframe::wgpu::Limits {
+                max_texture_dimension_2d: 8192,
+                ..eframe::wgpu::Limits::downlevel_webgl2_defaults()
+            }
+        );
+
+        // 内存那一档：不能是默认的 Performance（MemoryHints 没有 PartialEq，用 matches! 认）
+        assert!(matches!(
+            panel_device_descriptor(Backend::Dx12).memory_hints,
+            MemoryHints::MemoryUsage
+        ));
     }
 
     /// --softgl / ARONA_SOFTGL=1：无论有没有硬件 OpenGL，软渲染都排第一
