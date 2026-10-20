@@ -97,16 +97,19 @@ pub fn missing_deps() -> Vec<MissingDep> {
         .collect()
 }
 
-/// 试加载一个共享库。加载成功立刻释放引用计数，不留常驻句柄。
+/// 试加载一个共享库。能加载就说明依赖在位。
+///
+/// 不显式调 `Library::close`：句柄随作用域结束被 drop，而 `Library` 的 Drop 本身就会
+/// unload，写不写那一行效果相同；`close` 在部分平台上还是 `unsafe`、在另一些平台上不是，
+/// 包一层 `unsafe` 反而会招来 `unused_unsafe` 警告。
 fn can_load(library: &str) -> bool {
-    match unsafe { libloading::Library::new(library) } {
-        Ok(handle) => {
-            // SAFETY: 句柄刚由本函数创建，尚未被任何代码借用
-            drop(unsafe { handle.close() });
-            true
-        }
-        Err(_) => false,
-    }
+    // SAFETY: 只让动态加载器解析一个库名并立刻释放，不从里面取任何符号，
+    // 因此不存在跨模块的生命周期问题
+    let Ok(handle) = (unsafe { libloading::Library::new(library) }) else {
+        return false;
+    };
+    drop(handle);
+    true
 }
 
 /// 把缺失依赖拼成给用户看的说明，含各发行版的安装命令。

@@ -158,19 +158,26 @@ fn finalize_binary(root: &Path) -> PathBuf {
 
 /// 是不是该清理的旧产物：`arona-rs-<版本号>` 形态的**可执行文件**。
 ///
-/// Linux 上 `EXE_SUFFIX` 是空串，光看 `starts_with("arona-rs-")` 会把
-/// `arona-rs-1.2.0-linux-x64.tar.gz` 这类交付包一起判成旧产物删掉。所以这里
-/// 按平台分开认：Windows 只认 `.exe` 结尾，其它平台只认「文件名里没有扩展名」。
+/// 不能靠「文件名里有没有点」来判断有没有扩展名——版本号 `1.2.0` 自己就带两个点，
+/// 那样写会把 Linux 上真正的旧产物 `arona-rs-1.2.0` 判成"有扩展名的交付包"而漏掉
+/// （这条是 CI 的 Linux job 抓出来的：同一段逻辑在 Windows 上恰好因为产物带 `.exe`
+/// 而侥幸成立）。所以改成按结构认：前缀之后必须**恰好是一段三段式版本号**，
+/// Windows 形态再允许跟一个 `.exe`。交付包（`-linux-x64.tar.gz`、`-setup-…`、`.zip`）
+/// 都在版本号后面还有东西，自然落不进来。
 fn is_stale_binary(name: &str) -> bool {
-    if !name.starts_with("arona-rs-") || name.contains("-setup") {
+    let Some(rest) = name.strip_prefix("arona-rs-") else {
+        return false;
+    };
+    if name.contains("-setup") {
         return false;
     }
-    if cfg!(windows) {
-        name.ends_with(".exe")
-    } else {
-        // 没有点 = 没有扩展名 = 是个可执行文件（Linux 的 ELF 就长这样）
-        !name.contains('.')
-    }
+    // Windows 的旧产物带 .exe，Linux 的不带；两种都认
+    let version = rest.strip_suffix(".exe").unwrap_or(rest);
+    let parts: Vec<&str> = version.split('.').collect();
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
 }
 
 #[cfg(test)]
@@ -202,21 +209,28 @@ mod tests {
         );
     }
 
-    /// 旧产物清理不能误伤交付包：`arona-rs-1.2.0-linux-x64.tar.gz` 是给人下载的，
-    /// 不是遗留的可执行文件。Linux 上 `EXE_SUFFIX` 是空串，只按前缀判断就会把它删掉。
+    /// 旧产物清理的两个方向都得钉住：
+    /// 交付包（`.tar.gz` / `.zip` / `-setup`）一律不许动，而 `arona-rs-<版本号>` 形态的
+    /// 可执行文件该被清掉——**两个平台的形态都要认**。
+    ///
+    /// 这条测试原先是按 `cfg!(windows)` 分叉断言的，Windows 上恰好因为产物带 `.exe`
+    /// 而过关，Linux 上才暴露「版本号自己带点」那个判断错误。所以现在两种形态都断言。
     #[test]
     fn packaging_artifacts_are_never_mistaken_for_stale_binaries() {
+        // 交付包：版本号后面还有东西，都不算旧产物
         assert!(!is_stale_binary("arona-rs-1.2.0-linux-x64.tar.gz"));
         assert!(!is_stale_binary("arona-rs-1.2.0-linux-x64-compat.tar.gz"));
         assert!(!is_stale_binary("arona-rs-1.2.0-setup-win-x64.exe"));
-        // 真正的旧可执行文件该被清掉
-        if cfg!(windows) {
-            assert!(is_stale_binary("arona-rs-1.2.0.exe"));
-        } else {
-            assert!(is_stale_binary("arona-rs-1.2.0"));
-        }
-        // 主程序本体不匹配前缀规则，永远不动
+        assert!(!is_stale_binary("arona-rs-1.2.0-win-x64.zip"));
+        // 真正的旧可执行文件：Windows 带 .exe、Linux 不带，两种都得认出来
+        assert!(is_stale_binary("arona-rs-1.2.0"));
+        assert!(is_stale_binary("arona-rs-1.2.0.exe"));
+        // 三段式版本号才认，其它形状原样保留
+        assert!(!is_stale_binary("arona-rs-1.2"));
+        assert!(!is_stale_binary("arona-rs-notes"));
+        // 主程序本体与无关文件永远不动
         assert!(!is_stale_binary(&program_name()));
+        assert!(!is_stale_binary("readme.txt"));
     }
 }
 
