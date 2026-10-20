@@ -17,7 +17,13 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 rusqlite = { version = "0.32", features = ["bundled"] }
-reqwest = { version = "0.12", features = ["json"] }
+# TLS 用 rustls 而不是 reqwest 默认的 native-tls：native-tls 在 Windows 上走系统
+# schannel（天然免依赖），在 Linux 上却要链系统的 OpenSSL——那样 Linux 就再也做不出
+# 「解压即用、不装任何系统库」的静态包。rustls 是纯 Rust 实现，两平台都能静态链接，
+# 于是同一套 Cargo.toml 在 Windows 与 Linux(gnu/musl) 上产出的都是自包含的二进制。
+# 证书走 `-native-roots`（读系统根证书库）而不是内置的 webpki-roots：企业内网自建 CA
+# 那种场景与 native-tls 的行为保持一致，不会突然变成「证书不受信任」。
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
 chrono = "0.4"
 uuid = { version = "1", features = ["v4"] }
 rand = "0.8"

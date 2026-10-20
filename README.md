@@ -8,7 +8,27 @@
 - 插件开发文档：[PLUGIN_DEVELOPMENT.md](PLUGIN_DEVELOPMENT.md)，最小可编译样例：[`plugins/hello/`](plugins/hello)
 - 许可证：GNU AGPLv3（见文末「移植声明与许可」）
 
-本 README 只讲框架。插件是**独立编译的 dll**，由用户放进运行目录的 `plugins/`，框架启动时扫描装载 ——
+### 平台
+
+| 平台 | 管理面板（GUI） | 交付形态 |
+| --- | --- | --- |
+| Windows x64 | 有 | 安装包 `-setup-win-x64.exe` + 便携 `-win-x64.zip`（渲染运行库全随包） |
+| Linux x64 | **无**，只有命令行模式 | `-linux-x64.tar.gz`（标准，按构建机 glibc）<br>`-linux-x64-compat.tar.gz`（宽兼容，glibc 2.17 基线） |
+
+**平台是构建出来的，不是写死的**：同一份源码、同一套命令，产物布局与随包组件按目标平台自动切换
+（Windows 带 `softgl/` 与 DXC 着色器编译器，Linux 带 `fonts/` 且不编 eframe/wgpu）。
+Linux 版不链接任何图形库，所以服务器、容器、无桌面环境都能直接跑；TLS 用 rustls，
+两平台都不需要系统的 OpenSSL。
+
+> **为什么 Linux 不做静态包**：不是没试，是试过两条死路。musl 静态二进制里 `dlopen`
+> 是个直接返回 `Dynamic loading not supported` 的空桩，而框架的全部功能都来自运行期装载的
+> 插件；同时 rustc 不支持为 musl 目标编译 `cdylib`，插件那边也编不出 `.so`。
+> gnu 的全静态同样被 zig 明确拒绝。**能装插件是硬前提**，所以两个 Linux 包都是 glibc 动态链接，
+> 差别只在 glibc 基线。缺什么依赖不用担心：框架启动时会把发行版与内核写进日志，并逐个探测
+> 关键动态库，缺了就打印 apt / dnf / pacman / apk 各一条安装命令。
+
+本 README 只讲框架。插件是**独立编译的动态库**（Windows `.dll` / Linux `.so`），
+由用户放进运行目录的 `plugins/`，框架启动时扫描装载 ——
 本仓库不收录任何功能插件的源码，也不链接它们；某个插件的命令、玩法、数据来源与配置项都不属于框架，
 本文一律不列。想知道插件怎么写、能拿到哪些接口、对工具链有什么硬性要求，
 看 [PLUGIN_DEVELOPMENT.md](PLUGIN_DEVELOPMENT.md)。
@@ -131,6 +151,51 @@ HKEY_CURRENT_USER\Software\YuLinLoli\Arona-rs      # 选「为所有用户安装
 - 调试 / 自动化场景可以用环境变量跳过提权：`ARONA_NO_ELEVATE=1`。
 - 不想弹 UAC 又有管理员需求时，也可以手动右键 exe →「以管理员身份运行」；
   程序检测到自己已经提权后不会重复申请。
+- **Linux 上这一段不适用**：没有 UAC，也就没有提权流程。要监听 1024 以下的端口就用
+  root 或 `setcap`，其余场景普通用户直接跑即可。
+
+### Linux 用法
+
+Linux 版**只有命令行模式**（不含管理面板），启动后就是一个带颜色的控制台窗口，
+配置与数据布局与 Windows 完全一致。
+
+```bash
+tar -xzf arona-rs-1.2.0-linux-x64-compat.tar.gz
+cd arona-rs-1.2.0-linux-x64-compat
+./arona-rs                 # 前台运行，Ctrl+C 停止
+```
+
+两个包怎么选：
+
+| 包 | glibc 要求 | 适合 |
+| --- | --- | --- |
+| `-linux-x64-compat.tar.gz` | ≥ 2.17 | **拿不准就选它**：CentOS 7 / Ubuntu 16.04 之后的所有发行版都能跑 |
+| `-linux-x64.tar.gz` | 跟构建机一致 | 追新发行版；原生形态，系统库更新时一并受益 |
+
+启动时的第一行日志会写明「运行平台: <发行版> (内核 x.y.z, x86_64)」，并检查关键动态库——
+缺什么会直接打印各发行版的安装命令，不用再去查包名。两个包的代码与行为完全一致，
+差别只在编译时钉的 glibc 基线。
+
+要把机器人挂在后台，用系统服务管理器即可（systemd 示例）：
+
+```ini
+[Unit]
+Description=Arona-rs QQ bot
+After=network-online.target
+
+[Service]
+Type=simple
+# 工作目录决定 config/ data/ logs/ plugins/ 落在哪
+WorkingDirectory=/opt/arona-rs
+ExecStart=/opt/arona-rs/arona-rs --nogui
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+```
+
+> `--nogui` 在 Linux 上是无副作用的写法：Linux 构建本来就不含 GUI，加上它只是把意图写明，
+> 同一份 systemd 单元可以直接复用到别的平台。
 
 ## 配置
 
@@ -358,29 +423,51 @@ Windows 上含 GUI 的产物使用 windows 子系统，GUI 模式不会多出控
 
 ```bash
 cargo build-release      # 发布构建(默认含管理 GUI), 产物: target/release/arona-rs[.exe]
-cargo dist               # 发布构建 + 整理产物（主程序固定不带版本号；顺手清掉旧的 arona-rs-<版本号>.exe）
+cargo dist               # 发布构建 + 整理产物（主程序固定不带版本号；顺手清掉旧的 arona-rs-<版本号>）
 cargo run-release        # 构建并运行(默认打开管理 GUI)
 cargo run-nogui          # 以纯命令行(黑窗口)模式运行
 cargo build-nogui        # 精简命令行版: 不含 GUI(--no-default-features)
-cargo installer          # 发布构建 + 打 Windows 安装包
-cargo build-plugin       # 构建仓库里的示例插件: target/release/hello_plugin.dll
+cargo installer          # 发布构建 + 打 Windows 安装包（仅 Windows）
+cargo linux-dist         # 发布构建 + 打两个 Linux 交付包（仅 Linux）
+cargo build-plugin       # 构建仓库里的示例插件: target/release/hello_plugin[.so]
 ```
 
 这些是 `.cargo/config.toml` 里的别名，框架侧的都固定打在 `-p arona-host` 上，也可以直接写全命令。
 
+**命令不随平台变，产物随平台变**：
+
+| 平台 | `cargo dist` 产出 | 打交付包 |
+| --- | --- | --- |
+| Windows | `arona-rs.exe` + `softgl/` + `dxcompiler.dll` + `dxil.dll` | `cargo installer` → `-setup-win-x64.exe` |
+| Linux | `arona-rs`（ELF）+ `fonts/` | `cargo linux-dist` → 标准包 + 宽兼容包两个 `tar.gz` |
+
+Linux 构建自动带 `--no-default-features`（不编 eframe/wgpu），所以整条链路不需要 X11、Wayland、
+OpenGL 或任何图形库。`cargo linux-dist` 的宽兼容包需要一套能生成老 glibc 的工具链：
+
+```bash
+cargo install cargo-zigbuild        # 交叉工具链包装
+# 再装 zig：https://ziglang.org/download （或 winget install zig.zig / scoop install zig）
+```
+
+有了它，`x86_64-unknown-linux-gnu.2.17` 目标会把 glibc 基线钉在 2.17；在 Linux 原生机器上
+构建标准包则不需要任何额外工具。
+工具链缺失时**不报错**：标准包照常产出，宽兼容包跳过并说明缺什么。只要标准包可以设
+`ARONA_SKIP_COMPAT=1` 直接跳过。
+
 ### 插件怎么进来
 
 框架产物里**永远不含功能插件**，所以没有「带不带插件」两种构建。插件是独立 crate，
-编译成 dll 后由用户放进运行目录的 `plugins/`，框架启动时扫描并装载：
+编译成动态库（Windows `.dll` / Linux `.so`，框架按运行平台自动认扩展名）后由用户放进
+运行目录的 `plugins/`，框架启动时扫描并装载：
 
 ```bash
 # 1. 构建框架（一次即可，之后换插件不用重编）
 cargo build-release
 
 # 2. 构建示例插件（或任何第三方插件 crate）
-cargo build-plugin                                       # → target/release/hello_plugin.dll
+cargo build-plugin                                       # → target/release/hello_plugin.dll（Linux: .so）
 
-# 3. 把 dll 放进运行目录的 plugins/，再启动框架
+# 3. 把插件库放进运行目录的 plugins/，再启动框架
 mkdir -p target/release/plugins
 cp target/release/hello_plugin.dll target/release/plugins/
 cargo run-release
@@ -406,7 +493,8 @@ cargo run-release
 - 约 62 MB 的 `softgl/` 与 exe **分开存储**，安装时释放到安装目录的 `softgl\`；仓库里没有 `softgl/`
   时安装包自动不含该组件（`/DHasSoftgl`）。DXC 同理（`/DHasDxc`），缺失时程序降到系统 FXC。
 
-可选：拉取**渲染运行库**（都不入库，`cargo dist` / `cargo installer` 会自动复制到产物目录）：
+可选：拉取**渲染运行库**（都不入库，`cargo dist` / `cargo installer` 会自动复制到产物目录。
+**Windows 专用**——Linux 版不含 GUI，不需要它们）：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/fetch-dxc.ps1      # dxc\dxcompiler.dll + dxil.dll（约 30MB）
@@ -423,17 +511,23 @@ powershell -ExecutionPolicy Bypass -File scripts/fetch-softgl.ps1   # softgl\（
 pwsh -File scripts/make-icon.ps1     # 从 assets/source 的立绘取上半部分裁成正方形
 ```
 
-推送 `v*` 标签会触发 [`.github/workflows/AutoUploadReleaseBuild.yml`](.github/workflows/AutoUploadReleaseBuild.yml)：
-在 Windows 上跑测试、拉取 `dxc` 与 `softgl`、构建主程序 exe，再用 Inno Setup 编译安装包，
-最终发布三样东西并自动创建 GitHub Release：
+推送 `v*` 标签会触发 [`.github/workflows/AutoUploadReleaseBuild.yml`](.github/workflows/AutoUploadReleaseBuild.yml)，
+两条流水线并行（Windows 与 Linux 各自在本平台上原生构建，不做交叉编译），最终发布四样东西并自动创建 GitHub Release：
 
 | 产物 | 说明 |
 | --- | --- |
-| `arona-rs-<版本号>-win-x64.zip` | 便携版（框架本体）：`arona-rs.exe` + DXC 两个 dll + `softgl/`，插件 dll 由你自己放进 `plugins/` |
+| `arona-rs-<版本号>-win-x64.zip` | 便携版（框架本体）：`arona-rs.exe` + DXC 两个 dll + `softgl/` + `fonts/`，插件 dll 由你自己放进 `plugins/` |
 | `arona-rs-<版本号>-setup-win-x64.exe` | 安装包：介绍 + AGPLv3 全文 + 默认配置 + DXC（必装）+ 可选 `softgl/`，额外建好空的 `plugins\` |
+| `arona-rs-<版本号>-linux-x64.tar.gz` | Linux 标准包：`arona-rs` + `fonts/` + 空的 `plugins/`，按构建机 glibc 基线 |
+| `arona-rs-<版本号>-linux-x64-compat.tar.gz` | Linux 宽兼容包：同样的布局，glibc 基线钉在 2.17，老发行版也能跑 |
+
+Linux 那条流水线在出包前会做两道校验：解开包 `timeout 8 ./arona-rs --nogui` 确认它真的能起来
+并打出平台体检输出；再用 `objdump -T` 扫一遍宽兼容包的最高 glibc 符号，超过 2.17 就直接失败
+——那说明 zigbuild 的目标后缀没生效，包拿到老系统上会当场炸。
 
 裸 `arona-rs.exe` 只是构建中间产物（本地 `cargo dist` 产出、安装包与 zip 都从它取材），
-不单独上传到 Release。体积参考：含 GUI 的主程序 exe 约 19 MB，`--no-default-features` 的精简命令行版约 10 MB。
+不单独上传到 Release。体积参考：含 GUI 的主程序 exe 约 19 MB，`--no-default-features` 的精简命令行版约 10 MB；
+Linux 两个包里的主程序都是约 7.8 MB。
 
 ### 验证
 
@@ -442,7 +536,7 @@ cargo test --workspace                 # 离线单测（动态装载与 ABI 握�
 cargo test --release --workspace       # CI 口径
 cargo clippy --workspace --all-targets # 框架侧 error 级必须清零
 cargo fmt --all
-cargo build-plugin                     # 示例插件编成 dll，产物 target/release/hello_plugin.dll
+cargo build-plugin                     # 示例插件编成动态库，产物 target/release/hello_plugin[.so]
 ```
 
 ## 仓库结构
@@ -519,7 +613,12 @@ arona::export_arona_plugin!(MyPlugin);
   `onebot.yml` 坏掉时连不上任何实现端，提示后退出并保留现场。软错误（不认识的配置项等）只记 `WARNING`。
 - 三方库（wgpu / glutin / winit）的诊断会写进控制台与日志文件，`ARONA_LOG` 可调级别。
 - 远程桌面（RDP）通常能直接开面板；Windows Server Core（无桌面体验）不支持 GUI，请只用 `--nogui`。
-- 群里发命令没人回应：先确认插件 dll 在不在运行目录的 `plugins/` 里、日志有没有「已装载动态插件」
+- **Linux 上不想看到彩色输出**：设 `NO_COLOR=1`，或把输出重定向到文件（非终端时自动降级为纯文本）。
+- **Linux 上报 `GLIBC_2.xx not found`**：目标机的 glibc 比构建机旧，换成
+  `-linux-x64-compat.tar.gz`（基线 2.17），不用升级系统。
+- **Linux 上提示缺依赖**：启动输出里会点名缺哪个库并给出 apt / dnf / pacman / apk 四条命令，
+  照抄一条装上即可；这些库通常随基础系统就有，只有容器与精简镜像才容易缺。
+- 群里发命令没人回应：先确认插件动态库在不在运行目录的 `plugins/` 里、日志有没有「已装载动态插件」
   （一条都没有就是根本没装进来；「跳过插件 …」会点名工具链差在哪一项），再到「群管理」页看
   该群/该功能/该插件有没有被关掉，最后看日志里有没有「功能已关闭」或 panic 隔离的记录。
 

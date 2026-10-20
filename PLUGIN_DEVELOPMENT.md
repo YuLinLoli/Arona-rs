@@ -2,9 +2,18 @@
 
 本项目拆成「框架 + 功能插件」两层。框架只提供 **OneBot 连接（含 v11 全量动作接口与事件钩子）、管理面板(GUI)、群授权/黑名单、插件与功能的启停门控、命令分发骨架** 与生命周期编排；具体玩法一律以**插件**形式实现并插入框架。
 
-插件契约对齐 [mirai](https://docs.mirai.com) 的插件模型（`PluginManager` / `plugin.yml` / `ApiVersion` / `EventPriority` / `CommandManager` / `CoroutineScope` / `DiContainer` / `ConfigKey`），装载方式也一样：**用户在启动前把插件包放进 `plugins/` 目录，框架启动时扫描、握手、装配**。差别只在包的形态——mirai 是 jar 由 ClassLoader 隔离加载，这里是 `cdylib` 编出的 dll 直接映射进宿主进程，因此对构建工具链的要求比 mirai 严格（§22 是硬性发布要求，务必读）。
+插件契约对齐 [mirai](https://docs.mirai.com) 的插件模型（`PluginManager` / `plugin.yml` / `ApiVersion` / `EventPriority` / `CommandManager` / `CoroutineScope` / `DiContainer` / `ConfigKey`），装载方式也一样：**用户在启动前把插件包放进 `plugins/` 目录，框架启动时扫描、握手、装配**。差别只在包的形态——mirai 是 jar 由 ClassLoader 隔离加载，这里是 `cdylib` 编出的动态库直接映射进宿主进程，因此对构建工具链的要求比 mirai 严格（§22 是硬性发布要求，务必读）。
 
-**想先跑起来再看文档：`plugins/hello/` 是一份完整的示例插件**，编译出 `hello_plugin.dll` 丢进 `plugins/` 就能装载；
+> **平台说明**：本文用 `dll` 指代「插件动态库」，它在不同平台上的实际形态是
+> Windows 的 `.dll` 与 Linux 的 `.so`（框架按运行平台自动认扩展名，见
+> `arona::plugin::dynamic::library_extension`）。其余契约——导出符号、握手、生命周期、
+> 配置与数据目录——两平台完全一致，**唯一区别是插件必须与它要装进去的那个宿主
+> 用同一个目标三元组构建**：Windows 宿主要 Windows 插件，Linux 宿主要 Linux 插件。
+> 另外 Linux 版框架不含管理面板（GUI），面向面板的能力（如 §11 的会话展示板）在
+> Linux 上照常工作，只是没有界面去显示它。
+
+**想先跑起来再看文档：`plugins/hello/` 是一份完整的示例插件**，编译出 `hello_plugin.dll`
+（Linux 上是 `hello_plugin.so`）丢进 `plugins/` 就能装载；
 命令、事件钩子、出站钩子、类型化配置、每日任务各演示了一发，本文讲的接口基本都能在那儿对着读。
 
 ## 1. 目录与版本
@@ -17,7 +26,8 @@ plugins/hello/             # 示例插件：name=hello-plugin, crate-type=["cdyl
 ```
 
 框架仓库里不含任何功能插件（示例除外），宿主也不链接插件：功能插件是**各自独立的 crate**，
-编译出 `xxx_plugin.dll` 后由用户放进运行目录的 `plugins/`，框架启动时扫描装载（§22）。
+编译出 `xxx_plugin.dll`（Linux: `xxx_plugin.so`）后由用户放进运行目录的 `plugins/`，
+框架启动时扫描装载（§22）。
 
 版本约定：框架与 host 同为 `1.2.0`，插件版本号各自演进。
 **插件接口的破坏性改动抬 `arona::plugin::FRAMEWORK_API_VERSION`**（与 crate 版本号无关），见 §6；
@@ -35,7 +45,7 @@ plugins/hello/             # 示例插件：name=hello-plugin, crate-type=["cdyl
   data/<插件>/…             该插件自己的数据（如 data/hello/image、arona.db、backups）
   fonts/                    安装包与便携 zip 释出的随包中文字体（思源宋体简中，OFL 1.1）
   logs/                     按天滚动的日志
-  plugins/                  用户放的插件 dll —— 框架扫描这一层以及它的每个一级子目录
+  plugins/                  用户放的插件动态库 —— 框架扫描这一层以及它的每个一级子目录
   plugins/<插件>/           框架按 id 渲染的 plugin.yml；插件的随包资源也放这里
 ```
 
@@ -1286,21 +1296,22 @@ ctx.clear_all_rows();       // 全摘（一般用不上：插件被停用时框�
 框架仓库里（`cargo run` 的运行目录是 `target/debug`，`--release` 时是 `target/release`）：
 
 ```bash
-cargo run -p arona-host                  # 默认打开管理面板 GUI
+cargo run -p arona-host                  # 默认打开管理面板 GUI（Linux 上直接进命令行模式）
 cargo run -p arona-host -- --nogui       # 纯命令行模式（黑窗口）
 cargo run -p arona-host -- --test-notify # 20 秒后跑一次每日推送，便于联调（它走的是插件**主动**发消息那条路，正好用来验 §22 那两处状态是不是真的接进了宿主）
 cargo build -p arona-host --no-default-features   # 精简命令行版
-cargo build-plugin                       # 编示例插件：target/release/hello_plugin.dll
+cargo build-plugin                       # 编示例插件：target/release/hello_plugin.dll（Linux: .so）
 ```
 
 插件仓库里：
 
 ```bash
-cargo build --release    # 改一行代码就是"重编 + 重拷 dll + 重启框架"这三步
+cargo build --release    # 改一行代码就是"重编 + 重拷动态库 + 重启框架"这三步
 cargo test               # rlib 那份给单测用，纯逻辑不必起宿主
 ```
 
-日常联调就是 `cp target/release/<插件>.dll <宿主运行目录>/plugins/<id>/` 后重启框架，
+日常联调就是 `cp target/release/<插件>.dll <宿主运行目录>/plugins/<id>/` 后重启框架
+（Linux 上换成 `.so`），
 看启动日志有没有那三行「装载成功」的输出（§15）。装载失败一定会有明确的中文原因，
 不会静默不出现——先查日志再怀疑代码。
 

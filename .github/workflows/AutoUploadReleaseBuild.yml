@@ -1,4 +1,4 @@
-# 自动发布：推送 v* 标签时构建 Windows 发布版并创建 GitHub Release
+# 自动发布：推送 v* 标签时构建 Windows 与 Linux 发布版并创建 GitHub Release
 # 参考: https://github.com/YuLinLoli/arona/blob/1.2.0-testonebot/.github/workflows/AutoUploadReleaseBuild.yml
 #
 # 用法:
@@ -7,9 +7,13 @@
 #   3. Actions 自动构建 -> 上传工件 -> 创建 Release
 #      产物: arona-rs-1.0.0-win-x64.zip（便携版, 内含 arona-rs.exe + softgl/ + DXC DLL, 带版本号）
 #            arona-rs-1.0.0-setup-win-x64.exe（安装包, 含程序介绍与 AGPLv3 全文）
-#      两个包都只含框架本体：功能插件是各自仓库编出的 dll，用户装好后放进 plugins\ 目录，
+#            arona-rs-1.0.0-linux-x64.tar.gz（Linux 标准包, 按构建机 glibc 基线）
+#            arona-rs-1.0.0-linux-x64-compat.tar.gz（Linux 宽兼容包, glibc 2.17 基线）
+#      所有包都只含框架本体：功能插件是各自仓库编出的 dll/so，用户装好后放进 plugins/ 目录，
 #      框架启动时自动扫描装载（工具链要求见 PLUGIN_DEVELOPMENT.md）
-#      渲染运行库全部随包发布: 解压/安装后无需装任何依赖就能打开管理面板
+#      Windows 包的渲染运行库全部随包发布: 解压/安装后无需装任何依赖就能打开管理面板
+#      Linux 版只提供命令行模式（不编 eframe/wgpu），因此不需要任何图形库；
+#      两个 Linux 包都是 glibc 动态链接——静态化会毁掉插件装载能力，不能做
 #      裸 exe 不上传: 要单文件就用安装包（或自己解压 zip）, 这样 Release 里不会有
 #      名字相同、无法区分版本的 arona-rs.exe
 # 也可以在 Actions 页面手动 Run workflow（手动触发时跳过版本校验、只构建不发布）。
@@ -187,9 +191,131 @@ jobs:
             ${{ env.SETUP_PATH }}
           compression-level: 0
 
-  # 2) 取回工件并发布 Release
+  # 2) 在 Linux 上构建两个 Linux 交付包（仅命令行版，不含管理面板）
+  #
+  # 为什么是两个包：标准包按 runner 的 glibc 基线编，是发行版的原生形态；
+  # 宽兼容包钉 glibc 2.17（CentOS 7 / Ubuntu 16.04 时代的水位），之后所有发行版都能跑。
+  # 两种用户都存在（追新的与部署在老系统/容器里的），合并成一个就只能二选一。
+  #
+  # **两个包都是 glibc 动态链接**，这一点不可协商：musl 静态二进制里 dlopen 是空桩，
+  # 装不了插件；rustc 也不支持 musl 的 cdylib，插件编不出来。能装插件是硬前提。
+  #
+  # Linux 版不编 eframe/wgpu（`--no-default-features`），所以整条流水线不需要 X11、Wayland、
+  # OpenGL 或任何图形库；TLS 走 rustls，也不需要系统的 OpenSSL。
+  LinuxBuild:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 工具链版本同样由仓库根的 rust-toolchain.toml 决定（与 Windows 侧一致）
+      - name: Show active toolchain
+        run: |
+          rustup show active-toolchain
+          rustc -vV
+
+      # 宽兼容包要的最后一环：zig 提供多版本 glibc 的头与链接器，cargo-zigbuild 负责
+      # 把它包装成 cc-rs/rustc 认得的形态。没有它只会少一个包，标准包照常产出。
+      #
+      # 直接从 ziglang.org 取官方二进制，不引第三方 setup action：这里少一个会随版本
+      # 失效的间接依赖，排查也更直接（URL 拼错时报的是 404，不是某个 action 的谜语）。
+      - name: Install zig
+        env:
+          ZIG_VERSION: "0.17.0"
+        run: |
+          set -euo pipefail
+          url="https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          echo "下载 $url"
+          curl -fsSL "$url" -o /tmp/zig.tar.xz
+          mkdir -p "$HOME/zig"
+          tar -xJf /tmp/zig.tar.xz -C "$HOME/zig" --strip-components=1
+          echo "$HOME/zig" >> "$GITHUB_PATH"
+          "$HOME/zig/zig" version
+
+      # 版本钉住：cargo-zigbuild 与 zig 的兼容面是成对变化的，最新的那个不一定配得上
+      # 上面装的 zig。0.23.x + zig 0.17 是本地验证过的组合。
+      - name: Install cargo-zigbuild
+        run: cargo install cargo-zigbuild --version '^0.23' --locked
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # Linux 交付的就是不含 GUI 的构建（`--no-default-features`），测试也按这个形态跑：
+      # 既验证的正是要发出去的那份东西，又不白编一遍 eframe/wgpu 那一大坨。
+      # Windows 侧因为交付带 GUI，那边跑的是默认 features。
+      - name: Test
+        run: cargo test --release --workspace --no-default-features
+
+      # 等价于 cargo linux-dist：出标准包 + 宽兼容包两个 tar.gz
+      - name: Build Linux packages
+        run: cargo test -p arona-host linux_dist --release -- --ignored --nocapture --test-threads=1
+
+      # 两个包必须都在。linux_dist 在工具链缺失时会**静默跳过**兼容包（本地开发时这是
+      # 友好的），但发布流水线上少一个包就是事故，所以这里显式要求两个都在。
+      - name: Verify both packages exist
+        run: |
+          set -euo pipefail
+          ls -la target/release/*.tar.gz
+          for kind in "" "-compat"; do
+            if ! ls target/release/arona-rs-*-linux-x64${kind}.tar.gz >/dev/null 2>&1; then
+              echo "缺少 arona-rs-*-linux-x64${kind}.tar.gz"; exit 1
+            fi
+          done
+          echo "标准包与宽兼容包都在"
+
+      # 冒烟：包里的二进制必须真的能起来。用超时兜住——
+      # 机器人连不上 OneBot 也该先打出启动横幅、运行平台与配置路径
+      - name: Smoke test the compat binary
+        run: |
+          set -e
+          mkdir -p /tmp/smoke && cd /tmp/smoke
+          tar -xzf "$GITHUB_WORKSPACE"/target/release/arona-rs-*-linux-x64-compat.tar.gz
+          cd arona-rs-*-linux-x64-compat
+          file ./arona-rs
+          ldd ./arona-rs || true
+          set +e
+          timeout 8 ./arona-rs --nogui > out.log 2>&1
+          code=$?
+          set -e
+          cat out.log
+          # 124 = 被 timeout 杀掉，说明它正常跑着（没有崩溃退出）
+          if [ "$code" -ne 0 ] && [ "$code" -ne 124 ]; then
+            echo "二进制启动失败，退出码 $code"; exit 1
+          fi
+          grep -q "运行平台" out.log || { echo "没有看到平台体检输出"; exit 1; }
+          echo "Linux 二进制冒烟通过"
+
+      # 宽兼容包的 glibc 基线必须真的钉住：用字符串扫一遍最高符号版本，
+      # 超过 2.17 就说明 zigbuild 的目标后缀没生效，包会在老系统上炸
+      - name: Verify compat glibc baseline
+        run: |
+          set -e
+          mkdir -p /tmp/verify && cd /tmp/verify
+          tar -xzf "$GITHUB_WORKSPACE"/target/release/arona-rs-*-linux-x64-compat.tar.gz
+          bin=$(find . -name arona-rs -type f | head -1)
+          max=$(objdump -T "$bin" | grep -o 'GLIBC_2\.[0-9]*' | sort -u -V | tail -1)
+          echo "最高 GLIBC 符号: $max"
+          if [ "$max" != "GLIBC_2.17" ]; then
+            echo "宽兼容包的 glibc 基线不是 2.17（实得 $max），目标后缀没生效"; exit 1
+          fi
+
+      - name: Get artifact name
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 \
+            | python3 -c "import json,sys; d=json.load(sys.stdin); print([p['version'] for p in d['packages'] if p['name']=='arona-host'][0])")
+          echo "APP_VERSION=$version" >> "$GITHUB_ENV"
+          echo "ARTIFACT_NAME=arona-rs-$version-linux" >> "$GITHUB_ENV"
+
+      - name: Upload-Artifact-Linux
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: target/release/arona-rs-*-linux-x64*.tar.gz
+          compression-level: 0
+
+  # 3) 取回工件并发布 Release
   Publish:
-    needs: Build
+    needs: [Build, LinuxBuild]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:

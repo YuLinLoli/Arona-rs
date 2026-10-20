@@ -2,42 +2,87 @@
 //!
 //!   cargo dist       发布构建: target/release/arona-rs[.exe]
 //!   cargo installer  在上面基础上调用 Inno Setup，打出 Windows 安装包:
-//!                    target/release/arona-rs-<版本号>-setup-win-x64.exe
+//!                    target/release/arona-rs-<版本号>-setup-win-x64.exe（仅 Windows）
+//!   cargo linux-dist 在 Linux 上打出两个交付包（仅 Linux）:
+//!                    arona-rs-<版本号>-linux-x64.tar.gz        （动态链接 glibc）
+//!                    arona-rs-<版本号>-linux-x64-static.tar.gz （musl 静态，无任何依赖）
+//!
+//! **平台是构建出来的，不是写死的**：产物布局、随包组件、打包步骤全部按
+//! `cfg!(windows)` / `cfg!(unix)` 分流，同一份 `cargo dist` 在 Windows 上产出
+//! exe + softgl/ + DXC，在 Linux 上产出无扩展名的 ELF + fonts/，不需要改命令。
 //!
 //! 主程序固定叫 `arona-rs[.exe]`、**不带版本号**：升级/自动更新时可以直接覆盖同名文件，
-//! 快捷方式、计划任务、注册表里的 ExeName 也都不用跟着版本号改。版本号只出现在安装包名、
-//! 便携 zip 名与「关于」页面里（安装包命名见 installer/arona-rs.iss 的 OutputBaseFilename）。
+//! 快捷方式与计划任务也都不用跟着版本号改。版本号只出现在包名与「关于」页面里。
 //! 历史构建留下的 `arona-rs-<版本号>[.exe]` 会在构建结束时清理掉。
 //!
-//! 两个构建任务都会把渲染运行库放到 exe 同级：softgl/（CPU 软渲染兜底）与 dxc/
-//! （DXC 着色器编译器）。它们都不入库，靠 scripts/fetch-softgl.ps1 与 scripts/fetch-dxc.ps1
-//! 现场获取；缺哪个就跳过对应副本并打印提示，安装包也不会带上对应组件。
+//! 渲染运行库（softgl/ 与 DXC）**只属于 Windows**：Linux 版只有命令行模式，
+//! 不链接 eframe/wgpu，也就没有显卡后端要兜底。反过来，随包中文字体两平台都带，
+//! 因为出图插件在 Linux 上同样要用它画字。
 //!
-//! 产物永远是框架本体：功能插件不链接进 exe，而是编译成 dll 由用户在启动前放进
-//! `plugins\`，框架启动时扫描装载（见 `arona::plugin::dynamic`）。
+//! 产物永远是框架本体：功能插件不链接进 exe，而是编译成 dll/so 由用户在启动前放进
+//! `plugins/`，框架启动时扫描装载（见 `arona::plugin::dynamic`）。
 //! 因此这里不存在"带插件的宿主"这条分支，也不需要给包名加区分后缀。
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// 发布构建（默认含管理 GUI），返回 target/release/arona-rs[.exe]
+///
+/// 目标三元组由调用方的 `--target` 决定；这里不改目录约定，只按当前构建的 target
+/// 去找产物。Linux 静态包构建时会传 `--target x86_64-unknown-linux-musl`，
+/// 产物落在 `target/<三元组>/release/`。
 fn build_release(root: &Path) -> PathBuf {
+    build_release_for(root, None)
+}
+
+/// 可选目标三元组的发布构建（`None` = 当前主机）
+///
+/// **跨平台时用 `cargo zigbuild` 而不是 `cargo build`**：给 Linux 目标编 C 代码
+/// （`ring` 的加密实现、`libsqlite3-sys` 的 sqlite3.c）需要一套 Linux 的 libc 头与
+/// 链接器，Windows 上没有。zig 自带这些，`cargo zigbuild` 会把 `zig cc` 包装成 cc-rs
+/// 认得的形态（直接用 `CC="zig cc -target ..."` 会被 cc-rs 的编译器家族探测打回，
+/// 它探测时只调 `zig -E`，把 `cc` 子命令丢了）。在 Linux 原生构建时仍走普通
+/// `cargo build`，链接器由 musl-tools / 系统 gcc 提供。
+fn build_release_for(root: &Path, target: Option<&str>) -> PathBuf {
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
-    println!("[dist] 开始发布构建");
-    // workspace 根是虚拟清单，`--features` 必须落到具体包上：产物就是 host 的 arona-rs.exe
+    let crossing_to_linux = target.is_some_and(|t| t.contains("linux")) && !cfg!(target_os = "linux");
+    let subcommand = if crossing_to_linux {
+        println!("[dist] 交叉编译到 Linux 目标，改用 cargo zigbuild");
+        "zigbuild"
+    } else {
+        "build"
+    };
+    println!(
+        "[dist] 开始发布构建 (cargo {subcommand}{})",
+        target.map(|t| format!(" {t}")).unwrap_or_default()
+    );
+    // workspace 根是虚拟清单，`--features` 必须落到具体包上：产物就是 host 的 arona-rs
     let mut command = Command::new(&cargo);
     command
-        .arg("build")
+        .arg(subcommand)
         .arg("--release")
         .arg("-p")
         .arg("arona-host");
-    command.args(["--features", "gui"]);
+    // Linux 只交付命令行版：不编 eframe/wgpu，产物既小又不依赖任何图形库
+    if cfg!(windows) {
+        command.args(["--features", "gui"]);
+    } else {
+        command.args(["--no-default-features"]);
+    }
+    if let Some(target) = target {
+        command.arg("--target").arg(target);
+    }
     let status = command
         .current_dir(root)
         .status()
         .expect("启动 cargo build --release 失败");
     assert!(status.success(), "cargo build --release 失败");
-    target_release_dir(root).join(format!("arona-rs{}", std::env::consts::EXE_SUFFIX))
+    release_dir(root, target).join(program_name())
+}
+
+/// 主程序文件名：Windows 带 .exe，Linux 不需要扩展名
+fn program_name() -> String {
+    format!("arona-rs{}", std::env::consts::EXE_SUFFIX)
 }
 
 /// workspace 根目录（仓库根）：本测试在 crates/arona-host 包里，需向上两级。
@@ -51,27 +96,54 @@ fn workspace_root() -> PathBuf {
         .unwrap_or(manifest)
 }
 
-fn target_release_dir(root: &Path) -> PathBuf {
-    std::env::var_os("CARGO_TARGET_DIR")
+/// 某个目标三元组（或当前主机）的 release 目录。
+///
+/// 先过 [`cargo_target_dir_name`] 把 zigbuild 的 glibc 版本后缀剥掉——不剥的话
+/// 会去 `target/x86_64-unknown-linux-gnu.2.17/release/` 找产物，而 cargo 实际把它
+/// 放在 `target/x86_64-unknown-linux-gnu/release/`（版本后缀只传给链接器）。
+fn release_dir(root: &Path, target: Option<&str>) -> PathBuf {
+    let base = std::env::var_os("CARGO_TARGET_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| root.join("target"))
-        .join("release")
+        .unwrap_or_else(|| root.join("target"));
+    match target {
+        Some(target) => base.join(cargo_target_dir_name(target)).join("release"),
+        None => base.join("release"),
+    }
+}
+
+/// `cargo-zigbuild` 的目标写法 `x86_64-unknown-linux-gnu.2.17` 里，`.2.17` 只影响链接
+/// 阶段用的 glibc 版本，**产物目录仍然是基础三元组**。这里把它剥掉，否则打包时会在
+/// 一个不存在的目录里找二进制。
+///
+/// 判据是「第一个点及其后面的部分」：Rust 的 target 三元组用 `-` 分段，自身不含点，
+/// 所以出现点就一定是 zigbuild 加上的版本后缀。
+fn cargo_target_dir_name(target: &str) -> &str {
+    match target.split_once('.') {
+        Some((base, version))
+            if !base.is_empty() && version.chars().all(|c| c.is_ascii_digit() || c == '.') =>
+        {
+            base
+        }
+        _ => target,
+    }
+}
+
+fn target_release_dir(root: &Path) -> PathBuf {
+    release_dir(root, None)
 }
 
 /// 交付前的产物整理：主程序固定为 arona-rs[.exe]（不带版本号，便于覆盖升级），
-/// 顺带清掉历史构建留下的 `arona-rs-<版本号>[.exe]`（安装包 arona-rs-*-setup-*.exe 保留）。
+/// 顺带清掉历史构建留下的 `arona-rs-<版本号>[.exe]`（安装包与压缩包保留）。
 fn finalize_binary(root: &Path) -> PathBuf {
     let release_dir = target_release_dir(root);
-    let suffix = std::env::consts::EXE_SUFFIX;
-    let exe = release_dir.join(format!("arona-rs{suffix}"));
+    let exe = release_dir.join(program_name());
     if !exe.is_file() {
         panic!("发布产物不存在: {}", exe.display());
     }
     if let Ok(entries) = std::fs::read_dir(&release_dir) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            let stale =
-                name.starts_with("arona-rs-") && name.ends_with(suffix) && !name.contains("-setup");
+            let stale = is_stale_binary(&name);
             if !stale {
                 continue;
             }
@@ -84,10 +156,75 @@ fn finalize_binary(root: &Path) -> PathBuf {
     exe
 }
 
+/// 是不是该清理的旧产物：`arona-rs-<版本号>` 形态的**可执行文件**。
+///
+/// Linux 上 `EXE_SUFFIX` 是空串，光看 `starts_with("arona-rs-")` 会把
+/// `arona-rs-1.2.0-linux-x64.tar.gz` 这类交付包一起判成旧产物删掉。所以这里
+/// 按平台分开认：Windows 只认 `.exe` 结尾，其它平台只认「文件名里没有扩展名」。
+fn is_stale_binary(name: &str) -> bool {
+    if !name.starts_with("arona-rs-") || name.contains("-setup") {
+        return false;
+    }
+    if cfg!(windows) {
+        name.ends_with(".exe")
+    } else {
+        // 没有点 = 没有扩展名 = 是个可执行文件（Linux 的 ELF 就长这样）
+        !name.contains('.')
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// zigbuild 的版本后缀必须从**目录名**里剥掉，否则打包时会在一个不存在的
+    /// `target/x86_64-unknown-linux-gnu.2.17/release/` 里找二进制而扑空。
+    /// 这条钉住的是「`.2.17` 只影响链接、不影响产物落点」这个容易记错的事实。
+    #[test]
+    fn the_glibc_suffix_never_lands_in_the_target_directory_name() {
+        assert_eq!(
+            cargo_target_dir_name("x86_64-unknown-linux-gnu.2.17"),
+            "x86_64-unknown-linux-gnu"
+        );
+        // 没后缀的原样返回
+        assert_eq!(
+            cargo_target_dir_name("x86_64-unknown-linux-gnu"),
+            "x86_64-unknown-linux-gnu"
+        );
+        assert_eq!(
+            cargo_target_dir_name("x86_64-pc-windows-msvc"),
+            "x86_64-pc-windows-msvc"
+        );
+        // 点后面不是纯版本号时不动它：宁可原样保留，也别把未知写法悄悄改坏
+        assert_eq!(
+            cargo_target_dir_name("weird.target-name"),
+            "weird.target-name"
+        );
+    }
+
+    /// 旧产物清理不能误伤交付包：`arona-rs-1.2.0-linux-x64.tar.gz` 是给人下载的，
+    /// 不是遗留的可执行文件。Linux 上 `EXE_SUFFIX` 是空串，只按前缀判断就会把它删掉。
+    #[test]
+    fn packaging_artifacts_are_never_mistaken_for_stale_binaries() {
+        assert!(!is_stale_binary("arona-rs-1.2.0-linux-x64.tar.gz"));
+        assert!(!is_stale_binary("arona-rs-1.2.0-linux-x64-compat.tar.gz"));
+        assert!(!is_stale_binary("arona-rs-1.2.0-setup-win-x64.exe"));
+        // 真正的旧可执行文件该被清掉
+        if cfg!(windows) {
+            assert!(is_stale_binary("arona-rs-1.2.0.exe"));
+        } else {
+            assert!(is_stale_binary("arona-rs-1.2.0"));
+        }
+        // 主程序本体不匹配前缀规则，永远不动
+        assert!(!is_stale_binary(&program_name()));
+    }
+}
+
 /// 附带软件 OpenGL 兜底库：仓库根 softgl/ -> target/release/softgl/
 ///
 /// 没有显卡驱动 / 没有 DX12 的服务器靠它用 llvmpipe 把管理面板画出来（见 runtime::softgl）。
 /// 返回 false 表示仓库里没有 softgl/（未运行 scripts/fetch-softgl.ps1）。
+#[cfg(windows)]
 fn copy_softgl(root: &Path) -> bool {
     let source = root.join("softgl");
     let dest = target_release_dir(root).join("softgl");
@@ -112,6 +249,7 @@ fn copy_softgl(root: &Path) -> bool {
 /// 动态加载的 DXC（`Dx12Compiler::DynamicDxc`），运行时从 exe 同级读 dxcompiler.dll/dxil.dll，
 /// 所以**随包分发这两个 DLL** 才能保住最快的着色器编译路径（见 gui::wgpu_options）。
 /// 返回 false 表示仓库里没有 dxc/（未运行 scripts/fetch-dxc.ps1）——渲染降级链会跳过 DXC 档。
+#[cfg(windows)]
 fn copy_dxc(root: &Path) -> bool {
     let source = root.join("dxc");
     if !source.is_dir() {
@@ -139,7 +277,40 @@ fn copy_dxc(root: &Path) -> bool {
     true
 }
 
+/// 随包中文字体：installer/fonts/ -> 产物目录 fonts/
+///
+/// 出图插件画卡片、以及（Windows 上）管理面板显示中文，用的都是这一份思源宋体。
+/// 两平台都要带：**没有它，Linux 上的出图插件只能退回各发行版的系统字体候选，
+/// 同一句话在不同机器上观感不一致**，这正是当初把它收进框架的理由。
+///
+/// Windows 的安装包由 Inno Setup 自己释放 `fonts\`，所以那一侧不在这里重复；
+/// 便携 zip 与 Linux 包则需要它躺在运行目录里。
+/// Windows 的安装包由 Inno Setup 自己释放 `fonts\`，便携 zip 由 CI 直接并入，
+/// 所以那一侧不在这里重复；只有 Linux 需要它跟着产物目录走。
+#[cfg(unix)]
+fn copy_fonts(root: &Path) -> bool {
+    let source = root.join("installer").join("fonts");
+    let dest = target_release_dir(root).join("fonts");
+    if !source.is_dir() {
+        return false;
+    }
+    match copy_dir(&source, &dest) {
+        Ok(()) => {
+            println!("[dist] 已附带随包中文字体: {}", dest.display());
+            true
+        }
+        Err(err) => {
+            eprintln!("[dist] 复制 fonts 失败: {err}");
+            false
+        }
+    }
+}
+
 /// 构建任务: 发布构建并整理产物（主程序 arona-rs[.exe] 不带版本号，交付推荐）
+///
+/// 同一份命令在两个平台上产出各自的布局，随包组件按 `cfg!` 分流：
+/// - Windows: arona-rs.exe + softgl/ + dxcompiler.dll + dxil.dll
+/// - Linux:   arona-rs（无扩展名）+ fonts/
 #[ignore = "构建任务, 运行: cargo dist"]
 #[test]
 fn dist_build() {
@@ -148,15 +319,27 @@ fn dist_build() {
     let exe = finalize_binary(&root);
     println!("[dist] 构建产物: {}", exe.display());
 
-    if !copy_softgl(&root) {
-        println!(
-            "[dist] 未附带软件 OpenGL; 无显卡驱动/无 DX12 的服务器需要先运行 scripts/fetch-softgl.ps1"
-        );
+    #[cfg(windows)]
+    {
+        if !copy_softgl(&root) {
+            println!(
+                "[dist] 未附带软件 OpenGL; 无显卡驱动/无 DX12 的服务器需要先运行 scripts/fetch-softgl.ps1"
+            );
+        }
+        if !copy_dxc(&root) {
+            println!(
+                "[dist] 未附带 DXC 着色器编译器; 渲染降级链会跳过 DXC 档, 需要先运行 scripts/fetch-dxc.ps1"
+            );
+        }
     }
-    if !copy_dxc(&root) {
-        println!(
-            "[dist] 未附带 DXC 着色器编译器; 渲染降级链会跳过 DXC 档, 需要先运行 scripts/fetch-dxc.ps1"
-        );
+    #[cfg(not(windows))]
+    {
+        // Linux 版不含 GUI：没有渲染后端，softgl/DXC 一律不参与，只需要随包字体
+        if !copy_fonts(&root) {
+            eprintln!(
+                "[dist] 未附带随包中文字体（缺 installer/fonts/）：出图插件会退回系统字体候选"
+            );
+        }
     }
 }
 
@@ -164,6 +347,10 @@ fn dist_build() {
 ///
 /// ISCC 查找顺序: 环境变量 ARONA_ISCC -> PATH -> 注册表 InstallLocation -> 常见安装目录。
 /// 安装包内容与目录规划见 installer/arona-rs.iss。
+///
+/// 只在 Windows 上有意义：Inno Setup 与 .iss 脚本都是 Windows 专属的。Linux 侧的交付
+/// 包由 [`linux_dist`] 负责，两者是同一条流水线的两个平台分支。
+#[cfg(windows)]
 #[ignore = "构建任务, 运行: cargo installer"]
 #[test]
 fn installer_build() {
@@ -241,6 +428,7 @@ fn installer_build() {
 }
 
 /// 查找 Inno Setup 的命令行编译器 ISCC.exe
+#[cfg(windows)]
 fn find_iscc() -> Option<PathBuf> {
     if let Some(value) = std::env::var_os("ARONA_ISCC") {
         let candidate = PathBuf::from(value);
@@ -283,6 +471,7 @@ fn find_iscc() -> Option<PathBuf> {
 }
 
 /// 从注册表卸载项里读 InstallLocation
+#[cfg(windows)]
 fn reg_install_location(key: &str) -> Option<PathBuf> {
     let output = Command::new("reg")
         .args(["query", key, "/v", "InstallLocation"])
@@ -318,4 +507,221 @@ fn copy_dir(source: &Path, dest: &Path) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+// ==================== Linux 交付包 ====================
+
+/// 宽兼容包的目标三元组：给 glibc 钉一个老基线。
+///
+/// `x86_64-unknown-linux-gnu.2.17` 是 cargo-zigbuild 的写法——目录仍落在基础三元组下，
+/// 但链接时按 glibc 2.17 的符号表走。2.17 是 CentOS 7 / Ubuntu 16.04 时代的水位，
+/// 钉在这条线上意味着**之后所有发行版都能直接跑**，不必关心构建机装的是哪年的系统。
+#[cfg(unix)]
+const COMPAT_TARGET: &str = "x86_64-unknown-linux-gnu.2.17";
+
+/// 构建任务: 在 Linux 上打出两个交付包（仅 Linux）
+///
+///   arona-rs-<版本>-linux-x64.tar.gz         标准包，按构建机的 glibc 基线
+///   arona-rs-<版本>-linux-x64-compat.tar.gz  宽兼容包，glibc 2.17 基线，几乎任何发行版都能跑
+///
+/// ## 为什么是两个包，且都不做「静态」
+///
+/// 静态一度是首选，但它和本项目的基本前提冲突，实测确认了两条死路：
+///
+/// 1. **musl 静态二进制 `dlopen` 不了任何东西**——musl 给静态构建留的桩就是
+///    直接返回 "Dynamic loading not supported"。而框架的全部功能都来自运行期装载的插件，
+///    一个装不了插件的宿主等于什么命令都不响应。
+/// 2. **rustc 不支持 musl 目标的 `cdylib`**（构建时会警告
+///    `dropping unsupported crate type`），插件根本编不出 `.so`，等于把插件作者也堵死。
+///
+/// gnu 的全静态同样走不通：zig 明确拒绝（"libc of the specified target requires
+/// dynamic linking"）。所以两个包都基于 glibc 动态链接——**能装插件是硬前提**。
+///
+/// 两个包的差别落在 glibc 基线上：标准包跟着构建机走，宽兼容包钉 2.17。
+/// 这覆盖了两类真实场景——追新发行版的人拿到的是原生形态，而在老系统 / 各种容器里
+/// 部署的人拿 compat 包即可，不必为了 glibc 版本去升级整个系统。
+///
+/// 兼容包需要 zig + cargo-zigbuild。没有时**不报错**：标准包照常产出，兼容包跳过并说明
+/// 缺什么——构建脚本不该因为少一个可选工具链就让整条流水线红掉。
+#[cfg(unix)]
+#[ignore = "构建任务, 运行: cargo linux-dist"]
+#[test]
+fn linux_dist() {
+    let root = workspace_root();
+    let version = env!("CARGO_PKG_VERSION");
+    println!("[linux-dist] 开始打包 (arona-rs {version})");
+
+    // ---- 1) 标准包：当前主机 target（Linux 上就是 gnu） ----
+    build_release(&root);
+    let exe = finalize_binary(&root);
+    let standard = pack_linux(&root, &exe, version, None);
+    println!("[linux-dist] 标准包: {}", standard.display());
+
+    // ---- 2) 宽兼容包：glibc 2.17 基线 ----
+    if !compat_ready() {
+        eprintln!(
+            "[linux-dist] 跳过宽兼容包：需要 zig + cargo-zigbuild。\n\
+             \x20   cargo install cargo-zigbuild   并装 zig（https://ziglang.org/download）\n\
+             \x20   （只想发标准包时设 ARONA_SKIP_COMPAT=1 直接跳过）"
+        );
+        return;
+    }
+    let compat_exe = build_release_for(&root, Some(COMPAT_TARGET));
+    let compat = pack_linux(&root, &compat_exe, version, Some("compat"));
+    println!("[linux-dist] 宽兼容包: {}", compat.display());
+}
+
+/// 宽兼容包能不能编：只认 zig + cargo-zigbuild 这条路（`glibc.2.17` 是它们提供的）。
+///
+/// 目标三元组本身不需要 `rustup target add`——`x86_64-unknown-linux-gnu.2.17` 用的还是
+/// 基础 gnu target 的 std，版本后缀只在链接阶段生效。
+///
+/// `ARONA_SKIP_COMPAT=1` 可以明确跳过（只想发标准包时用）。
+#[cfg(unix)]
+fn compat_ready() -> bool {
+    if env_flag("ARONA_SKIP_COMPAT") {
+        println!("[linux-dist] ARONA_SKIP_COMPAT 已设置，不构建宽兼容包");
+        return false;
+    }
+    let zig = in_path("zig");
+    if !zig {
+        eprintln!("[linux-dist] 没找到 zig（https://ziglang.org/download）");
+    }
+    let zigbuild = in_path("cargo-zigbuild");
+    if !zigbuild {
+        eprintln!("[linux-dist] 没找到 cargo-zigbuild（cargo install cargo-zigbuild）");
+    }
+    zig && zigbuild
+}
+
+/// 可执行文件在不在 PATH 里
+#[cfg(unix)]
+fn in_path(name: &str) -> bool {
+    std::env::var_os("PATH").is_some_and(|path| {
+        std::env::split_paths(&path).any(|dir| {
+            dir.join(name).is_file() || dir.join(format!("{name}.exe")).is_file()
+        })
+    })
+}
+
+/// 环境变量开关（`1`/`true`/`yes`/`on`）
+#[cfg(unix)]
+fn env_flag(name: &str) -> bool {
+    matches!(
+        std::env::var(name).as_deref(),
+        Ok("1") | Ok("true") | Ok("yes") | Ok("on")
+    )
+}
+
+/// 把一个可执行文件 + 随包字体打成 tar.gz 交付包，返回包路径。
+///
+/// 包内布局就是运行目录本身，用户解压后直接 `./arona-rs`，配置与数据会在当前工作目录
+/// 下自动生成（见 `runtime::paths`）：
+///
+/// ```text
+/// arona-rs-1.2.0-linux-x64/
+///   arona-rs          可执行
+///   fonts/            随包中文字体（出图插件用）
+///   plugins/          空目录：把插件 .so 放这里
+///   README.txt        怎么跑、去哪放插件
+/// ```
+#[cfg(unix)]
+fn pack_linux(root: &Path, exe: &Path, version: &str, flavor: Option<&str>) -> PathBuf {
+    let suffix = match flavor {
+        Some(flavor) => format!("-{flavor}"),
+        None => String::new(),
+    };
+    let package = format!("arona-rs-{version}-linux-x64{suffix}");
+    let staging = target_release_dir(root).join("package").join(&package);
+
+    // 每次重新铺：旧的残留会让包里混进上一次的文件
+    let _ = std::fs::remove_dir_all(&staging);
+    std::fs::create_dir_all(staging.join("plugins"))
+        .unwrap_or_else(|err| panic!("创建 {} 失败: {err}", staging.display()));
+
+    let target_exe = staging.join(program_name());
+    std::fs::copy(exe, &target_exe)
+        .unwrap_or_else(|err| panic!("复制 {} 到暂存目录失败: {err}", exe.display()));
+    set_executable(&target_exe);
+
+    // 字体：与 Windows 便携版同一份（出图插件在 Linux 上同样要用它画字）
+    let fonts_src = root.join("installer").join("fonts");
+    if fonts_src.is_dir() {
+        copy_dir(&fonts_src, &staging.join("fonts"))
+            .unwrap_or_else(|err| panic!("复制 fonts 失败: {err}"));
+    } else {
+        eprintln!("[linux-dist] 缺少 installer/fonts/，包内不含随包中文字体");
+    }
+
+    std::fs::write(staging.join("README.txt"), linux_readme(version, flavor))
+        .unwrap_or_else(|err| panic!("写 README.txt 失败: {err}"));
+
+    // tar -czf <包> -C <package 父目录> <package 目录>
+    // 用系统的 tar 而不是自造归档：它是每个 Linux 都有的，也省得为打包引入依赖
+    let archive = target_release_dir(root).join(format!("{package}.tar.gz"));
+    let _ = std::fs::remove_file(&archive);
+    let status = Command::new("tar")
+        .arg("-czf")
+        .arg(&archive)
+        .arg("-C")
+        .arg(staging.parent().expect("暂存目录一定有父目录"))
+        .arg(&package)
+        .status()
+        .expect("启动 tar 失败（Linux 上应当总是存在）");
+    assert!(status.success(), "tar 打包失败");
+
+    let size = std::fs::metadata(&archive).map(|meta| meta.len()).unwrap_or(0);
+    println!(
+        "[linux-dist] {package}.tar.gz ({:.1} MiB)",
+        size as f64 / 1024.0 / 1024.0
+    );
+    archive
+}
+
+/// 给文件加可执行位（0755）。`std::fs::copy` 会连权限一起复制，但经过暂存目录与 CI
+/// 缓存之后不该指望它，这里显式设一次。
+#[cfg(unix)]
+fn set_executable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755));
+}
+
+/// 包内 README：说清楚怎么跑、插件放哪、两个包有什么区别
+#[cfg(unix)]
+fn linux_readme(version: &str, flavor: Option<&str>) -> String {
+    let kind = match flavor {
+        Some(_) => {
+            "宽兼容包：按 glibc 2.17 基线编译。\n\
+             CentOS 7 / Ubuntu 16.04 及之后的所有发行版都能直接跑，\
+             不必关心是谁在哪台机器上编的。\n\
+             拿不准选哪个就用这个。"
+        }
+        None => {
+            "标准包：按构建机的 glibc 基线编译，是发行版的原生形态。\n\
+             目标机的 glibc 不能比构建机旧；报 `GLIBC_2.xx not found` 就换宽兼容包。"
+        }
+    };
+    format!(
+        "Arona-rs {version} — Linux x64\n\
+         \n\
+         {kind}\n\
+         \n\
+         运行：\n\
+         \x20   ./arona-rs           只启动命令行模式（Linux 版不提供管理面板）\n\
+         \x20   ./arona-rs --config=路径/onebot.yml\n\
+         \n\
+         首次运行会在**当前工作目录**下生成 config/ data/ logs/ plugins/，\n\
+         编辑 config/onebot.yml 填机器人账号与连接方式，config/arona.yml 填服务群与管理员。\n\
+         \n\
+         功能插件是独立的 .so，编译后放进 plugins/ 即可，框架启动时扫描装载。\n\
+         插件必须与框架用同一套工具链构建（rustc 版本、target、profile、链接方式一致），\n\
+         详见 PLUGIN_DEVELOPMENT.md。\n\
+         \n\
+         依赖：只需要系统自带的 glibc。启动时框架会把发行版与内核写进日志，\n\
+         并检查关键动态库；缺了会直接打印各发行版的安装命令，照抄一条即可。\n\
+         \n\
+         按 Ctrl+C 停止。\n\
+         \n\
+         许可证：GNU AGPLv3。\n"
+    )
 }

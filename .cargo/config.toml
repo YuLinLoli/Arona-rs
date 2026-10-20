@@ -20,13 +20,22 @@
 # 发布构建（产物 arona-rs[.exe]）
 build-release = "build --release -p arona-host"
 # 发布构建 + 整理产物: target/release/arona-rs[.exe]（主程序不带版本号, 最终交付推荐）
+# 布局随构建平台自动切换: Windows 带上 softgl/ 与 DXC; Linux 带上 fonts/（Linux 只有命令行版）
 # 注意: 本别名已带全部参数, 请不要再追加参数
 dist = "test -p arona-host dist_build --release -- --ignored --nocapture --test-threads=1"
 # 发布构建 + 打 Windows 安装包: target/release/arona-rs-<version>-setup-win-x64.exe（安装包带版本号）
 # 安装包内含程序介绍与 AGPLv3 全文; softgl/ 大依赖单独打包、安装时释放到安装目录
 # 需要 Inno Setup 6: winget install --id JRSoftware.InnoSetup
+# 仅 Windows 有效; Linux 请用 linux-dist
 # 注意: 本别名已带全部参数, 请不要再追加参数
 installer = "test -p arona-host installer_build --release -- --ignored --nocapture --test-threads=1"
+# 发布构建 + 打两个 Linux 交付包（仅 Linux）:
+#   arona-rs-<version>-linux-x64.tar.gz         标准包, 按构建机的 glibc 基线
+#   arona-rs-<version>-linux-x64-compat.tar.gz  宽兼容包, glibc 2.17 基线, 几乎任何发行版都能跑
+# 两个包都是 glibc 动态链接 —— musl 静态会让 dlopen 失效(装不了插件), 不能用于本项目
+# 兼容包需要 zig + cargo-zigbuild; 缺了只跳过它, 标准包照常产出
+# 注意: 本别名已带全部参数, 请不要再追加参数
+linux-dist = "test -p arona-host linux_dist --release -- --ignored --nocapture --test-threads=1"
 # 发布构建并立即运行
 run-release = "run --release -p arona-host"
 # 构建示例插件（产物 target/release/hello_plugin.dll）：把它拷进运行目录的 plugins/ 再启动框架
@@ -48,3 +57,8 @@ rustflags = ["-C", "target-feature=+crt-static"]
 
 [target.i686-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static"]
+
+# 注意：这里**故意没有**为 Linux 目标写 linker。
+# 标准包用系统自带的链接器；宽兼容包（glibc 2.17）由 cargo-zigbuild 自己接管链接器，
+# 它通过环境变量传递，优先级高于本文件——写死一个 musl-gcc 或 zig 路径只会让
+# 「在别人的机器上构建」这件事多一处会坏的假设。

@@ -194,6 +194,17 @@ pub(crate) async fn run_bot(
         .unwrap_or_else(runtime::paths::default_arona_file);
     let test_notify = args.iter().any(|arg| arg == "--test-notify");
 
+    // 平台体检：把「在什么系统上跑」记进日志，并主动探测关键动态库。缺依赖时点名缺哪个、
+    // 给出各发行版的安装命令——动态加载器那行英文在进程起来之前就打完并退出了，
+    // 根本进不了我们的日志，这一层是用户唯一能在启动输出里看到的线索。
+    runtime::log::info(format!("运行平台: {}", runtime::platform::describe()));
+    let missing = runtime::platform::missing_deps();
+    if !missing.is_empty() {
+        let hint = runtime::platform::install_hint(&missing);
+        runtime::console::eprint_safe(&format!("[Arona] {hint}"));
+        runtime::log::warning(hint);
+    }
+
     runtime::services::set_data_root(runtime::paths::data_root());
 
     // GUI 模式下弹框提示；--nogui 已经有控制台，直接看控制台/日志即可，避免无人值守时被弹框卡住

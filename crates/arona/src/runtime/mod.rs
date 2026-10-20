@@ -21,6 +21,8 @@ pub mod message;
 pub mod paths;
 /// 远端资料的按需读缓存（群成员/陌生人），挂在框架实例上
 pub mod peers;
+/// 平台体检：发行版信息与运行期动态库依赖（Linux 上是实活，其它平台是空实现）
+pub mod platform;
 /// 执行次序（事件监听与命令匹配共用）
 pub mod priority;
 /// 过期数据清理：框架统一排期与播报，插件只交删除动作
