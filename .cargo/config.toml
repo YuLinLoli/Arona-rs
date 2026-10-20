@@ -34,8 +34,13 @@ installer = "test -p arona-host installer_build --release -- --ignored --nocaptu
 #   arona-rs-<version>-linux-x64-compat.tar.gz  宽兼容包, glibc 2.17 基线, 几乎任何发行版都能跑
 # 两个包都是 glibc 动态链接 —— musl 静态会让 dlopen 失效(装不了插件), 不能用于本项目
 # 兼容包需要 zig + cargo-zigbuild; 缺了只跳过它, 标准包照常产出
+#
+# **`--no-default-features` 是必需的, 不是可选项**: 开了 gui 就会拉 eframe/wgpu,
+# 而 winit 在 Linux 上要求 x11 或 wayland feature, 本项目的 eframe 是 default-features=false,
+# 于是 Linux 上编 GUI 会直接 compile_error!("The platform you're compiling for is not supported
+# by winit")。Linux 版本来就不交付 GUI, 这一档必须关掉。
 # 注意: 本别名已带全部参数, 请不要再追加参数
-linux-dist = "test -p arona-host linux_dist --release -- --ignored --nocapture --test-threads=1"
+linux-dist = "test -p arona-host --no-default-features linux_dist --release -- --ignored --nocapture --test-threads=1"
 # 发布构建并立即运行
 run-release = "run --release -p arona-host"
 # 构建示例插件（产物 target/release/hello_plugin.dll）：把它拷进运行目录的 plugins/ 再启动框架

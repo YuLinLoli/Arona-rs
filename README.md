@@ -442,7 +442,17 @@ cargo build-plugin       # 构建仓库里的示例插件: target/release/hello_
 | Linux | `arona-rs`（ELF）+ `fonts/` | `cargo linux-dist` → 标准包 + 宽兼容包两个 `tar.gz` |
 
 Linux 构建自动带 `--no-default-features`（不编 eframe/wgpu），所以整条链路不需要 X11、Wayland、
-OpenGL 或任何图形库。`cargo linux-dist` 的宽兼容包需要一套能生成老 glibc 的工具链：
+OpenGL 或任何图形库。**在 Linux 上手动跑 cargo 命令时也必须带上这个标志**——本项目的 eframe 是
+`default-features = false`，而 winit 在 Linux 上要求 `x11`/`wayland` feature，不加就会得到一句
+`compile_error!("The platform you're compiling for is not supported by winit")`：
+
+```bash
+cargo build --release -p arona-host --no-default-features   # Linux 上正确
+cargo test  -p arona-host --no-default-features             # 同上
+cargo linux-dist                                            # 别名里已经带好了
+```
+
+`cargo linux-dist` 的宽兼容包需要一套能生成老 glibc 的工具链：
 
 ```bash
 cargo install cargo-zigbuild        # 交叉工具链包装

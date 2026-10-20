@@ -247,8 +247,13 @@ jobs:
         run: cargo test --release --workspace --no-default-features
 
       # 等价于 cargo linux-dist：出标准包 + 宽兼容包两个 tar.gz
+      #
+      # `--no-default-features` 必须带上：开了 gui 就会拉 eframe/wgpu，而 winit 在 Linux 上
+      # 要求 x11/wayland feature，本项目的 eframe 是 default-features=false，于是这一档会
+      # 直接吃一句 compile_error!("The platform you're compiling for is not supported by winit")。
+      # Linux 版本来就不交付 GUI（`Test` 那步也是这么跑的）。
       - name: Build Linux packages
-        run: cargo test -p arona-host linux_dist --release -- --ignored --nocapture --test-threads=1
+        run: cargo test -p arona-host --no-default-features linux_dist --release -- --ignored --nocapture --test-threads=1
 
       # 两个包必须都在。linux_dist 在工具链缺失时会**静默跳过**兼容包（本地开发时这是
       # 友好的），但发布流水线上少一个包就是事故，所以这里显式要求两个都在。
