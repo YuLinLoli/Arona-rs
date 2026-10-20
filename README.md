@@ -36,7 +36,7 @@ Linux 版不链接任何图形库，所以服务器、容器、无桌面环境�
 ## 框架与插件的分工
 
 ```
-arona-host（宿主 exe）──▶ arona（框架库）◀── 功能插件（独立 crate，编译成 dll，实现 AronaPlugin）
+arona-host（宿主可执行）──▶ arona（框架库）◀── 功能插件（独立 crate，编译成动态库，实现 AronaPlugin）
                                               │
                               启动前放进 plugins/，框架扫描 + ABI 握手后装载
 ```
@@ -54,15 +54,15 @@ arona-host（宿主 exe）──▶ arona（框架库）◀── 功能插件�
 | 定时任务内核（每天/间隔/单次/延时） | 排自己的任务 |
 | 管理面板 GUI、日志、提权、渲染后端降级 | ——（不参与 GUI） |
 
-框架**不依赖任何插件**，插件单向依赖框架，产物永远是同一个 exe：装了几个插件、装的是哪几个，
-只取决于运行目录的 `plugins/` 里放了哪些 dll。一个插件都没有时，连上 QQ 之后收得到消息，
+框架**不依赖任何插件**，插件单向依赖框架，产物永远是同一个可执行文件：装了几个插件、装的是哪几个，
+只取决于运行目录的 `plugins/` 里放了哪些动态库。一个插件都没有时，连上 QQ 之后收得到消息，
 但没有任何命令会被响应（连 `/帮助` 都没有）。
 
 ## 能力细节
 
 - **只做 OneBot 11**：正向 WebSocket / 反向 WebSocket / 正向 HTTP / 反向 HTTP 四种连接，
   同一类型可配多个实例，可直接对接 NapCat、Lagrange、LLOWeb 等实现端。
-- **插件放在目录里就行**：没有 JVM、没有 Mirai 控制台；启动前把插件 dll 丢进运行目录的 `plugins/`，
+- **插件放在目录里就行**：没有 JVM、没有 Mirai 控制台；启动前把插件动态库丢进运行目录的 `plugins/`，
   框架扫描、做工具链握手、装载装配，和 mirai 的 `plugins/` 用法一致。功能包的增删**不重新编译框架**。
 - **聊天记录留档**：QQ 的引用只认实现端缓存里的近期消息，久了就引用不到。框架因此自己记一份
   聊天数据（图片只存原链接），供插件做引用回复与按存储 id 的撤回；保留天数与清理间隔可配。
@@ -71,8 +71,12 @@ arona-host（宿主 exe）──▶ arona（框架库）◀── 功能插件�
 - **控制台彩色输出**：Windows 下走原生 `SetConsoleTextAttribute`，cmd.exe（经典 conhost）、PowerShell、
   Windows Terminal 都能正常上色，不依赖 VT；其他平台走 ANSI。检测到 `NO_COLOR` 或输出被重定向时
   自动降级为纯文本，不会漏出转义码。
-- **免安装依赖**：MSVC 运行库静态链接进 exe，`d3dcompiler_47.dll` / `opengl32.dll` 走延迟加载，
+- **免安装依赖**（Windows）：MSVC 运行库静态链接进 exe，`d3dcompiler_47.dll` / `opengl32.dll` 走延迟加载，
   着色器编译器用随包的 DXC（没有就降回系统 FXC），目标机什么都不用装。
+- **依赖自检**（Linux）：启动时把发行版与内核写进日志，并逐个探测关键动态库；缺哪个就点名哪个，
+  附上 apt / dnf / pacman / apk 各一条安装命令。动态加载器报错发生在进程进入 `main` 之前，
+  那些英文根本进不了日志，这一层是唯一能让用户看见原因的出口。
+  两个 Linux 包只需要系统自带的 glibc，不需要 OpenSSL（TLS 走 rustls）。
 
 ## 快速开始
 
@@ -318,19 +322,23 @@ chatlog:
     LICENSE-SourceHanSerif.txt     它的许可证全文
   logs/                    按天滚动的日志
   plugins/
-    <插件>.dll              功能插件本体：启动前放这里（放进一级子目录也认），框架扫描装载
-    _…                      以 `_` 开头的 dll 当作第三方运行库跳过，不会被当插件装载
+    <插件>.dll / .so        功能插件本体：启动前放这里（放进一级子目录也认），框架扫描装载
+    _…                      以 `_` 开头的动态库当作第三方运行库跳过，不会被当插件装载
     <插件>/plugin.yml       插件清单（id / 名称 / 版本 / 依赖），装载时由框架按插件上报的元信息写出
 ```
 
-`plugins/` 是**装载目录**，`plugins/<插件>/` 是插件的**身份目录**：框架每装载一个 dll，就按它上报的
-元信息写出或刷新 `plugins/<id>/plugin.yml`，并顺手备好 `config/<id>/` 与 `data/<id>/`，
-用户数据一律按 id 归到这两处。删掉 dll 只是下次启动不再装载，身份目录与用户数据不会跟着消失。
+> 插件动态库的扩展名按运行平台认：Windows 是 `.dll`、Linux 是 `.so`（macOS 上的 `.dylib` 同理）。
+> 同一台机器上只放对应平台的那份——**Windows 编出的 `.dll` 在 Linux 上加载不了，反之亦然**，
+> 因为 ABI 指纹里带着目标三元组与 CRT 链接方式。
 
-`fonts/` 是**随包中文字体**（安装包与便携 zip 都带）。过去 GUI 与每个出图插件各自去系统目录猜一份中文字体，
+`plugins/` 是**装载目录**，`plugins/<插件>/` 是插件的**身份目录**：框架每装载一个动态库，就按它上报的
+元信息写出或刷新 `plugins/<id>/plugin.yml`，并顺手备好 `config/<id>/` 与 `data/<id>/`，
+用户数据一律按 id 归到这两处。删掉插件文件只是下次启动不再装载，身份目录与用户数据不会跟着消失。
+
+`fonts/` 是**随包中文字体**（Windows 安装包、便携 zip 与 Linux 两个包都带）。过去 GUI 与每个出图插件各自去系统目录猜一份中文字体，
 结果是"这台机器装了才有、没装就画不出字"，而且每台机器的字都不一样，观感没法验收。现在框架把这一份
 交给所有要画字的地方（`arona::runtime::text`），面板上的字和插件画在图上的字是同一套。
-**字节在进程里也只有一份**：宿主读一次、常驻一份，经上行通道借给每个插件 dll，面板借用同一份而不另拷——
+**字节在进程里也只有一份**：宿主读一次、常驻一份，经上行通道借给每个插件动态库，面板借用同一份而不另拷——
 三个出图插件加面板过去各存一份 11 MB，现在合起来就一份。
 想换成别的字体：把自己那份放进 `fonts/`，按文件名里带 `Regular` / `Bold` 命名（大小写无关，`.otf`/`.ttf`/`.ttc` 都认）即可；
 这一目录空着或没有带字重的那两份，程序与插件退回系统字体目录，**功能不受影响**。
@@ -429,7 +437,7 @@ cargo run-nogui          # 以纯命令行(黑窗口)模式运行
 cargo build-nogui        # 精简命令行版: 不含 GUI(--no-default-features)
 cargo installer          # 发布构建 + 打 Windows 安装包（仅 Windows）
 cargo linux-dist         # 发布构建 + 打两个 Linux 交付包（仅 Linux）
-cargo build-plugin       # 构建仓库里的示例插件: target/release/hello_plugin[.so]
+cargo build-plugin       # 构建仓库里的示例插件: target/release/hello_plugin.dll（Linux: libhello_plugin.so）
 ```
 
 这些是 `.cargo/config.toml` 里的别名，框架侧的都固定打在 `-p arona-host` 上，也可以直接写全命令。
@@ -473,15 +481,19 @@ cargo install cargo-zigbuild        # 交叉工具链包装
 ```bash
 # 1. 构建框架（一次即可，之后换插件不用重编）
 cargo build-release
+# Linux 上记得带 --no-default-features（见上文「构建与交付」）
 
 # 2. 构建示例插件（或任何第三方插件 crate）
-cargo build-plugin                                       # → target/release/hello_plugin.dll（Linux: .so）
+cargo build-plugin                                       # → target/release/hello_plugin.dll（Linux: libhello_plugin.so）
 
 # 3. 把插件库放进运行目录的 plugins/，再启动框架
 mkdir -p target/release/plugins
-cp target/release/hello_plugin.dll target/release/plugins/
+cp target/release/hello_plugin.dll target/release/plugins/     # Linux 上是 libhello_plugin.so
 cargo run-release
 ```
+
+Linux 上编出来的文件名带 `lib` 前缀（`libhello_plugin.so`），这是 cargo 的默认命名，放进去照样认——
+框架只看扩展名，不要求文件名与插件 id 一致。
 
 日志里会依次出现「已装载动态插件: <名字> <版本> (<文件名>)」与「插件已启动: …」；
 工具链对不上时会打印「跳过插件 …」并说明差在哪一项。
@@ -531,13 +543,22 @@ pwsh -File scripts/make-icon.ps1     # 从 assets/source 的立绘取上半部�
 | `arona-rs-<版本号>-linux-x64.tar.gz` | Linux 标准包：`arona-rs` + `fonts/` + 空的 `plugins/`，按构建机 glibc 基线 |
 | `arona-rs-<版本号>-linux-x64-compat.tar.gz` | Linux 宽兼容包：同样的布局，glibc 基线钉在 2.17，老发行版也能跑 |
 
-Linux 那条流水线在出包前会做两道校验：解开包 `timeout 8 ./arona-rs --nogui` 确认它真的能起来
-并打出平台体检输出；再用 `objdump -T` 扫一遍宽兼容包的最高 glibc 符号，超过 2.17 就直接失败
-——那说明 zigbuild 的目标后缀没生效，包拿到老系统上会当场炸。
+`Publish` 这一步 `needs: [Build, LinuxBuild]`——**任何一个平台失败都不会发出半个版本**。
+
+Linux 那条流水线在出包前会做两道硬校验：解开包 `timeout 8 ./arona-rs --nogui` 确认它真的能起来
+并打出平台体检输出（不是"编过了就算"）；再用 `objdump -T` 扫一遍宽兼容包的最高 glibc 符号，
+超过 2.17 就直接失败——那说明 zigbuild 的目标后缀没生效，包拿到老系统上会当场炸。
+另外还会断言两个包都确实产出了，防止工具链缺失时"静默少发一个"。
 
 裸 `arona-rs.exe` 只是构建中间产物（本地 `cargo dist` 产出、安装包与 zip 都从它取材），
-不单独上传到 Release。体积参考：含 GUI 的主程序 exe 约 19 MB，`--no-default-features` 的精简命令行版约 10 MB；
-Linux 两个包里的主程序都是约 7.8 MB。
+不单独上传到 Release。体积参考：
+
+| 产物 | 大小 |
+| --- | --- |
+| 含 GUI 的主程序 exe | 约 19 MB |
+| `--no-default-features` 的精简命令行版 | 约 10 MB |
+| Linux 主程序（两种包相同） | 约 7.8 MB |
+| Linux 两个 tar.gz（大头是 23 MB 随包字体） | 23.2 / 22.9 MB |
 
 ### 验证
 
@@ -546,7 +567,7 @@ cargo test --workspace                 # 离线单测（动态装载与 ABI 握�
 cargo test --release --workspace       # CI 口径
 cargo clippy --workspace --all-targets # 框架侧 error 级必须清零
 cargo fmt --all
-cargo build-plugin                     # 示例插件编成动态库，产物 target/release/hello_plugin[.so]
+cargo build-plugin                     # 示例插件编成动态库，产物 target/release/hello_plugin.dll（Linux: libhello_plugin.so）
 ```
 
 ## 仓库结构
@@ -560,33 +581,36 @@ crates/arona/            框架库
   runtime/   命令表与参数类型系统、事件优先级、配置、日志、聊天记录缓存、清理内核、消息模型
   config/    框架配置 arona.yml、协议配置 onebot.yml、插件配置区与模板生成
   plugin/    插件契约：生命周期编排、登记交接面、作用域回收、健康度
-             abi/（导出符号与工具链指纹）dynamic/（扫描 plugins/ 装载 dll）
+             abi/（导出符号与工具链指纹）dynamic/（扫描 plugins/ 装载动态库）
   framework/ 注册表的宿主实例（对齐 mirai 的 MiraiInstance）
   container/ 插件间共享能力的服务容器
   quartz/    定时任务内核   services/ 服务开关表   admin/ 管理与诊断接口   gui/ 管理面板
   assets/    GUI 内嵌的品牌图 arona.png（放在 crate 目录内才进得了 crates.io 的包）
-crates/arona-host/       宿主可执行：产物 bin = arona-rs，里面没有任何功能插件
+crates/arona-host/       宿主可执行：产物 bin = arona-rs[.exe]，里面没有任何功能插件
   build.rs   只把图标与清单编进 Windows 产物（不再生成插件注册代码）
   src/main.rs  一行 arona::run(args)
-plugins/hello/           插件开发示例（编译成 dll）：命令 / 事件钩子 / 出站钩子 / 类型化配置 / 每日任务
+plugins/hello/           插件开发示例（编译成动态库）：命令 / 事件钩子 / 出站钩子 / 类型化配置 / 每日任务
 assets/                  程序图标（arona.ico）、arona.manifest、源立绘（source/）；GUI 用的 arona.png 在 crates/arona/assets/
-scripts/                 make-icon.ps1、fetch-dxc.ps1、fetch-softgl.ps1
-installer/               Windows 安装包：arona-rs.iss、intro.txt、defaults/（默认配置模板）、languages/
+scripts/                 make-icon.ps1、fetch-dxc.ps1、fetch-softgl.ps1（后两个是 Windows 渲染运行库相关）
+installer/               Windows 安装包：arona-rs.iss、intro.txt、defaults/（默认配置模板）、fonts/（随包字体）、languages/
 ```
 
 `plugins/hello/` 是**跟框架同仓存放的开发样例**，不被宿主依赖、不进安装包；
-真实的功能插件由各自的仓库分发，交付物就是编译好的 dll。
+真实的功能插件由各自的仓库分发，交付物就是编译好的动态库。
+
+`installer/fonts/` 是随包中文字体，三个交付形态都会用到它：Windows 安装包由 Inno Setup 释放、
+便携 zip 并入、Linux 两个包由 `cargo linux-dist` 复制进包内。
 
 ## 写一个插件
 
-插件是一个**独立 crate**，编译成 dll 交付。以框架库为依赖（发布名 `arona-rs`、库名仍是 `arona`，
+插件是一个**独立 crate**，编译成动态库交付（Windows `.dll` / Linux `.so`）。以框架库为依赖（发布名 `arona-rs`、库名仍是 `arona`，
 所以源码照旧 `use arona::…`；依赖声明里**务必**带上 `default-features = false`，别让 GUI 顺着依赖扩散），
 实现 `AronaPlugin` 并用一个宏导出四个 C 符号（ABI 号、工具链指纹、宿主上行通道、造实例）：
 
 ```toml
 # Cargo.toml
 [lib]
-crate-type = ["cdylib", "rlib"]   # cdylib 出 dll；rlib 那份只给 cargo test 用
+crate-type = ["cdylib", "rlib"]   # cdylib 出动态库；rlib 那份只给 cargo test 用
 
 [dependencies]
 arona = { package = "arona-rs", version = "1.2.0", default-features = false }
@@ -608,10 +632,15 @@ impl AronaPlugin for MyPlugin {
 arona::export_arona_plugin!(MyPlugin);
 ```
 
-编译出的 dll 放进框架运行目录的 `plugins/`，下次启动框架就会扫描、握手并装载它 ——
+编译出的动态库放进框架运行目录的 `plugins/`，下次启动框架就会扫描、握手并装载它 ——
 **框架不需要重新编译，也不需要知道你的插件存在**。命令怎么登记、事件怎么按子类订阅、
 配置区怎么声明、停用后框架回收哪些东西、工具链必须对齐哪几项，逐条写在
 [PLUGIN_DEVELOPMENT.md](PLUGIN_DEVELOPMENT.md)；`plugins/hello/` 是这些接口的可编译样例。
+
+> **平台跟着宿主走**：插件与宿主在同一个进程里交换 Rust 对象，所以必须同工具链同目标平台。
+> 要给 Linux 版装插件，就得在 Linux 上编一份 `.so`——在 Windows 上交叉编出来的那份，
+> 指纹里的 `host` 字段对不上，会被握手拒载。代码本身通常不用改：仓库里的示例插件
+> 零改动就能在 Linux 下编出 `libhello_plugin.so`。
 
 ## 疑难排查
 

@@ -1239,6 +1239,8 @@ ctx.clear_all_rows();       // 全摘（一般用不上：插件被停用时框�
    ```
 
    CRT 口径不同会让两边各带一份运行库，跨模块分配/释放内存直接炸；框架的握手也会在这里拒载。
+   **Linux 侧不用抄这段**：那里没有 CRT 静态链接这回事（musl 静态又不能 `dlopen`，本项目不采用），
+   指纹里的 `crt-static` 自然是 `0`，与 Linux 宿主一致即可。
 2. 实现 `AronaPlugin`（`meta` 必填 id + name + version）。
 3. 在 `src/lib.rs` 末尾导出一行入口：
 
@@ -1337,6 +1339,10 @@ cargo fmt --all
 本地运行若被提权逻辑拦住，用 `ARONA_NO_ELEVATE=1` 绕过。
 
 GUI 相关的落地细节（改动前务必先读）：
+- **Linux 版不含 GUI**：`cargo build -p arona-host --no-default-features`，此时 eframe/wgpu 整个
+  不参与编译，也就不依赖任何图形库。注意 Linux 上**必须**带这个标志——本项目的 eframe 是
+  `default-features = false`（不引 x11/wayland），开了 gui 去编会直接得到
+  `compile_error!("The platform you're compiling for is not supported by winit")`。
 - Windows 下含 GUI 的构建带 `#![windows_subsystem = "windows"]`，**不弹控制台**；命令行模式由
   `runtime/console.rs` 接回上级终端或另建控制台。核对产物可看 PE 头 subsystem：GUI 版应为 2，
   `--no-default-features` 版应为 3。
@@ -1838,6 +1844,18 @@ tokio 也被静态链接成了两份，而"当前在哪个运行时里"这个上
 构建工具链：rustc 1.98.0，x86_64-pc-windows-msvc，--release，crt-static
 下载后放进 <框架运行目录>/plugins/<你的id>/，重启框架
 ```
+
+Linux 版把第二行换成那台机器自己的三元组（形如 `x86_64-unknown-linux-gnu`、`crt-static/0`）：
+
+```
+适用于 Arona-rs 1.2.0（框架契约 1.0.0，符号布局 10）
+构建工具链：rustc 1.98.0，x86_64-unknown-linux-gnu，--release
+下载后放进 <框架运行目录>/plugins/<你的id>/，重启框架
+```
+
+**要同时支持两个平台就发两个文件**（`xxx.dll` 与 `libxxx.so`），别指望一份跨平台——
+`.dll` 是 PE、`.so` 是 ELF，Linux 的 `dlopen` 加载不了前者；而且指纹里的
+`target`/`host`/`crt-static` 三项必然不同。
 
 第二行的版本号要和 `rust-toolchain.toml` 里那一行对得上。符号布局号抄 `arona::plugin::abi::ABI_LAYOUT`
 当轮的值：它和工具链版本号一样是"差一个就不该混用"，而宿主报的永远是它自己那一份。第三件事别偷懒写成"任意 rustc
