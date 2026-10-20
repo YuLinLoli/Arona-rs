@@ -420,7 +420,7 @@ fn status_chip(ui: &mut egui::Ui, mem: Option<u64>) {
                 .selectable(false),
             )
             .on_hover_text(
-                "框架进程自己的工作集内存（与任务管理器「内存」同一口径），每 5 秒采样一次",
+                "框架进程自己的专用工作集——与任务管理器「进程 → 内存」同一口径，每 5 秒采样一次",
             );
         }
     });
