@@ -661,9 +661,8 @@ fn compat_ready() -> bool {
 #[cfg(unix)]
 fn in_path(name: &str) -> bool {
     std::env::var_os("PATH").is_some_and(|path| {
-        std::env::split_paths(&path).any(|dir| {
-            dir.join(name).is_file() || dir.join(format!("{name}.exe")).is_file()
-        })
+        std::env::split_paths(&path)
+            .any(|dir| dir.join(name).is_file() || dir.join(format!("{name}.exe")).is_file())
     })
 }
 
@@ -733,7 +732,9 @@ fn pack_linux(root: &Path, exe: &Path, version: &str, flavor: Option<&str>) -> P
         .expect("启动 tar 失败（Linux 上应当总是存在）");
     assert!(status.success(), "tar 打包失败");
 
-    let size = std::fs::metadata(&archive).map(|meta| meta.len()).unwrap_or(0);
+    let size = std::fs::metadata(&archive)
+        .map(|meta| meta.len())
+        .unwrap_or(0);
     println!(
         "[linux-dist] {package}.tar.gz ({:.1} MiB)",
         size as f64 / 1024.0 / 1024.0

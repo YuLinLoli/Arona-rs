@@ -2931,7 +2931,9 @@ fn wgpu_options(flavor: WgpuFlavor) -> eframe::egui_wgpu::WgpuConfiguration {
 /// limits，`max_texture_dimension_2d` 抬到 8192 以便 4K 屏下建出够大的面纹理——
 /// 这两条与内存无关，动它会改掉既有后端的行为。那份默认闭包是**拷过来**的，egui 升级时
 /// 若改了它，`the_panel_device_descriptor_only_relaxes_memory_hints` 会先报出来。
-fn chip_friendly_device(adapter: &eframe::wgpu::Adapter) -> eframe::wgpu::DeviceDescriptor<'static> {
+fn chip_friendly_device(
+    adapter: &eframe::wgpu::Adapter,
+) -> eframe::wgpu::DeviceDescriptor<'static> {
     panel_device_descriptor(adapter.get_info().backend)
 }
 

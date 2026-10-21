@@ -784,7 +784,8 @@ mod tests {
                 manager.find("DependStale").unwrap().state(),
                 PluginState::Failed(_)
             ),
-            "install 失败的插件不该被运行期开关重新拉起"        );
+            "install 失败的插件不该被运行期开关重新拉起"
+        );
         assert_eq!(manager.active_ids().len(), 2);
 
         for id in ["DependChild", "DependParent", "DependStale"] {

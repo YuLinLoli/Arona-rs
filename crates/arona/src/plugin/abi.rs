@@ -664,7 +664,14 @@ mod tests {
             "指纹不该再以 arona 版本开头: {TOOLCHAIN_FINGERPRINT}"
         );
         // 该有的几项一个都不能少
-        for key in ["rustc/", "host/", "target/", "profile/", "crt-static/", "features/"] {
+        for key in [
+            "rustc/",
+            "host/",
+            "target/",
+            "profile/",
+            "crt-static/",
+            "features/",
+        ] {
             assert!(
                 TOOLCHAIN_FINGERPRINT.contains(key),
                 "指纹缺少 {key}: {TOOLCHAIN_FINGERPRINT}"

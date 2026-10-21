@@ -33,7 +33,10 @@ pub struct MissingDep {
 /// 进程根本起不来，任何检查代码都没机会执行；能跑到这里就说明它在。
 const WATCHED: &[(&str, &[&str])] = &[
     // 栈展开（panic 时打印回溯、以及 Rust 的 unwind 路径）要用它
-    ("libgcc_s.so.1", &["libgcc", "libgcc1", "gcc-libs", "libgcc_s1"]),
+    (
+        "libgcc_s.so.1",
+        &["libgcc", "libgcc1", "gcc-libs", "libgcc_s1"],
+    ),
     // 数学库：image/字体排版等路径会用到
     ("libm.so.6", &["libc6", "glibc", "libc"]),
     // dlopen 与被插件装载强相关（新版 glibc 已并入 libc，但老系统上是独立库）
@@ -147,8 +150,14 @@ pub fn install_hint(missing: &[MissingDep]) -> String {
             .join("、"),
     );
     text.push_str("\n  装上其中一个即可：");
-    text.push_str(&format!("\n    Debian/Ubuntu: sudo apt install {}", debian.join(" ")));
-    text.push_str(&format!("\n    Fedora/RHEL:   sudo dnf install {}", fedora.join(" ")));
+    text.push_str(&format!(
+        "\n    Debian/Ubuntu: sudo apt install {}",
+        debian.join(" ")
+    ));
+    text.push_str(&format!(
+        "\n    Fedora/RHEL:   sudo dnf install {}",
+        fedora.join(" ")
+    ));
     text.push_str(&format!(
         "\n    Arch:          sudo pacman -S {}",
         names.join(" ")
