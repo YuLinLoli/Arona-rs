@@ -30,7 +30,7 @@ plugins/hello/             # 示例插件：name=hello-plugin, crate-type=["cdyl
 框架启动时扫描装载（§22）。
 
 版本约定：框架与 host 同为 `1.2.0`，插件版本号各自演进。
-**插件接口的破坏性改动抬 `arona::plugin::FRAMEWORK_API_VERSION`**（与 crate 版本号无关），见 §6；
+**插件接口的破坏性改动抬 `arona::plugin::abi::ABI_LAYOUT`**（与 crate 版本号无关），见 §6；
 **插件会读的那个类型换了布局**（`Framework`、`CommandContext`、`EventBody`、`BodyFilter`、`OneBotApi`
 这些，加字段/加变体/改字段类型）另抬 `arona::plugin::abi::ABI_LAYOUT`（当前 `9`），见 §22。
 
@@ -105,7 +105,7 @@ arona-host ──depends──▶ arona（框架）──启动时扫描──�
 | `MiraiInstance.reference()` 拿到的那套全局注册表 | `arona::framework::Framework::global()`（进程默认实例）/ `Framework::new()`（隔离实例），持有下面所有表 | `framework.rs` |
 | `PluginManager.loadPlugin / enablePlugin / disablePlugin` | `arona::plugin::PluginManager` + `install_all` / `configure_all` / `start_all` / `disable` / `stop_all` | `crates/arona/src/plugin/manager.rs` |
 | jar 内 `plugin.yml`（`PluginDescriptor`） | `PluginMeta` → 框架渲染成 `plugins/<id>/plugin.yml` | `plugin/description.rs` |
-| `ApiVersion.isCompatibleWith`（主版本相等 + 框架次版本不低于要求） | `ApiVersion::satisfies` + `check_api` 握手 | 同上 + `manager.rs` |
+| `ApiVersion.isCompatibleWith`（主版本相等 + 框架次版本不低于要求） | **不设契约版本号**：能否装载只看 `abi::ABI_LAYOUT` 与工具链指纹（见 §22） | `plugin/abi.rs` |
 | `plugin.depend` / `softDepend` | `PluginMeta::depends` / `soft_depends`，`PluginManager::ordered()` 拓扑排序 | `manager.rs` |
 | `CommandManager.registerCommand` | `ctx.command(..)` / `ctx.commands(..)`，按框架实例持有、条目带插件归属 | `runtime/dispatcher.rs` |
 | `commandRegistry { string("...") int("分钟") optional() }`（`ArgParserCombinationDSL`） | `CommandRegistration::with_args(vec![arg::i64("分钟").optional() ..])`，缺参/类型错的用法回显由框架给 | `runtime/args.rs` |
@@ -166,8 +166,8 @@ arona-host ──depends──▶ arona（框架）──启动时扫描──�
    `plugins/`（连同它的一级子目录）里的每个 dll，逐个 `LoadLibrary` → ABI 与工具链指纹握手 →
    取出实例，以 `loader: dynamic` 记进插件表；**单个文件握手失败只记一条日志，不影响其余插件**。
    然后按依赖拓扑序逐个插件：
-   建好 `plugins/<id>/`、`config/<id>/`、`data/<id>/` 并写 `plugins/<id>/plugin.yml` → **契约版本握手**
-   （不兼容即标 `Failed`，不跑 install）→ 调 `install(&PluginRegistrar)`：插件在此登记功能开关与配置区，
+   建好 `plugins/<id>/`、`config/<id>/`、`data/<id>/` 并写 `plugins/<id>/plugin.yml` → 调
+   `install(&PluginRegistrar)`：插件在此登记功能开关与配置区，
    使生成的配置模板认得这些键、注释里带完整功能清单。
    **install 阶段不过滤被禁用的插件**——否则 GUI 列不出它、模板也会丢掉它的配置块。
 2. 加载 `config/arona.yml`（框架业务配置，含热更新）与 `config/onebot.yml`（协议配置）。
@@ -222,7 +222,7 @@ pub trait AronaPlugin: Send + Sync + 'static {
 `version` 建议直接取 `env!("CARGO_PKG_VERSION")`，与 crate 版本保持一致：
 
 ```rust
-use arona::plugin::{ApiVersion, PluginMeta};
+use arona::plugin::PluginMeta;
 
 fn meta(&self) -> PluginMeta {
     PluginMeta::new(
@@ -232,7 +232,6 @@ fn meta(&self) -> PluginMeta {
         "语音房管理：排队上麦、静音、房管投票",
     )
     .with_author("你的名字")
-    // .requires_api(ApiVersion::new(1, 1, 0))          // 用到比当前框架新的接口时才抬
     // .depends_on(&["core-data"])                      // 硬依赖：任一缺失/停用则本插件不装配
     // .soft_depends_on(&["gacha"])                     // 软依赖：只决定装配先后，缺了照样跑
     // .with_group_scoped(false)                        // 纯私聊插件：声明自己不按群生效
@@ -252,11 +251,10 @@ fn meta(&self) -> PluginMeta {
 `group_settings.<群号>.disabled_plugins` 全都用它。**改名等于换一份用户数据，定下来就别动。**
 匹配时大小写不敏感。
 
-**契约版本握手**（mirai 的 `ApiVerification`）：框架启动时对每个插件比一次
-`FRAMEWORK_API_VERSION.satisfies(&meta.api_version)`，规则是**主版本号必须相等、框架次版本不低于要求**
-（框架只加能力不删能力，所以要求低版本的插件在新框架上照常跑）。不通过的插件标 `Failed`、不跑 `install`，
-日志写清"要求 api x.y.z，本程序提供 api a.b.c"。默认要求的正是当前契约版本，所以绝大多数插件不用管。
-握手失败的插件**不会被运行期的开关重新拉起**（它恒为"不生效"），只能靠改代码/升框架解决。
+**插件能不能装进来，只看符号布局号与工具链指纹**（§22）。这里没有契约版本号那一层：
+接口的破坏性改动用抬 `ABI_LAYOUT` 表达，装载时对不上就拒载并写清两边的数字。
+install 阶段自身失败的插件标 `Failed`，**不会被运行期的开关重新拉起**——它恒为"不生效"，
+只能靠改代码/换一份匹配的框架解决。
 
 **依赖解析**：`PluginManager::ordered()` 对 `depends + soft_depends` 做拓扑排序（依赖在前，同层保持清单顺序，
 结果稳定）。成环的插件全部标 `Failed("插件依赖成环…")`。`depends` 是硬约束：被依赖者没编译进来、
@@ -281,7 +279,7 @@ fn meta(&self) -> PluginMeta {
 
 这些接口都顺手 `create_dir_all`（`install_all()` 阶段已先建好三件套），插件取到路径就能直接写。
 `plugins/<id>/plugin.yml` 是框架自动生成的 mirai 风格清单
-（`id/name/version/author/description/apiVersion/loader/depends/softDepends/groupScoped/config/data/image`），
+（`id/name/version/author/description/apiLayout/loader/depends/softDepends/groupScoped/config/data/image`），
 `plugins/<id>/` 是推荐投放位置：dll 本身放这里，随包资源也放这里，
 `plugin.yml` 由框架按插件上报的元信息渲染出来（§22）。
 
@@ -1227,7 +1225,7 @@ ctx.clear_all_rows();       // 全摘（一般用不上：插件被停用时框�
 
    另两条口径：`serde_json` 框架**不 re-export**，插件要自己 `json!(...)` 就得直依赖。它并非"只在自己家里用"——
    卡片段 `MessageSegment::Json(Value)` / `Xml(Value)` 与兜底段 `Raw { data: Value }` 装的就是这个类型，
-   于是它会跨过 dll 边界。握手核对的五项（§22）**不看**第三方 crate 版本，所以请自己跟框架同大版本
+   于是它会跨过 dll 边界。握手核对的那几项（§22）**不看**第三方 crate 版本，所以请自己跟框架同大版本
    （根 `Cargo.toml` 里是 `serde_json = "1"`）；两边版本差出布局就是两份不同的 `Value`，编译器不会拦。
    `reqwest` **不要装**，出站一律走 `arona::runtime::http`（§14.1）。
 
@@ -1267,7 +1265,7 @@ ctx.clear_all_rows();       // 全摘（一般用不上：插件被停用时框�
 装载成功的标志是这三行日志：
 
 ```
-[Arona] 插件 ABI 握手通过: 布局 9，契约 1.0.0
+[Arona] 插件 ABI 握手通过: 布局 10
 [Arona] 已装载动态插件: HelloPlugin 0.1.0 (hello_plugin.dll)
 [Arona] 插件已启动: HelloPlugin v0.1.0
 ```
@@ -1807,20 +1805,41 @@ tokio 也被静态链接成了两份，而"当前在哪个运行时里"这个上
 有 `tokio::task::spawn::spawn` 与某个第三方库的 `execute`，而**你的代码一帧都不在栈上**。结论一样：
 凡"进程级只该有一份"的东西（连接池、全局定时器、驱动线程）都优先用框架暴露的方法拿。
 
-### 握手核对的五项
+### 握手核对的项目
 
 | 项 | 来源 | 不一致的后果 |
 | --- | --- | --- |
 | 符号布局版本 | `arona::plugin::abi::ABI_LAYOUT`（当前 10） | 四个导出符号的签名、或**插件会读的那个类型**（`Framework`、`CommandContext`、`EventBody`、`BodyFilter`、`OneBotApi`、`PluginMeta`）换了布局，新旧不可混用。布局 6 起 `quartz` 的 `Scheduler`/`TaskEntry` **已经不出界**（排期走宿主通道，§10），那两个结构内部随便改；布局 7 起 `HttpCall`/`HttpDone` 多的那几段也在这一号里——**跨边界的结构体加字段就是抬布局的事**，私有与否不看；布局 8 起 `HostBridge` 多一条会话展示板通道（`ViewSpec`，§14.3），那张表的字段布局同样不出界；布局 9 起 `PluginMeta` 多一项 `group_scoped`（§6），插件不写就是默认的 `true`；布局 10 起 `HostBridge` 多一条字体通道（`fonts`，§7），随包字体字节由宿主常驻一份借给各 dll——**插件源码不用改，但必须随框架重编** |
-| 框架契约版本 | `FRAMEWORK_API_VERSION`（主版本相等 + 框架次版本不低于插件要求） | 插件用到了宿主还没有的接口 |
 | rustc 版本与 host 三件套 | 两边各自 `rustc -vV` 的 `release` / `host` 两行 | `dyn Trait` 胖指针布局、泛型单态化产物可能对不上 |
 | 目标三元组 + profile + CRT 链接方式 | `TARGET` / `PROFILE` / `crt-static` | debug 与 release 混编会炸；两套 MSVC 运行库会各自分配释放内存 |
-| arona-rs 版本 + 除 `gui`/`default` 外的 feature 集合 | `CARGO_PKG_VERSION` / `CARGO_FEATURE_*` | 两边看到的 `Framework` / `PluginContext` 不是同一个结构 |
+| 除 `gui`/`default` 外的 feature 集合 | `CARGO_FEATURE_*` | 两边看到的 `Framework` / `PluginContext` 不是同一个结构 |
 
 指纹由 `crates/arona/build.rs` 算出、由 `export_arona_plugin!` 原样上报（末尾带 NUL，宿主按 C
 字符串读），宿主按字符串全等比对。`gui` 与它的别名 `default` 是被放行的两个例外（§16）：
 `gui` 有源码扫描用例盯着它不改共享类型布局，`default` 若不放行，`cargo build --workspace`
 与插件作者的 `cargo build -p <插件>` 会算出不同指纹，同仓编出来的 dll 反而装不进自己的宿主。
+
+指纹长这样（本机实测）：
+
+```
+rustc/1.98.0|host/x86_64-pc-windows-msvc|target/x86_64-pc-windows-msvc|profile/release|crt-static/1|features/
+```
+
+#### 为什么指纹里没有框架版本号
+
+曾经有两项被去掉了，都是因为**它们在结构上是冗余的**：
+
+- **`arona-rs` 的 crate 版本**：版本号跟发布节奏走（1.1.0 → 1.2.0 期间布局号从 5 走到 10，二者
+  完全脱钩）。把它算进指纹，意味着「只改了内部实现、补丁版 +1」也会把全部插件拒载，而那些插件
+  其实完全能跑。真正决定能不能混用的是编译器与链接方式那几项，加上单独的 `ABI_LAYOUT`。
+- **`FRAMEWORK_API_VERSION` 契约号**（对齐 mirai 的 `ApiVerification`）：它只在插件接口破坏性变更
+  时才抬，而那种变更必然改变跨边界的类型布局或导出符号——也就必然抬 `ABI_LAYOUT`。实测
+  v1.0.0 / v1.1.0 / v1.2.0 三个版本里它一路都是 `1.0.0`，**一次也没独立拦下过东西**；留着只会
+  多出一种「布局号对一个、契约号对不上」的状态。
+
+所以现在插件能不能装进来只看两件事：**布局号相等 + 工具链指纹全等**。
+推论是：**框架升补丁版、改内部实现都不必重编插件**；只有抬了 `ABI_LAYOUT` 或换了工具链才要重编。
+`plugins/<id>/plugin.yml` 里写的是 `apiLayout: <布局号>`，用它判断一个插件还能不能用。
 
 ### 工具链版本以仓库里那一行为准
 
@@ -1840,7 +1859,7 @@ tokio 也被静态链接成了两份，而"当前在哪个运行时里"这个上
 ### 发布插件时必须写明的三件事
 
 ```
-适用于 Arona-rs 1.2.0（框架契约 1.0.0，符号布局 10）
+适用于 Arona-rs 1.2.0（符号布局 10）
 构建工具链：rustc 1.98.0，x86_64-pc-windows-msvc，--release，crt-static
 下载后放进 <框架运行目录>/plugins/<你的id>/，重启框架
 ```
@@ -1848,7 +1867,7 @@ tokio 也被静态链接成了两份，而"当前在哪个运行时里"这个上
 Linux 版把第二行换成那台机器自己的三元组（形如 `x86_64-unknown-linux-gnu`、`crt-static/0`）：
 
 ```
-适用于 Arona-rs 1.2.0（框架契约 1.0.0，符号布局 10）
+适用于 Arona-rs 1.2.0（符号布局 10）
 构建工具链：rustc 1.98.0，x86_64-unknown-linux-gnu，--release
 下载后放进 <框架运行目录>/plugins/<你的id>/，重启框架
 ```
@@ -1862,6 +1881,9 @@ Linux 版把第二行换成那台机器自己的三元组（形如 `x86_64-unkno
 都能用"——那不是宽松，是把干净的拒载推迟成随机的崩溃。
 真要跨编译器版本，得走进程外通信（子进程 + JSON-RPC）或 wasm 组件模型，
 那是与本框架这套契约不同的另一条路。
+
+反过来，**框架升补丁版、改内部实现都不必重编插件**：指纹里没有 crate 版本号，布局号也没动，
+装进去照样能跑。需要重编的时机只有两个——`ABI_LAYOUT` 抬了，或者工具链变了。
 
 ### 插件侧禁止清单
 

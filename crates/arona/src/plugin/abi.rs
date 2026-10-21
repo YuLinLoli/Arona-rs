@@ -28,8 +28,6 @@
 //!
 //! 插件作者不需要手写它们，一行 [`export_arona_plugin!`] 就够。
 
-use crate::plugin::ApiVersion;
-use crate::plugin::description::FRAMEWORK_API_VERSION;
 use std::ffi::c_void;
 use std::os::raw::c_char;
 
@@ -95,24 +93,24 @@ pub const TOOLCHAIN_FINGERPRINT: &str = env!("ARONA_ABI_FINGERPRINT");
 /// 所以对外一律用这一份。
 pub const TOOLCHAIN_FINGERPRINT_C: &str = concat!(env!("ARONA_ABI_FINGERPRINT"), "\0");
 
-/// 把布局版本与框架契约版本打包成一个 `u64`：高 32 位是 [`ABI_LAYOUT`]，
-/// 低 32 位是 `major << 16 | minor`（patch 不参与握手，与 mirai 的 `ApiVersion` 一致）。
-pub const fn pack_abi(api: &ApiVersion) -> u64 {
-    ((ABI_LAYOUT as u64) << 32) | ((api.major as u64) << 16) | api.minor as u64
+/// 插件上报的 ABI 号：目前只有布局版本一项。
+///
+/// 曾经这里是「布局版本（高 32 位）+ 框架契约版本（低 32 位）」两段。契约号被去掉了，
+/// 因为它在结构上是冗余的：它只在**插件接口破坏性变更**时才抬，而那种变更必然同时改变
+/// 跨边界的类型布局或导出符号——也就必然抬 [`ABI_LAYOUT`]。实测三个版本里
+/// `FRAMEWORK_API_VERSION` 一路都是 `1.0.0`，而布局号从 3 走到 10，它一次也没独立拦下过东西。
+///
+/// 留着它反而有害：两个数各自演进，就多出一种"一个对一个不对"的状态，而真正决定
+/// 能不能混用的一直是布局与工具链。现在插件只管报布局号，宿主只管比布局号。
+///
+/// 低 32 位仍为 0，这样旧插件报上来的 `u64` 即使带过契约号，高 32 位也照样读得出布局。
+pub const fn pack_abi(layout: u32) -> u64 {
+    (layout as u64) << 32
 }
 
 /// 解出 [`pack_abi`] 里的布局版本
 pub const fn unpack_layout(packed: u64) -> u32 {
     (packed >> 32) as u32
-}
-
-/// 解出 [`pack_abi`] 里的框架契约版本（patch 恒为 0，握手不看它）
-pub const fn unpack_api(packed: u64) -> ApiVersion {
-    ApiVersion::new(
-        ((packed >> 16) & 0xFFFF) as u32,
-        (packed & 0xFFFF) as u32,
-        0,
-    )
 }
 
 /// 插件 dll 上报的握手信息是否被当前框架接受。
@@ -124,16 +122,10 @@ pub fn check_abi(packed: u64, toolchain: &str) -> Result<(), String> {
             "插件 ABI 布局版本不匹配：插件为 {layout}，本框架为 {ABI_LAYOUT}。请用同版本框架重新编译插件"
         ));
     }
-    let built = unpack_api(packed);
-    if !FRAMEWORK_API_VERSION.satisfies(&built) {
-        return Err(format!(
-            "插件按框架契约 {built} 编译，当前框架只有 {FRAMEWORK_API_VERSION}"
-        ));
-    }
     if toolchain != TOOLCHAIN_FINGERPRINT {
         return Err(format!(
             "插件与框架的构建工具链不一致，无法安全装载。\n  框架: {TOOLCHAIN_FINGERPRINT}\n  插件: {toolchain}\n\
-             插件必须与宿主使用同一个 rustc、同一个目标三元组、同一档 profile（release/debug）、\n  同一 CRT 链接方式以及同一版本的 arona 依赖编译。"
+             插件必须与宿主使用同一个 rustc、同一个目标三元组、同一档 profile（release/debug）、\n  同一 CRT 链接方式以及同一组框架 feature 编译。"
         ));
     }
     Ok(())
@@ -432,10 +424,10 @@ macro_rules! export_arona_plugin {
         $crate::export_arona_plugin!(@impl $crate::plugin::abi::private_arc($instance));
     };
     (@impl $ctor:expr) => {
-        /// 符号布局版本 + 本 dll 编译时所链接的框架契约版本
+        /// 本 dll 编译时的符号布局版本（宿主按它决定要不要装载）
         #[unsafe(no_mangle)]
         pub extern "C" fn arona_plugin_abi() -> u64 {
-            $crate::plugin::abi::pack_abi(&$crate::plugin::FRAMEWORK_API_VERSION)
+            $crate::plugin::abi::pack_abi($crate::plugin::abi::ABI_LAYOUT)
         }
 
         /// 本 dll 的构建工具链指纹（以 NUL 结尾，宿主按字符串全等校验）
@@ -555,11 +547,11 @@ mod tests {
     }
 
     #[test]
-    fn abi_roundtrip_keeps_layout_and_api() {
-        let packed = pack_abi(&ApiVersion::new(1, 7, 3));
+    fn abi_roundtrip_keeps_the_layout() {
+        let packed = pack_abi(ABI_LAYOUT);
         assert_eq!(unpack_layout(packed), ABI_LAYOUT);
-        // patch 不参与握手
-        assert_eq!(unpack_api(packed), ApiVersion::new(1, 7, 0));
+        // 低 32 位保留为 0：旧插件报上来的 u64 即使带过契约号，布局位也照样读得准
+        assert_eq!(packed & 0xFFFF_FFFF, 0);
     }
 
     /// 交给宿主的是裸指针，只能按 C 字符串读：漏了结尾 NUL，宿主会读过指纹继续找 0，
@@ -642,23 +634,41 @@ mod tests {
     #[test]
     fn check_abi_rejects_each_mismatch() {
         let mine = TOOLCHAIN_FINGERPRINT.to_string();
-        assert!(check_abi(pack_abi(&FRAMEWORK_API_VERSION), &mine).is_ok());
+        assert!(check_abi(pack_abi(ABI_LAYOUT), &mine).is_ok());
         assert!(
-            check_abi(pack_abi(&FRAMEWORK_API_VERSION), "arona/0.0.0|rustc/9.9.9")
+            check_abi(pack_abi(ABI_LAYOUT), "rustc/9.9.9|host/x|target/y")
                 .is_err_and(|reason| reason.contains("工具链不一致"))
         );
-        let newer = ApiVersion::new(
-            FRAMEWORK_API_VERSION.major,
-            FRAMEWORK_API_VERSION.minor + 1,
-            0,
-        );
-        assert!(
-            check_abi(pack_abi(&newer), &mine)
-                .is_err_and(|reason| reason.contains("插件按框架契约"))
-        );
+        // 布局号差一档就该拒：这是唯一决定"能不能混用"的号码
         assert!(
             check_abi((ABI_LAYOUT as u64 + 7) << 32, &mine)
                 .is_err_and(|reason| reason.contains("ABI 布局版本"))
         );
+    }
+
+    /// 指纹里**不含** crate 版本号：升个补丁版不该把全部插件拒掉。
+    ///
+    /// 这条防的是有人"顺手"把 `CARGO_PKG_VERSION` 加回指纹里去——那会让每次发版都
+    /// 强制所有插件重编，而绝大多数发版并不改变任何跨边界的东西。
+    #[test]
+    fn the_fingerprint_does_not_track_the_crate_version() {
+        let version = env!("CARGO_PKG_VERSION");
+        // 版本号形如 1.2.0，只匹配 `arona/1.2.0` 这种带前缀的写法，
+        // 避开 rustc/x.y.z 之类本来就该出现的数字
+        assert!(
+            !TOOLCHAIN_FINGERPRINT.contains(&format!("arona/{version}")),
+            "crate 版本被算进指纹了，升级就会误伤全部插件: {TOOLCHAIN_FINGERPRINT}"
+        );
+        assert!(
+            !TOOLCHAIN_FINGERPRINT.starts_with("arona/"),
+            "指纹不该再以 arona 版本开头: {TOOLCHAIN_FINGERPRINT}"
+        );
+        // 该有的几项一个都不能少
+        for key in ["rustc/", "host/", "target/", "profile/", "crt-static/", "features/"] {
+            assert!(
+                TOOLCHAIN_FINGERPRINT.contains(key),
+                "指纹缺少 {key}: {TOOLCHAIN_FINGERPRINT}"
+            );
+        }
     }
 }

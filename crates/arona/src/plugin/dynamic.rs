@@ -21,7 +21,7 @@
 use crate::plugin::AronaPlugin;
 use crate::plugin::abi::{
     ABI_SYMBOL, DYNAMIC_LOADER, ENTRY_SYMBOL, HOST_ACCEPTED, HOST_SYMBOL, HostBridge,
-    TOOLCHAIN_SYMBOL, check_abi, unpack_api, unpack_layout,
+    TOOLCHAIN_SYMBOL, check_abi, unpack_layout,
 };
 use crate::plugin::manager::PluginLoader;
 use crate::runtime::log;
@@ -193,11 +193,7 @@ pub unsafe fn handshake(library: &libloading::Library) -> Result<(), String> {
     // SAFETY: 上面已验过指针非空，且它来自刚映射进本进程的模块
     let reported = unsafe { read_c_string(pointer) }?;
     check_abi(packed, &reported)?;
-    log::debug(format!(
-        "插件 ABI 握手通过: 布局 {}，契约 {}",
-        unpack_layout(packed),
-        unpack_api(packed)
-    ));
+    log::debug(format!("插件 ABI 握手通过: 布局 {}", unpack_layout(packed)));
     Ok(())
 }
 
@@ -246,11 +242,7 @@ mod tests {
         let packed = unsafe { abi() };
         let pointer = unsafe { toolchain() };
         println!("宿主指纹: {}", crate::plugin::abi::TOOLCHAIN_FINGERPRINT);
-        println!(
-            "packed = {packed:#018x} 布局 {} 契约 {}",
-            unpack_layout(packed),
-            unpack_api(packed)
-        );
+        println!("packed = {packed:#018x} 布局 {}", unpack_layout(packed));
         let mut bytes = Vec::new();
         for offset in 0..512usize {
             // SAFETY: 探针，只在这台机器上手工跑；模块常驻期间这段内存可读

@@ -35,7 +35,7 @@ use std::sync::Arc;
 
 pub use abi::DYNAMIC_LOADER;
 pub use context::{PluginContext, PluginRegistrar};
-pub use description::{ApiVersion, FRAMEWORK_API_VERSION, PluginMeta};
+pub use description::PluginMeta;
 pub use dynamic::DynamicPluginLoader;
 pub use manager::{
     BUILTIN_LOADER, LifecycleOptions, LoaderRegistry, ManagedPlugin, PluginLoader, PluginManager,
@@ -265,8 +265,6 @@ pub(crate) fn prepare_plugin_home(plugin: &Arc<ManagedPlugin>) {
     crate::runtime::paths::plugin_data_dir(id);
 }
 
-pub(crate) use manager::check_api;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -390,7 +388,8 @@ mod tests {
             "id: ContractAlpha",
             "name: 契约自检插件",
             "version: 1.0.0",
-            "apiVersion: 1.0.0",
+            // 契约版本号已不再参与握手，清单里写的是真正决定能否混用的布局号
+            &format!("apiLayout: {}", crate::plugin::abi::ABI_LAYOUT),
             "loader: builtin",
             "depends: []",
             "softDepends: []",
@@ -682,45 +681,54 @@ mod tests {
         let _ = std::fs::remove_dir_all(crate::runtime::paths::plugin_data_dir(ID));
     }
 
-    /// 依赖与契约握手的落地行为：装配顺序按 depends 拓扑排（与登记顺序无关）、
-    /// 契约版本不兼容只淘汰这一家、硬依赖被停用时下游连锁停用。
+    /// 依赖的落地行为：装配顺序按 depends 拓扑排（与登记顺序无关）、
+    /// install 阶段某一家失败只淘汰它自己、硬依赖被停用时下游连锁停用。
+    ///
+    /// 这条用例原先还兼职验"契约版本不兼容只淘汰这一家"。契约版本号去掉之后，
+    /// 那个位置换成一个**在 install 里主动失败**的插件——验的是同一件事：
+    /// 单家失败不拖累别人。
     #[tokio::test(flavor = "current_thread")]
     async fn dependencies_install_in_topological_order_and_cascade() {
         struct Spec {
             id: &'static str,
             depends: &'static [&'static str],
-            api: ApiVersion,
+            broken: bool,
         }
 
         struct Depending(Spec);
 
         impl AronaPlugin for Depending {
             fn meta(&self) -> PluginMeta {
-                PluginMeta::new(self.0.id, "依赖自检插件", "1.0.0", "依赖与握手自检")
+                PluginMeta::new(self.0.id, "依赖自检插件", "1.0.0", "依赖与失败隔离自检")
                     .depends_on(self.0.depends)
-                    .requires_api(self.0.api)
+            }
+
+            fn install(&self, _reg: &PluginRegistrar) -> Result<(), String> {
+                if self.0.broken {
+                    return Err("这个插件故意在 install 阶段失败".to_string());
+                }
+                Ok(())
             }
         }
 
-        let current = crate::plugin::FRAMEWORK_API_VERSION;
         let framework = crate::framework::Framework::new();
         let manager = framework.plugins().clone();
         // 故意先登记"依赖方"：拓扑排序要把被依赖者提到前面
         assert!(manager.register(Arc::new(Depending(Spec {
             id: "DependChild",
             depends: &["DependParent"],
-            api: current,
+            broken: false,
         }))));
         assert!(manager.register(Arc::new(Depending(Spec {
             id: "DependParent",
             depends: &[],
-            api: current,
+            broken: false,
         }))));
-        // 要求一个还不存在的契约版本：只该淘汰它自己
+        // 登记阶段就坏掉的一家：只该淘汰它自己
         assert!(manager.register(Arc::new(Depending(Spec {
             id: "DependStale",
             depends: &[],
-            api: ApiVersion::new(current.major + 1, 0, 0),
+            broken: true,
         }))));
 
         let ids: Vec<&str> = manager.ordered().iter().map(|plugin| plugin.id()).collect();
@@ -741,14 +749,14 @@ mod tests {
                 .map(|(id, _)| id.as_str())
                 .collect::<Vec<_>>(),
             vec!["DependStale"],
-            "只有契约不兼容的插件该被淘汰"
+            "只有 install 失败的那家该被淘汰"
         );
         assert!(
             matches!(
                 manager.find("DependStale").unwrap().state(),
                 PluginState::Failed(_)
             ),
-            "握手失败要写明原因"
+            "失败要写明原因"
         );
         assert!(manager.configure_all(&options).is_empty());
         assert!(manager.start_all().is_empty());
@@ -776,8 +784,7 @@ mod tests {
                 manager.find("DependStale").unwrap().state(),
                 PluginState::Failed(_)
             ),
-            "契约不兼容的插件不该被运行期开关重新拉起"
-        );
+            "install 失败的插件不该被运行期开关重新拉起"        );
         assert_eq!(manager.active_ids().len(), 2);
 
         for id in ["DependChild", "DependParent", "DependStale"] {

@@ -133,7 +133,7 @@ impl ManagedPlugin {
         *self.context.write().unwrap() = Some(context);
     }
 
-    /// 用户开关 + 契约兼容 + 硬依赖是否都可用（mirai 的 depends 传播）。
+    /// 用户开关 + 自身没失败过 + 硬依赖是否都可用（mirai 的 depends 传播）。
     /// 停用名单查本管理器所属框架实例的门控，依赖查表用传入的管理器，
     /// 所以测试可以拿一个局部实例跑完整生命周期。
     pub fn is_effectively_enabled(&self, manager: &PluginManager) -> bool {
@@ -141,8 +141,10 @@ impl ManagedPlugin {
         if !framework.gating().plugin_enabled(self.id()) {
             return false;
         }
-        // 契约握手失败的插件不该被运行期的开关重新拉起
-        if !self.meta.is_compatible() {
+        // 已经失败过的（install/configure/start 任一步出错）不再被运行期开关重新拉起。
+        // 这条判据原先借的是 `meta.is_compatible()`——契约版本号去掉之后，必须在这里
+        // 明说：换回来的做法是对的，因为"是否还能起来"本来就该看自己的状态。
+        if matches!(self.state(), PluginState::Failed(_)) {
             return false;
         }
         self.meta.depends.iter().all(|need| {
@@ -350,16 +352,15 @@ impl PluginManager {
         ordered
     }
 
-    /// install 阶段：契约握手 + 功能/配置区登记。单家失败不拖累别人。
+    /// install 阶段：功能/配置区登记。单家失败不拖累别人。
+    ///
+    /// 这里**不再有契约版本握手**：插件能不能装进来，在装载那一步就由
+    /// [`crate::plugin::abi::check_abi`] 按布局号 + 工具链指纹判完了，走不到这里。
     pub fn install_all(&self) -> Vec<(String, String)> {
         let mut failures: Vec<(String, String)> = Vec::new();
         let framework = self.framework();
         for plugin in self.ordered() {
             crate::plugin::prepare_plugin_home(&plugin);
-            if let Err(reason) = crate::plugin::check_api(plugin.meta()) {
-                self.fail(&plugin, reason, &mut failures);
-                continue;
-            }
             // 分群作用域先记进门控，再跑 install：GUI 与命令路由都在读这张表，
             // 声明不按群生效的插件不该在任何一个群里被分群名单挡住
             framework
@@ -649,18 +650,6 @@ fn guard_void(plugin: &Arc<ManagedPlugin>, site: &str, f: impl FnOnce()) {
     }
 }
 
-/// 与框架契约版本握手（mirai 的 `ApiVerification`）
-pub(crate) fn check_api(meta: &PluginMeta) -> Result<(), String> {
-    if meta.is_compatible() {
-        return Ok(());
-    }
-    Err(format!(
-        "插件契约版本不兼容: 要求 api {}，本程序提供 api {}",
-        meta.api_version,
-        crate::plugin::description::FRAMEWORK_API_VERSION
-    ))
-}
-
 /// 把停用的插件名下的一切都收回去（走进程默认实例；插件生命周期里由框架自动调用）
 pub fn revoke_resources(plugin: &Arc<ManagedPlugin>) {
     PluginManager::global().revoke(plugin);
@@ -689,7 +678,7 @@ pub(crate) fn describe(plugin: &ManagedPlugin) -> String {
          version: {version}\n\
          author: {author}\n\
          description: {description}\n\
-         apiVersion: {api}\n\
+         apiLayout: {layout}\n\
          loader: {loader}\n\
          depends: {depends}\n\
          softDepends: {soft}\n\
@@ -706,7 +695,9 @@ pub(crate) fn describe(plugin: &ManagedPlugin) -> String {
             meta.author
         },
         description = meta.description,
-        api = meta.api_version,
+        // 契约版本号已经不参与握手，这里改为写出真正决定能否混用的布局号：
+        // 用户拿 plugin.yml 去问"我这个插件还能不能用"时，看的就是这个数字
+        layout = crate::plugin::abi::ABI_LAYOUT,
         loader = plugin.loader(),
         depends = list(meta.depends),
         soft = list(meta.soft_depends),

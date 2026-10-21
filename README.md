@@ -501,6 +501,9 @@ Linux 上编出来的文件名带 `lib` 前缀（`libhello_plugin.so`），这�
 其中 rustc 版本已经钉在仓库根的 `rust-toolchain.toml` 里：`cargo build` 会自动选中它，
 本地和 CI 不再各凭当天的 stable。详细要求和发布前自检清单见 [PLUGIN_DEVELOPMENT.md §22](PLUGIN_DEVELOPMENT.md)。
 
+> 判据只有两个：**符号布局号相等 + 工具链指纹全等**。框架版本号不参与比对，所以
+> 升个补丁版、改内部实现都不必重编插件；只有抬了 `ABI_LAYOUT` 或换了工具链才需要重编。
+
 ### 安装包
 
 由 [Inno Setup 6](https://jrsoftware.org/isinfo.php) 编译，脚本见 [`installer/arona-rs.iss`](installer/arona-rs.iss)：

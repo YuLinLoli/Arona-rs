@@ -3,11 +3,15 @@
 //! Rust 没有稳定的跨编译器 ABI：`dyn Trait` 的胖指针布局、泛型单态化产物、panic
 //! 与内存分配策略都随 rustc 版本与 profile 变化。本 crate 允许功能插件以 `cdylib`
 //! 形式在运行期加载并直接交换 `Arc<dyn AronaPlugin>`，成立的前提是**宿主与插件由
-//! 同一版 rustc、同一 target、同一 profile、同一 CRT 链接方式、同一份 arona 源码、
-//! 同一组 feature** 编译。
+//! 同一版 rustc、同一 target、同一 profile、同一 CRT 链接方式、同一组 feature** 编译。
 //!
 //! 这个前提没法靠编译器保证，就在这里算成指纹，由 `plugin::abi` 在装载每个 dll 时逐个核对，
 //! 对不上就拒载（宁可当场报错，也不要"加载成功但随机崩溃"）。
+//!
+//! **指纹里刻意不含 crate 版本号**。版本号跟发布节奏走（1.1.0 → 1.2.0 期间布局号从 5 走到 10），
+//! 把它算进来会让"只改了内部实现、补丁版 +1"也把全部插件拒载，而那些插件其实完全能跑。
+//! 真正决定能不能混用的是下面这几项（编译器与链接方式），加上单独的 `ABI_LAYOUT`
+//! （跨边界类型变了才抬，见 `plugin::abi`）。
 //!
 //! 两个例外是 `default` 与 `gui`：`default` 只是 feature 别名（本 crate 里它展开成 `gui`），
 //! `gui` 只门控 `arona::gui` 与两个 GUI 启动辅助模块——两者都不改变任何共享类型的布局。
@@ -51,8 +55,7 @@ fn main() {
     let host = field(&verbose, "host").unwrap_or("unknown");
 
     println!(
-        "cargo:rustc-env=ARONA_ABI_FINGERPRINT=arona/{}|rustc/{}|host/{}|target/{}|profile/{}|crt-static/{}|features/{}",
-        std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".to_string()),
+        "cargo:rustc-env=ARONA_ABI_FINGERPRINT=rustc/{}|host/{}|target/{}|profile/{}|crt-static/{}|features/{}",
         release,
         host,
         target,
