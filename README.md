@@ -164,8 +164,8 @@ Linux 版**只有命令行模式**（不含管理面板），启动后就是一�
 配置与数据布局与 Windows 完全一致。
 
 ```bash
-tar -xzf arona-rs-1.2.0-linux-x64-compat.tar.gz
-cd arona-rs-1.2.0-linux-x64-compat
+tar -xzf arona-rs-1.2.1-linux-x64-compat.tar.gz
+cd arona-rs-1.2.1-linux-x64-compat
 ./arona-rs                 # 前台运行，Ctrl+C 停止
 ```
 
@@ -501,8 +501,10 @@ Linux 上编出来的文件名带 `lib` 前缀（`libhello_plugin.so`），这�
 其中 rustc 版本已经钉在仓库根的 `rust-toolchain.toml` 里：`cargo build` 会自动选中它，
 本地和 CI 不再各凭当天的 stable。详细要求和发布前自检清单见 [PLUGIN_DEVELOPMENT.md §22](PLUGIN_DEVELOPMENT.md)。
 
-> 判据只有两个：**符号布局号相等 + 工具链指纹全等**。框架版本号不参与比对，所以
-> 升个补丁版、改内部实现都不必重编插件；只有抬了 `ABI_LAYOUT` 或换了工具链才需要重编。
+> 判据只有两个：**符号布局号相等 + 工具链指纹全等**。**从 1.2.1 起**框架不再校验「框架契约版本」与
+> 「arona crate 版本」，所以升补丁版、改内部实现都不必重编插件；只有抬了 `ABI_LAYOUT` 或换了工具链才需要。
+> 1.2.0 及更早的版本还会把 crate 版本算进指纹，那时每次升版都要重编——这条分界线两边行为不同，
+> 细节见 [PLUGIN_DEVELOPMENT.md §22](PLUGIN_DEVELOPMENT.md)。
 
 ### 安装包
 
@@ -616,7 +618,7 @@ installer/               Windows 安装包：arona-rs.iss、intro.txt、defaults
 crate-type = ["cdylib", "rlib"]   # cdylib 出动态库；rlib 那份只给 cargo test 用
 
 [dependencies]
-arona = { package = "arona-rs", version = "1.2.0", default-features = false }
+arona = { package = "arona-rs", version = "1.2.1", default-features = false }
 # 同源联调改成 path：arona = { package = "arona-rs", path = "../Arona-rs/crates/arona", default-features = false }
 ```
 

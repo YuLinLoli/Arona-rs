@@ -10,7 +10,7 @@ Arona 框架库 crate（OneBot v11 连接、管理面板、群授权与黑名单
 ```toml
 [dependencies]
 # 务必 default-features = false：gui 特性只在宿主那边打开，插件不该把 eframe 拖进 dll
-arona = { package = "arona-rs", version = "1.2.0", default-features = false }
+arona = { package = "arona-rs", version = "1.2.1", default-features = false }
 ```
 
 - 宿主可执行文件在 `crates/arona-host`（产物 `arona-rs[.exe]`）。

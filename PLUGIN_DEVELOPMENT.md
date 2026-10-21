@@ -20,8 +20,8 @@
 
 ```
 Cargo.toml                 # 虚拟 workspace（resolver=2）
-crates/arona/              # 框架库 crate：包名 arona-rs（库名仍是 arona，见 §15），version=1.2.0
-crates/arona-host/         # 宿主可执行：name=arona-host, version=1.2.0, 产物 bin=arona-rs
+crates/arona/              # 框架库 crate：包名 arona-rs（库名仍是 arona，见 §15），version=1.2.1
+crates/arona-host/         # 宿主可执行：name=arona-host, version=1.2.1, 产物 bin=arona-rs
 plugins/hello/             # 示例插件：name=hello-plugin, crate-type=["cdylib", "rlib"]
 ```
 
@@ -29,7 +29,7 @@ plugins/hello/             # 示例插件：name=hello-plugin, crate-type=["cdyl
 编译出 `xxx_plugin.dll`（Linux: `xxx_plugin.so`）后由用户放进运行目录的 `plugins/`，
 框架启动时扫描装载（§22）。
 
-版本约定：框架与 host 同为 `1.2.0`，插件版本号各自演进。
+版本约定：框架与 host 同为 `1.2.1`，插件版本号各自演进。
 **插件接口的破坏性改动抬 `arona::plugin::abi::ABI_LAYOUT`**（与 crate 版本号无关），见 §6；
 **插件会读的那个类型换了布局**（`Framework`、`CommandContext`、`EventBody`、`BodyFilter`、`OneBotApi`
 这些，加字段/加变体/改字段类型）另抬 `arona::plugin::abi::ABI_LAYOUT`（当前 `9`），见 §22。
@@ -1207,7 +1207,7 @@ ctx.clear_all_rows();       // 全摘（一般用不上：插件被停用时框�
 
    [dependencies]
    # 务必 default-features = false（§16）。arona 的版本必须与目标宿主完全一致
-   arona = { package = "arona-rs", version = "1.2.0", default-features = false }
+   arona = { package = "arona-rs", version = "1.2.1", default-features = false }
    # 类型化配置要 derive（§12）；命令/钩子的 async 体里要 tokio::time::sleep、select! 也得直依赖
    # （§22 的"两份 tokio"小节：框架按帧给这类任务补装运行时上下文）。
    # 起后台任务请用 ctx.spawn（§10），别裸 tokio::spawn，更不要 #[tokio::main]——运行时是宿主那一个
@@ -1838,8 +1838,23 @@ rustc/1.98.0|host/x86_64-pc-windows-msvc|target/x86_64-pc-windows-msvc|profile/r
   多出一种「布局号对一个、契约号对不上」的状态。
 
 所以现在插件能不能装进来只看两件事：**布局号相等 + 工具链指纹全等**。
-推论是：**框架升补丁版、改内部实现都不必重编插件**；只有抬了 `ABI_LAYOUT` 或换了工具链才要重编。
-`plugins/<id>/plugin.yml` 里写的是 `apiLayout: <布局号>`，用它判断一个插件还能不能用。
+
+#### 从 1.2.1 起的变化（升级须知）
+
+**1.2.1 起，框架不再校验「契约版本」与「crate 版本」**，握手只剩符号布局号与工具链指纹两项。
+这条分界线两边的行为不一样，插件作者要对齐的是自己手上那一份：
+
+| 框架版本 | 校验项 | 需要重编插件的时机 |
+| --- | --- | --- |
+| ≤ 1.2.0 | 布局号 + **契约号 + crate 版本** + 工具链指纹 | 框架一升版（哪怕只改内部实现）就要重编 |
+| **≥ 1.2.1** | 布局号 + 工具链指纹 | 只在**抬了 `ABI_LAYOUT`** 或**换了工具链**时 |
+
+推论是：**从 1.2.1 起，框架升补丁版、改内部实现都不必重编插件**——装进去照样能跑。
+这一次（1.2.0 → 1.2.1）本身是例外：导出值与指纹格式都变了，所以**现有插件需要随 1.2.1 重编一次**，
+之后才享受上面那条。
+
+`plugins/<id>/plugin.yml` 里写的是 `apiLayout: <布局号>`（1.2.1 起；更早的版本写的是 `apiVersion`），
+用它判断一个插件还能不能用。
 
 ### 工具链版本以仓库里那一行为准
 
@@ -1859,7 +1874,7 @@ rustc/1.98.0|host/x86_64-pc-windows-msvc|target/x86_64-pc-windows-msvc|profile/r
 ### 发布插件时必须写明的三件事
 
 ```
-适用于 Arona-rs 1.2.0（符号布局 10）
+适用于 Arona-rs 1.2.1（符号布局 10）
 构建工具链：rustc 1.98.0，x86_64-pc-windows-msvc，--release，crt-static
 下载后放进 <框架运行目录>/plugins/<你的id>/，重启框架
 ```
@@ -1867,7 +1882,7 @@ rustc/1.98.0|host/x86_64-pc-windows-msvc|target/x86_64-pc-windows-msvc|profile/r
 Linux 版把第二行换成那台机器自己的三元组（形如 `x86_64-unknown-linux-gnu`、`crt-static/0`）：
 
 ```
-适用于 Arona-rs 1.2.0（符号布局 10）
+适用于 Arona-rs 1.2.1（符号布局 10）
 构建工具链：rustc 1.98.0，x86_64-unknown-linux-gnu，--release
 下载后放进 <框架运行目录>/plugins/<你的id>/，重启框架
 ```
