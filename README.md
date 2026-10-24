@@ -164,8 +164,8 @@ Linux 版**只有命令行模式**（不含管理面板），启动后就是一�
 配置与数据布局与 Windows 完全一致。
 
 ```bash
-tar -xzf arona-rs-1.2.2-linux-x64-compat.tar.gz
-cd arona-rs-1.2.2-linux-x64-compat
+tar -xzf arona-rs-1.3.0-linux-x64-compat.tar.gz
+cd arona-rs-1.3.0-linux-x64-compat
 ./arona-rs                 # 前台运行，Ctrl+C 停止
 ```
 
@@ -295,6 +295,10 @@ chatlog:
 - `ARONA_CONSOLE_EMOJI=0`：关闭控制台 emoji
 - `ARONA_NO_ELEVATE=1`：跳过启动时的管理员权限申请（调试 / 自动化测试用）
 - `--arona-elevated`：提权重启时由程序自己附加的内部标记，不需要手动加（防止无限重启）
+- `--debug-api`：开运行期自省端点（只读，默认绑定 `127.0.0.1:8787`）。默认**不开**，
+  同一个 exe 加这个参数重启就能用，见下文「运行期自检」
+- `--debug-bind=<地址:端口>`：自省端点绑哪（等价 `ARONA_DEBUG_BIND`）
+- `--debug-token=<令牌>`：自省端点的访问令牌（等价 `ARONA_DEBUG_TOKEN`）。绑非回环地址时**必须**给
 
 还有一个**转交给插件**的开关，框架自己不用：`--test-notify` 会原样放进 `PluginContext::test_notify`，
 由插件决定要不要安排一次自检。
@@ -618,7 +622,7 @@ installer/               Windows 安装包：arona-rs.iss、intro.txt、defaults
 crate-type = ["cdylib", "rlib"]   # cdylib 出动态库；rlib 那份只给 cargo test 用
 
 [dependencies]
-arona = { package = "arona-rs", version = "1.2.2", default-features = false }
+arona = { package = "arona-rs", version = "1.3.0", default-features = false }
 # 同源联调改成 path：arona = { package = "arona-rs", path = "../Arona-rs/crates/arona", default-features = false }
 ```
 
@@ -646,6 +650,48 @@ arona::export_arona_plugin!(MyPlugin);
 > 要给 Linux 版装插件，就得在 Linux 上编一份 `.so`——在 Windows 上交叉编出来的那份，
 > 指纹里的 `host` 字段对不上，会被握手拒载。代码本身通常不用改：仓库里的示例插件
 > 零改动就能在 Linux 下编出 `libhello_plugin.so`。
+
+## 运行期自检（`--debug-api`）
+
+程序跑起来之后想看清它此刻在做什么，除了翻日志还有一条路：加 `--debug-api` 启动，
+框架会在 `127.0.0.1:8787` 开一个**只读**端点，把内部状态取成一份 JSON。
+
+```bash
+arona-rs.exe --nogui --debug-api --debug-token=换成你自己的长串
+curl --noproxy '*' "http://127.0.0.1:8787/debug/snapshot?token=换成你自己的长串&tail=200"
+```
+
+也可以直接用浏览器打开 `http://127.0.0.1:8787/`，页面上填令牌就能取快照。
+
+| 路径 | 内容 |
+| --- | --- |
+| `GET /debug/snapshot` | 完整快照（JSON）；`?tail=N` 指定带回多少行日志 |
+| `GET /debug/logs` | 最近日志（纯文本，一行一条） |
+| `GET /debug/healthz` | `ok`，存活探测 |
+
+快照里有什么：
+
+- `process`：pid、版本、**符号布局号与工具链指纹**（插件装载的判据就这两个）、uptime、
+  专用工作集（与任务管理器同口径）、CPU 数、平台
+- `plugins`：每个插件的 id/名字/版本/作者/装载器、状态（运行中/已装配/已停用/失败原因）、
+  是否生效、是否按群生效、累计失败次数、**命令数 / 订阅数 / 定时任务数**、硬依赖
+- `commands`：全量命令表（名字、插件、用法、权限、优先级、登记序号）
+- `hooks`：每条事件订阅的归属、优先级、订阅范围，以及它是不是出站钩子
+- `jobs`：定时任务（名字、归属分组、上次/下次触发时间）
+- `views`：各插件经展示板上报的「这个会话订了什么」
+- `config`：群白名单、管理员、黑名单条数、停用的插件/功能、命令前缀、panic 阈值
+- `logs`：最近若干行（含 stderr 标记）
+
+几个设计上的取舍，避免用的时候踩坑：
+
+- **不做成 cargo feature**。插件 ABI 的工具链指纹里含 feature 集合，多一个 feature 会让
+  「调试版」和「发行版」编出的插件互相拒载。所以是同一个二进制、运行期开关：
+  不加参数就是生产行为，加了才有端点。
+- **不写进 `arona.yml`**。那个结构体是插件会直接读的类型，加字段就得抬 `ABI_LAYOUT`。
+  调试口这点便利不值得让所有插件重编，所以开关只走启动参数与环境变量。
+- **默认只绑回环、且要令牌**。绑到非回环地址却没给 `--debug-token` 时**直接拒绝启动**：
+  这份东西能读出全部插件状态与最近日志，不该裸奔在公网上。
+- 端点只读：没有任何"改配置 / 停插件 / 触发任务"的入口。要动状态还是走 GUI 或命令。
 
 ## 疑难排查
 

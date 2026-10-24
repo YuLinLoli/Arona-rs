@@ -1060,6 +1060,69 @@ impl HookRegistry {
             seq: self.seq.fetch_add(1, Ordering::SeqCst),
         });
     }
+
+    /// 当前全部订阅的摘要（调试接口 / 诊断用）。
+    ///
+    /// 只读，且**不参与 ABI**：它返回的是新建的值类型（[`HookInfo`]），
+    /// 不是表里的条目本身——所以插件拿着它随便改都不会动到注册表。
+    pub fn describe(&self) -> Vec<HookInfo> {
+        let mut out = Vec::new();
+        if let Ok(hooks) = self.hooks.read() {
+            for hook in hooks.iter() {
+                out.push(HookInfo {
+                    plugin: hook.plugin.clone(),
+                    feature: hook.feature,
+                    priority: hook.priority,
+                    filters: if hook.filters.is_empty() {
+                        vec!["All".to_string()]
+                    } else {
+                        hook.filters.iter().map(BodyFilter::display_name).collect()
+                    },
+                    outbound: false,
+                });
+            }
+        }
+        if let Ok(outbound) = self.outbound.read() {
+            for hook in outbound.iter() {
+                out.push(HookInfo {
+                    plugin: hook.plugin.clone(),
+                    feature: hook.feature,
+                    priority: hook.priority,
+                    // 出站钩子不看事件体，它看的是要发出去的消息
+                    filters: vec!["Outbound".to_string()],
+                    outbound: true,
+                });
+            }
+        }
+        out
+    }
+
+    /// 某个插件一共订了多少条（入站 + 出站）。调试快照按插件汇总时用它。
+    pub fn count_of_plugin(&self, plugin: &str) -> usize {
+        let inbound = self
+            .hooks
+            .read()
+            .map(|hooks| hooks.iter().filter(|hook| hook.plugin == plugin).count())
+            .unwrap_or(0);
+        let outbound = self
+            .outbound
+            .read()
+            .map(|hooks| hooks.iter().filter(|hook| hook.plugin == plugin).count())
+            .unwrap_or(0);
+        inbound + outbound
+    }
+}
+
+/// 一条事件订阅的摘要（[`HookRegistry::describe`] 的产物）
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HookInfo {
+    pub plugin: String,
+    /// 绑定的分群功能开关；空串表示只跟插件启停走
+    pub feature: &'static str,
+    pub priority: ListenerPriority,
+    /// 订阅范围的可读说法（`All` / `群消息` / …）；出站钩子固定为 `Outbound`
+    pub filters: Vec<String>,
+    pub outbound: bool,
 }
 
 /// 便捷入口：只订阅某一类事件

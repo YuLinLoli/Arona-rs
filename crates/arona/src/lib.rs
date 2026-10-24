@@ -16,6 +16,9 @@ pub mod bot;
 pub mod config;
 /// 插件间能力共享容器（对应 mirai 的 `DiContainer`）
 pub mod container;
+/// 运行期自省：把插件、命令、钩子、定时任务、连接与最近日志取成一份 JSON 快照，
+/// 由 `--debug-api` 在回环地址上开一个只读端点（默认不开）
+pub mod debug;
 /// 框架实例：插件契约面的注册表按实例持有（对应 mirai 的 `MiraiInstance`）
 pub mod framework;
 pub mod onebot;
@@ -235,6 +238,10 @@ pub(crate) async fn run_bot(
     // 聊天记录库随启动建好：留档从第一条消息就有，路径不可写这类问题也当场报在启动日志里，
     // 而不是等第一条消息记账时才暴露
     runtime::chatlog::open(&runtime::paths::chatlog_file());
+
+    // 运行期自省：默认不开，只有启动参数（或环境变量）点名要时才监听回环地址。
+    // 放在这里而不是 GUI 之外，是因为两种启动方式（面板/命令行）都该能看运行状态。
+    debug::start(&args).await;
 
     // 插件配置：每个插件一份 config/<插件>/arona.yml（旧写法已在上面被接管，这里落盘并加载）
     config::plugin_config::init();

@@ -20,8 +20,8 @@
 
 ```
 Cargo.toml                 # 虚拟 workspace（resolver=2）
-crates/arona/              # 框架库 crate：包名 arona-rs（库名仍是 arona，见 §15），version=1.2.2
-crates/arona-host/         # 宿主可执行：name=arona-host, version=1.2.2, 产物 bin=arona-rs
+crates/arona/              # 框架库 crate：包名 arona-rs（库名仍是 arona，见 §15），version=1.3.0
+crates/arona-host/         # 宿主可执行：name=arona-host, version=1.3.0, 产物 bin=arona-rs
 plugins/hello/             # 示例插件：name=hello-plugin, crate-type=["cdylib", "rlib"]
 ```
 
@@ -29,7 +29,7 @@ plugins/hello/             # 示例插件：name=hello-plugin, crate-type=["cdyl
 编译出 `xxx_plugin.dll`（Linux: `xxx_plugin.so`）后由用户放进运行目录的 `plugins/`，
 框架启动时扫描装载（§22）。
 
-版本约定：框架与 host 同为 `1.2.2`，插件版本号各自演进。
+版本约定：框架与 host 同为 `1.3.0`，插件版本号各自演进。
 **插件接口的破坏性改动抬 `arona::plugin::abi::ABI_LAYOUT`**（与 crate 版本号无关），见 §6；
 **插件会读的那个类型换了布局**（`Framework`、`CommandContext`、`EventBody`、`BodyFilter`、`OneBotApi`
 这些，加字段/加变体/改字段类型）另抬 `arona::plugin::abi::ABI_LAYOUT`（当前 `9`），见 §22。
@@ -1207,7 +1207,7 @@ ctx.clear_all_rows();       // 全摘（一般用不上：插件被停用时框�
 
    [dependencies]
    # 务必 default-features = false（§16）。arona 的版本必须与目标宿主完全一致
-   arona = { package = "arona-rs", version = "1.2.2", default-features = false }
+   arona = { package = "arona-rs", version = "1.3.0", default-features = false }
    # 类型化配置要 derive（§12）；命令/钩子的 async 体里要 tokio::time::sleep、select! 也得直依赖
    # （§22 的"两份 tokio"小节：框架按帧给这类任务补装运行时上下文）。
    # 起后台任务请用 ctx.spawn（§10），别裸 tokio::spawn，更不要 #[tokio::main]——运行时是宿主那一个
@@ -1335,6 +1335,33 @@ cargo fmt --all
 框架侧的启动路径（`arona-host`）与插件仓库不在同一个 workspace，直接把 host 的 `Cargo.toml`
 用 `arona = { package = "arona-rs", path = "../Arona-rs/crates/arona" }` 指过来即可同源联调。
 本地运行若被提权逻辑拦住，用 `ARONA_NO_ELEVATE=1` 绕过。
+
+**运行期自检**：宿主加 `--debug-api --debug-token=<长串>` 启动后，
+`GET http://127.0.0.1:8787/debug/snapshot?token=<长串>` 就能拿到一份运行状态 JSON
+（插件表、命令表、事件订阅、定时任务、连接、内存、最近日志，字段见 README「运行期自检」）。
+插件侧也能直接读——`attach_host` 已经把插件里那份 `Framework::global()` 改指宿主实例，
+所以下面这三个函数拿到的是**宿主**的状态，不是 dll 自己那份空壳：
+
+```rust
+// 一份结构化的快照（值类型，可以随便挑字段）
+let snapshot = arona::debug::snapshot();
+let busy: Vec<&str> = snapshot
+    .plugins
+    .iter()
+    .filter(|plugin| plugin.running && plugin.id != "自己")
+    .map(|plugin| plugin.id.as_str())
+    .collect();
+
+// 或者直接拿 JSON 文本
+arona::runtime::log::info(arona::debug::snapshot_json());
+
+// 程序卡住、来不及连端点时：先 dump 一份到盘上
+let path = arona::debug::write_snapshot(&ctx.data_dir()).expect("写快照失败");
+```
+
+给自己加一条 debug 命令时注意两点：**别把 `logs` 原样贴到群里**（里面有别人的 QQ 号、
+消息片段与路径），也别把它当稳定接口——`schema` 是给外部脚本判版本的，字段会变。
+真要贴，挑 `plugins` 里自己那一档 + `jobs` 里自己排的那几条就够。
 
 GUI 相关的落地细节（改动前务必先读）：
 - **Linux 版不含 GUI**：`cargo build -p arona-host --no-default-features`，此时 eframe/wgpu 整个
@@ -1874,7 +1901,7 @@ rustc/1.98.0|host/x86_64-pc-windows-msvc|target/x86_64-pc-windows-msvc|profile/r
 ### 发布插件时必须写明的三件事
 
 ```
-适用于 Arona-rs 1.2.2（符号布局 10）
+适用于 Arona-rs 1.3.0（符号布局 10）
 构建工具链：rustc 1.98.0，x86_64-pc-windows-msvc，--release，crt-static
 下载后放进 <框架运行目录>/plugins/<你的id>/，重启框架
 ```
@@ -1882,7 +1909,7 @@ rustc/1.98.0|host/x86_64-pc-windows-msvc|target/x86_64-pc-windows-msvc|profile/r
 Linux 版把第二行换成那台机器自己的三元组（形如 `x86_64-unknown-linux-gnu`、`crt-static/0`）：
 
 ```
-适用于 Arona-rs 1.2.2（符号布局 10）
+适用于 Arona-rs 1.3.0（符号布局 10）
 构建工具链：rustc 1.98.0，x86_64-unknown-linux-gnu，--release
 下载后放进 <框架运行目录>/plugins/<你的id>/，重启框架
 ```
