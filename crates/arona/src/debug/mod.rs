@@ -35,13 +35,32 @@
 //! | --- | --- |
 //! | `GET /debug/snapshot` | 完整快照（JSON），`?tail=N` 控制日志行数 |
 //! | `GET /debug/logs` | 最近日志（纯文本，一行一条） |
+//! | `GET /debug/send-test` | 往调试群发一条带固定前缀的测试消息，确认发送链路通不通 |
 //! | `GET /debug/healthz` | `ok`，存活探测 |
 //!
 //! 鉴权：`Authorization: Bearer <token>`，或 `?token=<token>`（给浏览器直接点开用）。
+//!
+//! ## 调试群是干什么的
+//!
+//! 调试接口绑在回环地址上，只有**本机**能连。但排障的往往不是本机的终端：Agent 跑在
+//! 别处、人在手机上、或者只是不想为了看一眼状态去开个 SSH 隧道。所以设置里留一个
+//! 「调试群」——`/debug/send-test` 会让机器人往那个群发一条带 `【Arona 调试】` 前缀的
+//! 测试消息，Agent 拿到 message_id、主人在群里看到实物，两边一对就知道**发送链路**
+//! 断在哪一层：插件没发 / 端口没通 / OneBot 掉线 / 群号错 / 机器人不在群里。
+//!
+//! **读**状态永远走端口（Agent 自己拉 JSON），群里只做这一件事：确认「消息发出去没有」。
+//! 固定前缀是安全边界，不是装饰——令牌万一泄露，持有者也只能在调试群刷带标记的测试
+//! 消息，没法让机器人说出像人说的话。
+//!
+//! ## GUI 开关
+//!
+//! 「关于」页有一块调试设置（启用开关 / 端口 / 调试群 / 令牌），点「确认生效」当场启停，
+//! 不用重启程序。持久化写在 `config/debug.yml`——**不是** `arona.yml`，理由同上：
+//! 那个结构体跨边界，加字段要抬 ABI。这里单独一个小文件，框架自己的事自己存。
 
 use crate::framework::Framework;
 use crate::runtime::log::LiveLine;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -87,6 +106,8 @@ pub struct Snapshot {
     pub jobs: Vec<Job>,
     pub views: Vec<View>,
     pub config: Config,
+    /// 最近若干次 OneBot 动作（发送是否成功、耗时多久）
+    pub outbox: Vec<OutgoingCall>,
     /// 最近日志（最旧在前）
     pub logs: Vec<LogLine>,
 }
@@ -210,6 +231,81 @@ pub struct LogLine {
     pub text: String,
 }
 
+/// 一次 OneBot 动作的结局。
+///
+/// 主人说"机器人没反应"时，光看插件日志判断不了是**插件压根没发**、还是**发了但实现端拒了**。
+/// 这里把每一次动作的成败与耗时都留一份，Agent 一眼能看出卡在哪一层。
+#[derive(Clone, Debug, Serialize)]
+pub struct OutgoingCall {
+    /// 本机时间 HH:MM:SS
+    pub at: String,
+    /// OneBot 动作名（`send_group_msg` / `get_msg` / …）
+    pub action: String,
+    pub ok: bool,
+    /// 失败原因；成功时是空串
+    pub detail: String,
+    pub millis: u64,
+}
+
+/// 动作记录留多少条：够看清"最近有没有发出去"，又不至于把内存吃掉
+const OUTBOX_CAPACITY: usize = 200;
+
+fn outbox() -> &'static std::sync::Mutex<std::collections::VecDeque<OutgoingCall>> {
+    static OUTBOX: OnceLock<std::sync::Mutex<std::collections::VecDeque<OutgoingCall>>> =
+        OnceLock::new();
+    OUTBOX.get_or_init(|| std::sync::Mutex::new(std::collections::VecDeque::new()))
+}
+
+/// 记一次 OneBot 动作（成功/失败/耗时）。调用方是 `OneBotApi::raw`——所有动作都过它。
+pub fn record_call(action: &str, ok: bool, detail: &str, elapsed: std::time::Duration) {
+    let Ok(mut queue) = outbox().lock() else {
+        return;
+    };
+    if queue.len() >= OUTBOX_CAPACITY {
+        queue.pop_front();
+    }
+    queue.push_back(OutgoingCall {
+        at: chrono::Local::now().format("%H:%M:%S").to_string(),
+        action: action.to_string(),
+        ok,
+        detail: detail.to_string(),
+        millis: elapsed.as_millis().min(u64::MAX as u128) as u64,
+    });
+}
+
+/// 最近若干次动作（最旧在前）
+pub fn recent_calls(limit: usize) -> Vec<OutgoingCall> {
+    let Ok(queue) = outbox().lock() else {
+        return Vec::new();
+    };
+    let skip = queue.len().saturating_sub(limit);
+    queue.iter().skip(skip).cloned().collect()
+}
+
+/// 清空动作记录（"我要重新看一次"时用）
+pub fn clear_calls() {
+    if let Ok(mut queue) = outbox().lock() {
+        queue.clear();
+    }
+}
+
+/// 「发送自检」那条消息的正文。
+///
+/// 固定前缀是**安全边界**，不是装饰：令牌万一泄露，持有者也只能在调试群里刷带标记的
+/// 测试消息，没法让机器人说出像人说的话（不能冒充主人在别的群发指令）。
+pub fn test_message(extra: &str) -> String {
+    let extra: String = extra.trim().chars().take(300).collect();
+    let head = format!(
+        "【Arona 调试】发送链路自检 · {}",
+        chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+    );
+    if extra.is_empty() {
+        head
+    } else {
+        format!("{head}\n{extra}")
+    }
+}
+
 // ==================== 采集 ====================
 
 /// 取一份当前快照（进程默认实例）
@@ -246,6 +342,7 @@ pub fn snapshot_of(framework: &Framework) -> Snapshot {
         jobs,
         views: collect_views(framework),
         config: collect_config(framework),
+        outbox: recent_calls(50),
         logs: collect_logs(DEFAULT_LOG_TAIL),
     }
 }
@@ -433,6 +530,153 @@ pub fn write_snapshot(dir: &Path) -> std::io::Result<PathBuf> {
     Ok(path)
 }
 
+// ==================== 持久化设置与启停 ====================
+
+/// 调试接口的持久化设置（`config/debug.yml`）。
+///
+/// 单独一个文件、而不是塞进 `arona.yml`：后者是插件会直接读的 `pub` 类型，加字段要抬
+/// `ABI_LAYOUT`，而这一份只有框架自己看。改动它不影响任何插件。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct Settings {
+    /// 是否启用。默认**关**——生产用户不该被动多开一个端点
+    pub enabled: bool,
+    /// 监听端口（固定绑 `127.0.0.1`，不开放改绑地址）
+    pub port: u16,
+    /// 调试群号：`/debug/to-group` 把摘要发到这里；`0` 表示没配
+    pub group: i64,
+    /// 访问令牌。首次启用时自动生成，GUI 里可以复制
+    pub token: String,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Settings {
+            enabled: false,
+            port: 8787,
+            group: 0,
+            token: String::new(),
+        }
+    }
+}
+
+/// 设置文件：`config/debug.yml`
+pub fn settings_file() -> PathBuf {
+    crate::runtime::paths::config_root().join("debug.yml")
+}
+
+/// 读设置。文件不在、读坏了都退回默认值——而默认是「关」，所以坏文件等于没开，
+/// 不会因为手抖写坏一个 YAML 就把端点暴露出去。
+pub fn load_settings() -> Settings {
+    load_settings_from(&settings_file())
+}
+
+/// 指定路径的读（测试用；生产走 [`load_settings`]）
+fn load_settings_from(path: &Path) -> Settings {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Settings::default();
+    };
+    match serde_yaml::from_str::<Settings>(&text) {
+        Ok(mut settings) => {
+            if settings.port == 0 {
+                settings.port = DEFAULT_PORT;
+            }
+            settings
+        }
+        Err(err) => {
+            crate::runtime::log::warning(format!(
+                "调试设置 {} 读不出来，按「关闭」处理: {err}",
+                path.display()
+            ));
+            Settings::default()
+        }
+    }
+}
+
+/// 写设置。文件头带两行注释：用户手改时不用回来翻文档。
+pub fn save_settings(settings: &Settings) -> Result<(), String> {
+    save_settings_to(&settings_file(), settings)
+}
+
+fn save_settings_to(path: &Path, settings: &Settings) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|err| format!("建配置目录失败: {err}"))?;
+    }
+    let text = format!(
+        "# Arona 调试接口（GUI「关于」页也能改）。enabled 只影响这个只读端点，不影响机器人本身；\n\
+         # 端口固定绑 127.0.0.1；group 是发送自检的调试群号（0 表示不配）。\n\
+         enabled: {}\nport: {}\ngroup: {}\ntoken: \"{}\"\n",
+        settings.enabled, settings.port, settings.group, settings.token
+    );
+    std::fs::write(path, text).map_err(|err| format!("写 {} 失败: {err}", path.display()))
+}
+
+/// 生成够长的令牌：两个 UUID v4 拼成 64 个十六进制字符
+fn new_token() -> String {
+    format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    )
+}
+
+struct Running {
+    addr: SocketAddr,
+    stop: tokio::sync::oneshot::Sender<()>,
+}
+
+fn running() -> &'static std::sync::Mutex<Option<Running>> {
+    static RUNNING: OnceLock<std::sync::Mutex<Option<Running>>> = OnceLock::new();
+    RUNNING.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// 当前监听地址；没开就是 `None`（GUI 用它显示状态）
+pub fn listening_at() -> Option<SocketAddr> {
+    running()
+        .lock()
+        .ok()
+        .and_then(|guard| guard.as_ref().map(|run| run.addr))
+}
+
+/// 停掉当前监听。没开时是空操作，可以随便调。
+pub fn stop() {
+    if let Ok(mut guard) = running().lock() {
+        if let Some(run) = guard.take() {
+            let _ = run.stop.send(());
+        }
+    }
+}
+
+/// 按设置启停：先关旧的，再按 `enabled` 决定起不起；成功后落盘。
+///
+/// GUI 的「确认生效」与启动参数走同一条路，两边行为不会分叉。
+/// 返回一句给人看的结果，失败是说得出原因的那种（端口被占、权限不足等）。
+pub async fn apply(settings: &Settings) -> Result<String, String> {
+    let mut settings = settings.clone();
+    if settings.token.trim().is_empty() {
+        settings.token = new_token();
+    }
+    if settings.port == 0 {
+        return Err("端口不能写 0".to_string());
+    }
+    stop();
+    if !settings.enabled {
+        save_settings(&settings)?;
+        crate::runtime::log::info("调试接口已关闭");
+        return Ok("调试接口已关闭".to_string());
+    }
+    let config = ServeConfig {
+        bind: format!("127.0.0.1:{}", settings.port),
+        token: Some(settings.token.clone()),
+        log_tail: DEFAULT_LOG_TAIL,
+        group: settings.group,
+    };
+    let addr = serve(&config).await?;
+    save_settings(&settings)?;
+    crate::runtime::log::info_green(format!("调试接口已启用: http://{addr}/debug/snapshot"));
+    Ok(format!("已启用：http://{addr}/debug/snapshot"))
+}
+
 // ==================== 启动参数 ====================
 
 /// 调试接口的启动配置
@@ -441,14 +685,21 @@ pub struct ServeConfig {
     pub bind: String,
     pub token: Option<String>,
     pub log_tail: usize,
+    /// 调试群号：`/debug/to-group` 的收件地址，`0` 表示没配
+    pub group: i64,
 }
+
+/// 默认端口与绑定地址（只绑回环：这份东西能读出全部插件状态与最近日志）
+pub const DEFAULT_PORT: u16 = 8787;
+pub const DEFAULT_BIND: &str = "127.0.0.1:8787";
 
 impl Default for ServeConfig {
     fn default() -> Self {
         ServeConfig {
-            bind: "127.0.0.1:8787".to_string(),
+            bind: DEFAULT_BIND.to_string(),
             token: None,
             log_tail: DEFAULT_LOG_TAIL,
+            group: 0,
         }
     }
 }
@@ -524,16 +775,23 @@ mod http {
     struct Api {
         token: Option<String>,
         log_tail: usize,
+        /// 调试群号：发送自检的默认收件地址
+        group: i64,
     }
 
-    /// 起调试口：绑定、鉴权、挂三条路由。调用方必须已在 tokio 运行时里。
+    /// 起调试口：绑定、鉴权、挂路由。调用方必须已在 tokio 运行时里。
+    ///
+    /// 会先停掉已有的监听再绑：同一份进程不该同时开两个口，而且旧 listener 不先放开，
+    /// 改端口后重绑同一个端口会直接失败。
     pub async fn serve(config: &ServeConfig) -> Result<SocketAddr, String> {
+        // 参数不合法就别动现有的监听：配置写错不该把正在跑的那个也停掉
         if config.token.is_none() && !is_loopback(&config.bind) {
             return Err(format!(
                 "调试接口绑在 {} 上却没有 token；绑非回环地址必须给 --debug-token=<令牌>",
                 config.bind
             ));
         }
+        stop();
         let listener = tokio::net::TcpListener::bind(&config.bind)
             .await
             .map_err(|err| format!("调试接口绑定 {} 失败: {err}", config.bind))?;
@@ -544,19 +802,33 @@ mod http {
         let api = Api {
             token: config.token.clone(),
             log_tail: config.log_tail,
+            group: config.group,
         };
         let app = Router::new()
             .route("/", get(index))
             .route("/debug/snapshot", get(snapshot_route))
             .route("/debug/logs", get(logs))
+            .route("/debug/send-test", get(send_test))
             .route("/debug/healthz", get(healthz))
             .with_state(api);
 
+        // 关停靠这条 oneshot：GUI 点「关闭」或改了端口，都得让旧 listener 真正退出。
+        // 否则端口一直占着，会出现"旧的还能连、新的也起不来"的鬼现象。
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
         tokio::spawn(async move {
-            if let Err(err) = axum::serve(listener, app).await {
+            let server = axum::serve(listener, app).with_graceful_shutdown(async {
+                let _ = stop_rx.await;
+            });
+            if let Err(err) = server.await {
                 crate::runtime::log::error(format!("调试接口已停止: {err}"));
             }
         });
+        if let Ok(mut guard) = super::running().lock() {
+            *guard = Some(super::Running {
+                addr,
+                stop: stop_tx,
+            });
+        }
         Ok(addr)
     }
 
@@ -613,17 +885,65 @@ async function load(){
         "ok"
     }
 
+    /// 从查询串里取一个参数（`?a=1&b=2`）。不引 `Query` 提取器：这里只要几个可选值，
+    /// 手写一遍比给每个 handler 定义结构体省事，也避免 `serde_urlencoded` 那一串依赖。
+    fn query_param(uri: &Uri, key: &str) -> Option<String> {
+        uri.query()
+            .into_iter()
+            .flat_map(|query| query.split('&'))
+            .filter_map(|pair| pair.split_once('='))
+            .find(|(name, _)| *name == key)
+            .map(|(_, value)| value.to_string())
+    }
+
+    /// 往调试群发一条带固定前缀的测试消息，用来确认**发送链路**通不通。
+    ///
+    /// 读状态走 `/debug/snapshot`（Agent 直接读端口），这条只回答一个问句：
+    /// 「现在这一秒，机器人能不能把消息送进这个群」。返回里带 message_id 与耗时，
+    /// 主人那边看群有没有弹出消息，两边一对就知道断在哪一层（插件没发 / 端口 / OneBot / 群号错）。
+    async fn send_test(State(api): State<Api>, headers: HeaderMap, uri: Uri) -> Response {
+        if !allowed(&api, &headers, &uri) {
+            return unauthorized();
+        }
+        let group = query_param(&uri, "group")
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(api.group);
+        if group <= 0 {
+            return (
+                StatusCode::BAD_REQUEST,
+                "没有配置调试群：GUI「关于」页填一个群号，或请求时带 ?group=<群号>",
+            )
+                .into_response();
+        }
+        let text = super::test_message(&query_param(&uri, "text").unwrap_or_default());
+        let started = std::time::Instant::now();
+        match crate::bot::Bot::current()
+            .api()
+            .send_group_msg(group, text)
+            .await
+        {
+            Ok(id) => (
+                StatusCode::OK,
+                format!(
+                    "已投递到群 {group}：message_id={id}，耗时 {} ms。请主人在群里确认是否收到。",
+                    started.elapsed().as_millis()
+                ),
+            )
+                .into_response(),
+            Err(err) => (
+                StatusCode::BAD_GATEWAY,
+                format!("投递到群 {group} 失败：{err}。先确认 OneBot 在线、机器人确实在这个群里。"),
+            )
+                .into_response(),
+        }
+    }
+
     async fn snapshot_route(State(api): State<Api>, headers: HeaderMap, uri: Uri) -> Response {
         if !allowed(&api, &headers, &uri) {
             return unauthorized();
         }
-        let tail = uri
-            .query()
-            .into_iter()
-            .flat_map(|query| query.split('&'))
-            .filter_map(|pair| pair.split_once('='))
-            .find(|(key, _)| *key == "tail")
-            .and_then(|(_, value)| value.parse::<usize>().ok())
+        let tail = query_param(&uri, "tail")
+            .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(api.log_tail);
         let mut snap = super::snapshot();
         snap.logs = collect_logs(tail);
@@ -639,13 +959,8 @@ async function load(){
         if !allowed(&api, &headers, &uri) {
             return unauthorized();
         }
-        let tail = uri
-            .query()
-            .into_iter()
-            .flat_map(|query| query.split('&'))
-            .filter_map(|pair| pair.split_once('='))
-            .find(|(key, _)| *key == "tail")
-            .and_then(|(_, value)| value.parse::<usize>().ok())
+        let tail = query_param(&uri, "tail")
+            .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(api.log_tail);
         let text = collect_logs(tail)
             .into_iter()
@@ -668,22 +983,34 @@ pub use http::serve;
 /// 按启动参数决定要不要起调试口，并把结果写进日志。`run_bot` 里调一次。
 pub async fn start(args: &[String]) {
     boot();
-    let Some(config) = requested(args) else {
+
+    // 启动参数优先（临时排障用）；没有参数就按 config/debug.yml 里存的那份走——
+    // 否则 GUI 里打开开关、重启之后又变回关，用户会以为设置没保存。
+    if let Some(config) = requested(args) {
+        match serve(&config).await {
+            Ok(addr) => {
+                let token = match config.token.as_deref() {
+                    Some(token) => format!("token={}", mask(token)),
+                    None => "无 token（仅回环地址）".to_string(),
+                };
+                crate::runtime::log::info_green(format!(
+                    "调试接口已启动: http://{addr}/debug/snapshot  （{token}）"
+                ));
+            }
+            Err(err) => {
+                crate::runtime::log::warning(format!("调试接口未启动: {err}"));
+            }
+        }
         return;
-    };
-    match serve(&config).await {
-        Ok(addr) => {
-            let token = match config.token.as_deref() {
-                Some(token) => format!("token={}", mask(token)),
-                None => "无 token（仅回环地址）".to_string(),
-            };
-            crate::runtime::log::info_green(format!(
-                "调试接口已启动: http://{addr}/debug/snapshot  （{token}）"
-            ));
-        }
-        Err(err) => {
-            crate::runtime::log::warning(format!("调试接口未启动: {err}"));
-        }
+    }
+
+    let settings = load_settings();
+    if !settings.enabled {
+        return;
+    }
+    match apply(&settings).await {
+        Ok(message) => crate::runtime::log::info_green(format!("调试接口: {message}")),
+        Err(err) => crate::runtime::log::warning(format!("调试接口未启动: {err}")),
     }
 }
 
@@ -701,6 +1028,36 @@ fn mask(token: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 监听地址是进程级单例，两个用例同时起会互相 `stop()`。串起来跑。
+    /// （同 `runtime::log` 里那个 `LIVE_LOG_TEST_LOCK` 的理由。）
+    static HTTP_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// 等某个端口的连接真的被拒。
+    ///
+    /// 关停是**异步**的：`stop()` 只发一个信号，listener 在下一个调度周期才退出。
+    /// 所以断言"立刻连不上"会偶发失败——这里轮询到 1 秒，验的是"最终真的关了"，
+    /// 这恰好也是用户能感知的承诺（改端口后旧端口不该还能用）。
+    async fn eventually_refuses(addr: std::net::SocketAddr) -> bool {
+        // 必须带超时：端口还没关时连接会被接受，而 reqwest 默认无限等响应，
+        // 一挂就是一轮 CI 超时
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(300))
+            .build()
+            .expect("建不了测试客户端");
+        for _ in 0..40 {
+            if client
+                .get(format!("http://{addr}/debug/healthz"))
+                .send()
+                .await
+                .is_err()
+            {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        false
+    }
 
     #[test]
     fn loopback_detection_covers_the_usual_spellings() {
@@ -749,6 +1106,7 @@ mod tests {
             "jobs",
             "views",
             "config",
+            "outbox",
             "logs",
         ] {
             assert!(parsed.get(key).is_some(), "快照缺字段 {key}：{json}");
@@ -774,10 +1132,12 @@ mod tests {
     /// 端到端：真的起一个监听、真的发 HTTP。端口给 0 让系统挑，避免和本机别的东西撞。
     #[tokio::test]
     async fn http_serves_snapshot_and_enforces_the_token() {
+        let _guard = HTTP_TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let config = ServeConfig {
             bind: "127.0.0.1:0".to_string(),
             token: Some("secret-token-123".to_string()),
             log_tail: 5,
+            group: 0,
         };
         let addr = serve(&config).await.expect("调试口应当能在回环地址上起来");
 
@@ -819,10 +1179,110 @@ mod tests {
             bind: "0.0.0.0:0".to_string(),
             token: None,
             log_tail: 5,
+            group: 0,
         };
         let err = serve(&config)
             .await
             .expect_err("没有 token 就不该绑到公网地址");
         assert!(err.contains("token"), "{err}");
+    }
+
+    /// 设置落盘再读回来必须一模一样：GUI 点完「确认生效」重启后看到的值不该变
+    #[test]
+    fn settings_roundtrip_through_the_file() {
+        let dir = std::env::temp_dir().join(format!("arona-debug-settings-{}", std::process::id()));
+        let path = dir.join("debug.yml");
+        let settings = Settings {
+            enabled: true,
+            port: 8899,
+            group: 123456,
+            token: "abcdef123456".to_string(),
+        };
+        save_settings_to(&path, &settings).expect("写设置失败");
+        assert_eq!(load_settings_from(&path), settings);
+
+        // 文件不存在 → 默认（且默认必须是「关」）
+        let missing = load_settings_from(&dir.join("nope.yml"));
+        assert!(!missing.enabled, "读不到就按关处理，不能默认开");
+
+        // 文件写坏了 → 同样退回关，不能因为 YAML 坏了就把端点开出来
+        std::fs::write(&path, "enabled: [这不是布尔]").unwrap();
+        assert!(!load_settings_from(&path).enabled);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 启停要真的换端口：旧 listener 必须退出，否则用户会以为"改了没生效"
+    #[tokio::test]
+    async fn serve_moves_to_a_new_port_and_stop_closes_it() {
+        let _guard = HTTP_TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let first = ServeConfig {
+            bind: "127.0.0.1:0".to_string(),
+            token: Some("t0ken-aaaa".to_string()),
+            log_tail: 5,
+            group: 0,
+        };
+        let first_addr = serve(&first).await.expect("起第一个");
+        assert_eq!(listening_at(), Some(first_addr));
+
+        let second = ServeConfig {
+            bind: "127.0.0.1:0".to_string(),
+            token: Some("t0ken-bbbb".to_string()),
+            log_tail: 5,
+            group: 0,
+        };
+        let second_addr = serve(&second).await.expect("起第二个");
+        assert_ne!(first_addr, second_addr);
+        assert_eq!(listening_at(), Some(second_addr));
+        assert!(
+            eventually_refuses(first_addr).await,
+            "旧端口还能连，说明旧的 listener 没关掉"
+        );
+
+        stop();
+        assert!(listening_at().is_none());
+        assert!(eventually_refuses(second_addr).await, "停掉之后不该还能连");
+    }
+
+    /// 自检消息的固定前缀是安全边界：令牌泄露也只能发这种带标记的消息
+    #[test]
+    fn test_message_keeps_its_marker_and_truncates() {
+        let plain = test_message("");
+        assert!(plain.starts_with("【Arona 调试】"), "{plain}");
+
+        let custom = test_message("  看这里  ");
+        assert!(custom.starts_with("【Arona 调试】"));
+        assert!(custom.ends_with("看这里"), "{custom}");
+
+        let long = test_message(&"啊".repeat(1000));
+        assert!(long.chars().count() < 400, "超长正文没截断");
+    }
+
+    /// 动作记录要能被快照读到（"主人说没收到"时靠它判断是没发还是发失败）
+    #[test]
+    fn outbox_records_calls_in_order() {
+        clear_calls();
+        record_call(
+            "send_group_msg",
+            false,
+            "实现端拒绝",
+            std::time::Duration::from_millis(42),
+        );
+        record_call(
+            "send_group_msg",
+            true,
+            "",
+            std::time::Duration::from_millis(7),
+        );
+        let calls = recent_calls(10);
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert!(!calls[0].ok);
+        assert_eq!(calls[0].millis, 42);
+        assert_eq!(calls[0].detail, "实现端拒绝");
+        assert!(calls[1].ok);
+        // 只要最后一条时也按"最旧在前"给
+        let last = recent_calls(1);
+        assert_eq!(last.len(), 1);
+        assert!(last[0].ok);
     }
 }

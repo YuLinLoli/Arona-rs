@@ -503,10 +503,19 @@ struct AronaGui {
     log_scope_chat: bool,
     log_scope_plugin: bool,
     log_max: usize,
+    // 关于页：调试接口（只读自省端点）
+    debug_enabled: bool,
+    debug_port: String,
+    debug_group: String,
+    /// 令牌明文：GUI 里是唯一能看到完整值的地方（用户要复制给 Agent）
+    debug_token: String,
 }
 
 impl AronaGui {
     fn new(rt: tokio::runtime::Handle, tx: Sender<Msg>, rx: Receiver<Msg>) -> AronaGui {
+        // 调试接口的开关与端口存在 config/debug.yml（不是 arona.yml：那个结构体跨插件边界，
+        // 加字段要抬 ABI）。这里只是把磁盘上的值搬进输入框。
+        let debug_settings = crate::debug::load_settings();
         AronaGui {
             rt,
             tx,
@@ -547,6 +556,14 @@ impl AronaGui {
             log_scope_chat: false,
             log_scope_plugin: false,
             log_max: 500,
+            debug_enabled: debug_settings.enabled,
+            debug_port: debug_settings.port.to_string(),
+            debug_group: if debug_settings.group > 0 {
+                debug_settings.group.to_string()
+            } else {
+                String::new()
+            },
+            debug_token: debug_settings.token,
         }
     }
 
@@ -2029,7 +2046,7 @@ impl eframe::App for AronaGui {
                 egui::CentralPanel::default()
                     .frame(pane_frame(ctx))
                     .show(ctx, |ui| {
-                        scroll_y(ui, |ui| self.about(ui));
+                        scroll_y(ui, |ui| self.about(ui, ctx));
                     });
             }
         }
@@ -2242,7 +2259,7 @@ fn draw_log_lines(
 impl AronaGui {
     // ==================== 关于 ====================
 
-    fn about(&self, ui: &mut egui::Ui) {
+    fn about(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let dark = ui.visuals().dark_mode;
         if let Some(icon) = &self.icon {
             ui.add(
@@ -2319,8 +2336,125 @@ impl AronaGui {
                 }
             });
         });
+        ui.add_space(10.0);
+
+        card_row(ui, dark, |ui| {
+            section_title(ui, "调试接口");
+            ui.label(
+                "排障用的只读端点：插件状态、命令表、事件订阅、定时任务、以及每次 OneBot 动作的\
+                 成败与耗时，都能从这里读成 JSON。默认关闭，只绑本机 127.0.0.1。",
+            );
+            ui.weak(
+                "远程 Agent 靠这个端口读全部运行信息；「调试群」只用来确认「消息到底发出去没有」\
+                 ——让机器人往那个群发一条带标记的测试消息，你和它各看一眼即可。",
+            );
+            ui.add_space(6.0);
+
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.debug_enabled, "启用调试接口");
+                ui.add_space(16.0);
+                ui.label("端口");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.debug_port)
+                        .desired_width(64.0)
+                        .hint_text("8787"),
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.label("调试群");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.debug_group)
+                        .desired_width(140.0)
+                        .hint_text("群号，可留空"),
+                );
+                ui.weak("发送自检的目标群");
+            });
+            ui.horizontal(|ui| {
+                ui.label("令牌");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.debug_token)
+                        .desired_width(330.0)
+                        .hint_text("留空则自动生成"),
+                );
+                if ui.button("复制").clicked() {
+                    ui.ctx().copy_text(self.debug_token.clone());
+                }
+            });
+
+            // 当前是否在跑：读静态里的监听地址，一次 Mutex 读，每帧一次不心疼
+            match crate::debug::listening_at() {
+                Some(addr) => {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(0x3D, 0xA5, 0x63),
+                        format!("● 运行中：http://{addr}/debug/snapshot"),
+                    );
+                }
+                None => {
+                    ui.weak("○ 未启用");
+                }
+            }
+
+            ui.horizontal(|ui| {
+                if ui.button("确认生效").clicked() {
+                    match self.debug_form() {
+                        Ok(settings) => {
+                            self.spawn(ctx, async move {
+                                Msg::Note(crate::debug::apply(&settings).await)
+                            });
+                        }
+                        Err(reason) => self.note::<()>(Err(reason)),
+                    }
+                }
+                if ui.button("打开配置目录").clicked() {
+                    open_dir(&paths::config_root());
+                }
+            });
+            ui.weak(format!(
+                "设置存 {}",
+                crate::debug::settings_file().display()
+            ));
+        });
         ui.add_space(12.0);
         ui.weak("提示：右上角「外观」可切换白天 / 黑夜模式，选择会保存到 config\\gui.txt。");
+    }
+
+    /// 把「关于」页那三个输入框读成一份设置。
+    ///
+    /// 写错就当场说错在哪：悄悄按默认值跑的话，用户会以为改生效了，然后对着一个
+    /// 没开的端口找半小时。令牌留空时这里生成并回填，保证界面上看到的就是文件里的。
+    fn debug_form(&mut self) -> Result<crate::debug::Settings, String> {
+        let port: u16 = self
+            .debug_port
+            .trim()
+            .parse()
+            .map_err(|_| format!("端口「{}」不是 1-65535 的数字", self.debug_port.trim()))?;
+        if port == 0 {
+            return Err("端口不能是 0".to_string());
+        }
+        let raw_group = self.debug_group.trim();
+        let group: i64 = if raw_group.is_empty() {
+            0
+        } else {
+            raw_group
+                .parse()
+                .map_err(|_| format!("群号「{raw_group}」不是数字"))?
+        };
+        if group < 0 {
+            return Err("群号不能是负数".to_string());
+        }
+        if self.debug_token.trim().is_empty() {
+            self.debug_token = format!(
+                "{}{}",
+                uuid::Uuid::new_v4().simple(),
+                uuid::Uuid::new_v4().simple()
+            );
+        }
+        Ok(crate::debug::Settings {
+            enabled: self.debug_enabled,
+            port,
+            group,
+            token: self.debug_token.trim().to_string(),
+        })
     }
 }
 

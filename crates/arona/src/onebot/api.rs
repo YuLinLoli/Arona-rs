@@ -208,6 +208,23 @@ impl OneBotApi {
 
     /// 内部：拿到完整响应（含 async 受理），交给具体方法解析
     async fn raw(&self, action: &str, params: Value) -> Result<OneBotActionResponse, OneBotError> {
+        let started = std::time::Instant::now();
+        let result = self.raw_call(action, params).await;
+        // 每一次动作都记一笔给调试接口：成败、耗时、失败原因。
+        // 这解决的是"主人说没收到，到底是没发还是发失败"——只有实现端知道答案。
+        let (ok, detail) = match &result {
+            Ok(_) => (true, String::new()),
+            Err(err) => (false, err.to_string()),
+        };
+        crate::debug::record_call(action, ok, &detail, started.elapsed());
+        result
+    }
+
+    async fn raw_call(
+        &self,
+        action: &str,
+        params: Value,
+    ) -> Result<OneBotActionResponse, OneBotError> {
         let Some(connection) = self.connection() else {
             return Err(OneBotError::NoConnection);
         };
