@@ -10,11 +10,16 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 
+mod tray;
+
 /// 后台任务回传消息
 enum Msg {
     Groups(Result<Vec<admin::GroupInfo>, String>),
     Members(i64, Result<Vec<admin::MemberInfo>, String>),
     Note(Result<String, String>),
+    /// 托盘上发生的动作。走消息通道而不是每帧轮询：窗口收进托盘后就**不再渲染**，
+    /// `update` 也就不会再被调，那时只有托盘线程能把人叫回来。
+    Tray(tray::TrayAction),
 }
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -78,13 +83,102 @@ fn theme_file() -> std::path::PathBuf {
 }
 
 fn load_theme() -> ThemePref {
-    std::fs::read_to_string(theme_file())
-        .map(|text| ThemePref::parse(&text))
-        .unwrap_or(ThemePref::System)
+    load_prefs().theme
 }
 
 fn save_theme(pref: ThemePref) {
-    let _ = std::fs::write(theme_file(), format!("{}\n", pref.key()));
+    save_prefs(GuiPrefs {
+        theme: pref,
+        ..load_prefs()
+    });
+}
+
+/// 点窗口右上角那个 × 时做什么。
+///
+/// 出厂是 [`CloseAction::Ask`]：第一次关窗一定先问清楚。机器人是长期在后台跑的东西，
+/// 用户点 × 通常只想"把面板收起来"，而不是"把整台机器停掉"——但也不是所有人都这么想，
+/// 所以别替他猜，问一次、记住答案就好。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CloseAction {
+    Ask,
+    /// 收进托盘，机器人继续跑
+    Tray,
+    /// 直接退出（连机器人一起停）
+    Quit,
+}
+
+impl CloseAction {
+    fn key(self) -> &'static str {
+        match self {
+            CloseAction::Ask => "ask",
+            CloseAction::Tray => "tray",
+            CloseAction::Quit => "quit",
+        }
+    }
+
+    fn parse(text: &str) -> Option<CloseAction> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "ask" => Some(CloseAction::Ask),
+            "tray" | "minimize" | "min" => Some(CloseAction::Tray),
+            "quit" | "exit" => Some(CloseAction::Quit),
+            _ => None,
+        }
+    }
+}
+
+/// GUI 的持久化偏好：外观 + 关窗行为，一起写进 `config/gui.txt`。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GuiPrefs {
+    theme: ThemePref,
+    close: CloseAction,
+}
+
+/// 读偏好。**兼容老格式**：以前这个文件里只有一行裸主题值（`dark`），
+/// 现在改成 `键=值`；遇到没有 `=` 的行仍按主题解析，老用户的设置不会丢。
+fn load_prefs() -> GuiPrefs {
+    std::fs::read_to_string(theme_file())
+        .map(|text| parse_prefs(&text))
+        .unwrap_or(GuiPrefs {
+            theme: ThemePref::System,
+            close: CloseAction::Ask,
+        })
+}
+
+/// 解析 `config/gui.txt` 的正文（纯函数，便于单测）
+fn parse_prefs(text: &str) -> GuiPrefs {
+    let mut prefs = GuiPrefs {
+        theme: ThemePref::System,
+        close: CloseAction::Ask,
+    };
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        match line.split_once('=') {
+            Some((key, value)) => match key.trim() {
+                "theme" => prefs.theme = ThemePref::parse(value),
+                "close" => {
+                    if let Some(action) = CloseAction::parse(value) {
+                        prefs.close = action;
+                    }
+                }
+                _ => {}
+            },
+            // 老格式：整行就是主题值
+            None => prefs.theme = ThemePref::parse(line),
+        }
+    }
+    prefs
+}
+
+/// 序列化成文件正文（纯函数，便于单测）
+fn prefs_text(prefs: GuiPrefs) -> String {
+    format!("theme={}\nclose={}\n", prefs.theme.key(), prefs.close.key())
+}
+
+fn save_prefs(prefs: GuiPrefs) {
+    let _ = std::fs::write(theme_file(), prefs_text(prefs));
 }
 
 // ==================== 配色（Arona 蓝） ====================
@@ -509,13 +603,49 @@ struct AronaGui {
     debug_group: String,
     /// 令牌明文：GUI 里是唯一能看到完整值的地方（用户要复制给 Agent）
     debug_token: String,
+    // 关窗 / 托盘
+    /// 记住的关窗选择（`Ask` = 每次问）
+    close_action: CloseAction,
+    /// 正在显示「退出还是最小化」那个弹窗
+    confirm_close: bool,
+    /// 弹窗里「不再提示」的勾选状态
+    confirm_remember: bool,
+    /// 已经决定退出：从这一帧起不再拦截关闭请求
+    quitting: bool,
+    /// 窗口是否收在托盘里（决定要不要释放界面缓存）
+    hidden: bool,
+    /// 托盘图标；建不起来就是 `None`，面板照常可用
+    tray: Option<tray::Tray>,
 }
 
 impl AronaGui {
-    fn new(rt: tokio::runtime::Handle, tx: Sender<Msg>, rx: Receiver<Msg>) -> AronaGui {
+    fn new(
+        rt: tokio::runtime::Handle,
+        tx: Sender<Msg>,
+        rx: Receiver<Msg>,
+        egui_ctx: egui::Context,
+    ) -> AronaGui {
         // 调试接口的开关与端口存在 config/debug.yml（不是 arona.yml：那个结构体跨插件边界，
         // 加字段要抬 ABI）。这里只是把磁盘上的值搬进输入框。
         let debug_settings = crate::debug::load_settings();
+        let prefs = load_prefs();
+        // 托盘要拿窗口图标那份 RGBA。图标解不出来（资源缺了）就不建托盘，
+        // 面板本身照常用——关窗时只能选退出。
+        let tray = match load_window_icon() {
+            Some(data) => {
+                let built = tray::Tray::new(data.rgba, data.width, data.height);
+                match &built {
+                    // 事件用独立线程收：窗口收进托盘后不再渲染，`update` 也不再被调，
+                    // 只有这个线程能把"用户点了图标"翻译成一次唤醒
+                    Some(tray) => tray.start_watching(tx.clone(), egui_ctx.clone()),
+                    None => crate::runtime::log::warning(
+                        "托盘图标创建失败（系统不允许或图标尺寸不对）：关闭窗口时只能选择退出",
+                    ),
+                }
+                built
+            }
+            None => None,
+        };
         AronaGui {
             rt,
             tx,
@@ -564,6 +694,162 @@ impl AronaGui {
                 String::new()
             },
             debug_token: debug_settings.token,
+            close_action: prefs.close,
+            confirm_close: false,
+            confirm_remember: false,
+            quitting: false,
+            hidden: false,
+            tray,
+        }
+    }
+
+    // ==================== 关窗 / 托盘 ====================
+
+    /// 拦截窗口关闭请求，按记住的选择决定「问 / 收托盘 / 真退出」。
+    fn handle_close(&mut self, ctx: &egui::Context) {
+        if !ctx.input(|input| input.viewport().close_requested()) {
+            return;
+        }
+        // 已经决定退出：这一次放行，让 eframe 正常返回
+        if self.quitting {
+            return;
+        }
+        // 其余情况一律先取消这次关闭，再按偏好走后续动作
+        ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        match self.close_action {
+            CloseAction::Quit => self.quit_app(ctx),
+            CloseAction::Tray => self.hide_to_tray(ctx),
+            CloseAction::Ask => self.confirm_close = true,
+        }
+    }
+
+    /// 收进托盘：窗口不可见、机器人继续跑，界面缓存当场放掉。
+    fn hide_to_tray(&mut self, ctx: &egui::Context) {
+        if self.hidden {
+            return;
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        self.hidden = true;
+        self.confirm_close = false;
+        self.release_ui_memory();
+        crate::runtime::log::info(
+            "管理面板已收进托盘：界面缓存（列表/日志/纹理）已释放，机器人与插件照常运行",
+        );
+    }
+
+    /// 从托盘叫回前台。叫回来之后重新拉数据——隐藏时那些都被清掉了。
+    fn show_window(&mut self, ctx: &egui::Context) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        if self.hidden {
+            self.hidden = false;
+            // `started=false` 会在本帧末尾重新拉群列表；日志版本归零则整段重取
+            self.started = false;
+            self.log_version = 0;
+            crate::runtime::log::info("管理面板已从托盘唤回");
+        }
+    }
+
+    /// 真退出：放行关闭请求。eframe 返回后 `gui::run` 会停机器人并退出进程。
+    fn quit_app(&mut self, ctx: &egui::Context) {
+        if self.quitting {
+            return;
+        }
+        self.quitting = true;
+        self.confirm_close = false;
+        if self.hidden {
+            // 隐藏的窗口不渲染，`Close` 命令没人处理就会"点了退出却没退"。
+            // 先把它叫回可见，下一帧的 `close_requested` 才走得到放行那一条。
+            // 视觉上会闪一下——这一点点闪烁比退不掉强。
+            self.hidden = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        ctx.request_repaint();
+    }
+
+    /// 把界面这一层的内存还掉。
+    ///
+    /// 边界要说清楚：**窗口、渲染上下文与 GPU 资源回收不了**——winit 一个进程只能有一个
+    /// 事件循环，窗口销毁后没法再建回来，所以这部分只能随进程常驻。能还的是数据：
+    /// 日志行（GUI 这份副本最多能跟全局环形缓冲一样大，8 MB 量级）、群/成员/插件列表、
+    /// 品牌图纹理。这也正是"弹出就加载"的实现方式：隐藏时清空，显示时 `started` 归零重拉。
+    fn release_ui_memory(&mut self) {
+        self.icon = None;
+        self.log_lines = Vec::new();
+        self.log_lines.shrink_to_fit();
+        self.groups = Vec::new();
+        self.groups.shrink_to_fit();
+        self.members = Vec::new();
+        self.members.shrink_to_fit();
+        self.plugins = Vec::new();
+        self.plugins.shrink_to_fit();
+        self.onebot = None;
+        self.selected = None;
+        self.selected_plugin = None;
+        self.members_for = None;
+        self.groups_error = None;
+        self.members_error = None;
+        self.onebot_error = None;
+        self.toast = None;
+    }
+
+    /// 「退出还是最小化」那个弹窗，居中画在所有页之上。
+    fn confirm_dialog(&mut self, ctx: &egui::Context) {
+        if !self.confirm_close {
+            return;
+        }
+        let mut remember = self.confirm_remember;
+        let mut decision: Option<CloseAction> = None;
+        let mut cancel = false;
+        let tray_missing = self.tray.is_none();
+        egui::Window::new("关闭窗口")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.set_min_width(400.0);
+                ui.label(
+                    "退出会连同机器人与插件一起停掉；最小化则收进托盘，\
+                     机器人和插件继续在后台跑，点托盘图标随时回来。",
+                );
+                ui.add_space(8.0);
+                ui.checkbox(&mut remember, "记住这个选择，以后不再弹出");
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.button("最小化到托盘").clicked() {
+                        decision = Some(CloseAction::Tray);
+                    }
+                    if ui.button("退出程序").clicked() {
+                        decision = Some(CloseAction::Quit);
+                    }
+                    if ui.button("取消").clicked() {
+                        cancel = true;
+                    }
+                });
+                if tray_missing {
+                    ui.add_space(6.0);
+                    ui.weak("注意：本次运行没能创建托盘图标，最小化后只能用任务管理器结束进程。");
+                }
+            });
+        self.confirm_remember = remember;
+        if let Some(action) = decision {
+            self.confirm_close = false;
+            if remember {
+                self.close_action = action;
+                save_prefs(GuiPrefs {
+                    theme: self.theme,
+                    close: action,
+                });
+            }
+            match action {
+                CloseAction::Tray => self.hide_to_tray(ctx),
+                CloseAction::Quit => self.quit_app(ctx),
+                CloseAction::Ask => {}
+            }
+        } else if cancel {
+            self.confirm_close = false;
         }
     }
 
@@ -708,6 +994,10 @@ impl AronaGui {
                         // 热重载后连接状态变化，无需重载配置
                     }
                 }
+                Msg::Tray(action) => match action {
+                    tray::TrayAction::Open => self.show_window(ctx),
+                    tray::TrayAction::Quit => self.quit_app(ctx),
+                },
             }
         }
         if let Some(toast) = &self.toast {
@@ -723,6 +1013,7 @@ impl AronaGui {
 
     fn header(&mut self, ui: &mut egui::Ui) {
         let dark = ui.visuals().dark_mode;
+        let mut to_tray = false;
         // 第一行：品牌 + 运行状态 + 外观；第二行：页签。
         // 分成两行是因为状态文字较长，和四个页签挤在同一行时会把右侧控件顶出窗口。
         ui.horizontal(|ui| {
@@ -761,8 +1052,24 @@ impl AronaGui {
                 ui.separator();
                 ui.add_space(10.0);
                 status_chip(ui, self.mem.peek());
+                // 显式的「收进托盘」入口：有人习惯用 − 最小化到任务栏，也有人想直接收走。
+                // 没有托盘图标时不画这一格——点了就再也找不回来。
+                if self.tray.is_some() {
+                    ui.add_space(10.0);
+                    if ui
+                        .button("收进托盘")
+                        .on_hover_text("窗口收起来，机器人与插件继续在后台跑；点托盘图标随时回来")
+                        .clicked()
+                    {
+                        to_tray = true;
+                    }
+                }
             });
         });
+        if to_tray {
+            let ctx = ui.ctx().clone();
+            self.hide_to_tray(&ctx);
+        }
         ui.add_space(9.0);
         ui.horizontal(|ui| {
             for (tab, label) in [
@@ -1944,6 +2251,8 @@ fn now_secs() -> f64 {
 
 impl eframe::App for AronaGui {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 关窗请求优先处理：egui 只在那一帧置位，晚一步 `CancelClose` 就变成"点了没反应"
+        self.handle_close(ctx);
         // 外观：只在偏好变化时下发，避免每帧改 options 触发额外重绘
         if self.theme_applied != Some(self.theme) {
             self.theme_applied = Some(self.theme);
@@ -2054,6 +2363,8 @@ impl eframe::App for AronaGui {
             self.started = true;
             self.fetch_groups(ctx);
         }
+        // 弹窗画在所有页之上：它是模态的，不该被页内容挡住
+        self.confirm_dialog(ctx);
     }
 }
 
@@ -3008,7 +3319,7 @@ fn app_creator(
         crate::runtime::log::info(format!("管理面板已就绪（渲染后端: {attempt_name}）"));
         ready.store(true, Ordering::SeqCst);
         install_fonts(&cc.egui_ctx);
-        Ok(Box::new(AronaGui::new(handle, tx, rx)))
+        Ok(Box::new(AronaGui::new(handle, tx, rx, cc.egui_ctx.clone())))
     })
 }
 
@@ -3583,6 +3894,40 @@ fn panic_detail(payload: &(dyn std::any::Any + Send)) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 老版本 `gui.txt` 只有一行裸主题值（`dark`）：升级后不能把用户的外观设置读丢，
+    /// 也不能因为文件里没写关窗行为就擅自替他决定（默认仍是问一次）。
+    #[test]
+    fn legacy_single_line_pref_still_reads() {
+        let prefs = parse_prefs("dark\n");
+        assert_eq!(prefs.theme, ThemePref::Dark);
+        assert_eq!(prefs.close, CloseAction::Ask);
+    }
+
+    #[test]
+    fn prefs_roundtrip_and_unknown_values_fall_back() {
+        let prefs = GuiPrefs {
+            theme: ThemePref::Light,
+            close: CloseAction::Tray,
+        };
+        assert_eq!(parse_prefs(&prefs_text(prefs)), prefs);
+
+        // 手改坏了：主题回落到跟随系统、关窗回落到「问」。
+        // 关键是**不能**回落成 quit——写错一个词不该让程序下次被点一下就退掉。
+        let broken = parse_prefs("theme=???\nclose=???\n");
+        assert_eq!(broken.theme, ThemePref::System);
+        assert_eq!(broken.close, CloseAction::Ask);
+    }
+
+    /// 三个关闭行为都要能原样存取；`quit` 是唯一允许"下次直接退"的值
+    #[test]
+    fn close_action_keys_are_stable() {
+        for action in [CloseAction::Ask, CloseAction::Tray, CloseAction::Quit] {
+            assert_eq!(CloseAction::parse(action.key()), Some(action));
+        }
+        assert_eq!(CloseAction::parse("min"), Some(CloseAction::Tray));
+        assert_eq!(CloseAction::parse("whatever"), None);
+    }
 
     fn names(attempts: &[RendererAttempt]) -> Vec<&'static str> {
         attempts.iter().map(|attempt| attempt.name).collect()

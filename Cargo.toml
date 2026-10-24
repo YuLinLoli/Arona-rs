@@ -46,6 +46,9 @@ eframe = { version = "0.31", default-features = false, features = ["glow", "wgpu
 # 从而强制要求 VS 的「ATL/MFC」组件里的 atls.lib（开发机常缺）；运行期改为动态加载
 # 着色器编译器即可。管理面板在服务器上的兜底路径是 glow(OpenGL)+softgl，与 DXC 无关。
 wgpu = { version = "24", default-features = false, features = ["dx12"] }
+# 托盘图标（最小化到托盘）：只在 gui feature 下编译，Linux 精简版与插件侧都用不到。
+# Windows 上它自带消息线程，不依赖 winit 的事件泵，所以在 eframe 的 update 里轮询事件即可。
+tray-icon = "0.26"
 
 [profile.release]
 opt-level = 2

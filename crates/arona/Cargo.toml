@@ -3,7 +3,7 @@
 # 所以发布名带 -rs 后缀；下面 [lib] 仍叫 arona，源码与插件一律 use arona::…，
 # 依赖方只需 `arona = { package = "arona-rs", … }` 重命名一次即可，代码不用改。
 name = "arona-rs"
-version = "1.4.0"
+version = "1.5.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -42,7 +42,9 @@ ab_glyph = { workspace = true }
 # GUI 管理面板：由 host 通过 `arona/gui` 打开（插件依赖本 crate 时不会强制启用）
 eframe = { workspace = true, optional = true }
 wgpu = { workspace = true, optional = true }
+# 最小化到托盘 / 托盘菜单（右键退出、左键唤回面板）：与 GUI 同生共死
+tray-icon = { workspace = true, optional = true }
 
 [features]
 default = ["gui"]
-gui = ["dep:eframe", "dep:wgpu"]
+gui = ["dep:eframe", "dep:wgpu", "dep:tray-icon"]
