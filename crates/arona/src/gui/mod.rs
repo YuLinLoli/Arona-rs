@@ -12,6 +12,13 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 
 mod tray;
 
+/// 面板窗口标题。
+///
+/// **这不是随便一个字符串**：托盘线程靠 `FindWindowW` 按标题找窗口来唤回/退出，
+/// 标题改了而那边没改，托盘就会变成"点了完全没反应"（窗口还藏着，egui 的 update 也不跑，
+/// 没有任何报错）。所以两处都引用这一个常量，并有单测钉住。
+pub const WINDOW_TITLE: &str = "Arona 管理面板";
+
 /// 后台任务回传消息
 enum Msg {
     Groups(Result<Vec<admin::GroupInfo>, String>),
@@ -713,8 +720,10 @@ impl AronaGui {
         if !ctx.input(|input| input.viewport().close_requested()) {
             return;
         }
-        // 已经决定退出：这一次放行，让 eframe 正常返回
-        if self.quitting {
+        // 已经决定退出：这一次放行，让 eframe 正常返回。
+        // 托盘那条路不经过消息队列（窗口藏着时没人消费消息），所以还要看那个原子标志。
+        if self.quitting || tray::panel::quit_requested() {
+            self.quitting = true;
             return;
         }
         // 其余情况一律先取消这次关闭，再按偏好走后续动作
@@ -728,9 +737,9 @@ impl AronaGui {
 
     /// 收进托盘：窗口不可见、机器人继续跑，界面缓存当场放掉。
     fn hide_to_tray(&mut self, ctx: &egui::Context) {
-        if self.hidden {
-            return;
-        }
+        // 这里**不能**用 `if self.hidden { return }` 提前退出：托盘的「打开」是 Win32 直接
+        // 显示窗口的，`hidden` 标记要等下一帧 Msg 才同步；那一小段窗口里用户点 ×，
+        // 会被这条 early-return 吞掉，表现成"关不掉"。重复隐藏本身没有副作用。
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         self.hidden = true;
         self.confirm_close = false;
@@ -3824,7 +3833,7 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([1200.0, 780.0])
         .with_min_inner_size([900.0, 560.0])
-        .with_title("Arona 管理面板");
+        .with_title(WINDOW_TITLE);
     match load_window_icon() {
         Some(icon) => viewport = viewport.with_icon(icon),
         None => crate::runtime::console::eprint_safe(
@@ -3868,7 +3877,7 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
         // 渲染后端在初始化阶段 panic（wgpu 历史上出过）时不能带走整个进程：兜底链后面还有
         // 候选，机器人也已经在这个进程的 tokio 运行时里跑起来了。
         let attempt_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            eframe::run_native("Arona 管理面板", options, creator)
+            eframe::run_native(WINDOW_TITLE, options, creator)
         }));
         finished.store(true, Ordering::SeqCst);
         let result = match attempt_result {

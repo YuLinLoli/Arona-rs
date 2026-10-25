@@ -90,15 +90,163 @@ impl Tray {
                     }
                 }
                 if let Some(action) = action {
+                    // 关键一步：先用 Win32 把窗口叫出来，别指望 egui 的 update 去处理。
+                    // 窗口藏着的时候它根本不跑，消息发过去只会烂在队列里。
+                    match action {
+                        TrayAction::Open => {
+                            let shown = panel::show();
+                            crate::runtime::log::info(if shown {
+                                "托盘：打开管理面板"
+                            } else {
+                                "托盘：收到打开请求，但没找到面板窗口（标题被人改过？）"
+                            });
+                        }
+                        TrayAction::Quit => {
+                            let closed = panel::request_quit();
+                            crate::runtime::log::info(if closed {
+                                "托盘：收到退出请求，正在停止机器人并退出"
+                            } else {
+                                "托盘：收到退出请求，但没找到面板窗口，正在走备用路径"
+                            });
+                        }
+                    }
                     // 面板已经关了（接收端断了）就收工，别留一个空转线程
                     if tx.send(super::Msg::Tray(action)).is_err() {
                         break;
                     }
+                    // 兜底：窗口没找着的情况下，至少让 egui 试着跑一帧
                     ctx.request_repaint();
                 }
                 std::thread::sleep(std::time::Duration::from_millis(80));
             }
         });
+    }
+}
+
+/// 直接操作面板窗口（Windows）。
+///
+/// **为什么不能只靠 egui 的消息**：窗口收进托盘（`ViewportCommand::Visible(false)`）之后，
+/// winit 不再派发重绘，`update` 就停了；托盘线程发的那条 `Msg` 没有消费者，
+/// `request_repaint()` 也唤不醒一个隐藏窗口。结果就是"点了托盘图标没反应、菜单里点退出也没反应"
+/// —— 两个动作一起失灵，正是这个原因。
+///
+/// 所以关键路径绕开 egui：用 Win32 直接把窗口叫出来（`ShowWindow`），
+/// 退出则先置一个 `QUIT_REQUESTED` 标志、再 `PostMessage(WM_CLOSE)`。
+/// 窗口一旦可见，`update` 自然恢复，那条 `Msg` 才有人处理。
+#[cfg(windows)]
+pub mod panel {
+    use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn FindWindowW(class_name: *const u16, window_name: *const u16) -> isize;
+        fn ShowWindow(hwnd: isize, cmd: i32) -> i32;
+        fn SetForegroundWindow(hwnd: isize) -> i32;
+        fn PostMessageW(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> i32;
+        fn EnumWindows(callback: extern "system" fn(isize, isize) -> i32, lparam: isize) -> i32;
+        fn GetWindowThreadProcessId(hwnd: isize, pid: *mut u32) -> u32;
+        fn GetWindowTextLengthW(hwnd: isize) -> i32;
+    }
+
+    const SW_SHOW: i32 = 5;
+    const SW_RESTORE: i32 = 9;
+    const WM_CLOSE: u32 = 0x0010;
+
+    /// 面板窗口标题。**必须与 `gui::WINDOW_TITLE` 一字不差**（有单测钉着）。
+    pub(crate) const PANEL_TITLE: &str = "Arona 管理面板";
+
+    /// 托盘点了「退出」：让 `handle_close` 放行关闭请求，而不是转成"收进托盘"。
+    /// 用原子量而不是消息队列，是因为窗口隐藏时消息队列没人消费，这个标志没这个问题。
+    static QUIT_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+    /// `EnumWindows` 的回调拿不到闭包环境，结果只能放全局。找到即写、回调返回 0 停止枚举。
+    static FOUND: AtomicIsize = AtomicIsize::new(0);
+
+    extern "system" fn find_own_window(hwnd: isize, _lparam: isize) -> i32 {
+        let mut pid = 0u32;
+        // SAFETY: hwnd 由 EnumWindows 给出，pid 是本地栈变量
+        unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+        if pid == std::process::id() {
+            // 只看有标题的：那是我们的主窗口，不是 winit 内部那些空的辅助窗口
+            let len = unsafe { GetWindowTextLengthW(hwnd) };
+            if len > 0 {
+                FOUND.store(hwnd, Ordering::SeqCst);
+                return 0;
+            }
+        }
+        1
+    }
+
+    /// 找面板窗口。两条路：先按标题（快），找不到再按进程 id 扫自己的顶层窗口。
+    ///
+    /// 第二条不是多余：标题一旦被改（本地化、加版本号、"没有响应"后缀），
+    /// 按标题就永远找不到，而表现是"托盘点了完全没反应"——没有任何报错，最难查。
+    fn find() -> Option<isize> {
+        let title: Vec<u16> = PANEL_TITLE
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        // SAFETY: 只传一个以 NUL 结尾的 UTF-16 串；找不到返回 0
+        let by_title = unsafe { FindWindowW(std::ptr::null(), title.as_ptr()) };
+        if by_title != 0 {
+            return Some(by_title);
+        }
+
+        FOUND.store(0, Ordering::SeqCst);
+        // SAFETY: 回调只读窗口信息并写全局原子量，不触碰其它状态
+        unsafe { EnumWindows(find_own_window, 0) };
+        let by_pid = FOUND.load(Ordering::SeqCst);
+        (by_pid != 0).then_some(by_pid)
+    }
+
+    /// 把面板叫回前台。窗口隐藏时这一步是**必需的**——不先显示它，后面什么都做不了。
+    pub fn show() -> bool {
+        let Some(hwnd) = find() else {
+            return false;
+        };
+        // SAFETY: hwnd 来自 FindWindow*/EnumWindows，调用期间窗口由面板持有
+        unsafe {
+            ShowWindow(hwnd, SW_RESTORE);
+            ShowWindow(hwnd, SW_SHOW);
+            SetForegroundWindow(hwnd);
+        }
+        true
+    }
+
+    /// 请求退出：先置标志，再把窗口显示出来并投递 `WM_CLOSE`。
+    ///
+    /// 顺序不能反：窗口如果还藏着，`WM_CLOSE` 触发的重绘没人画，`handle_close` 就跑不到；
+    /// 先显示再关，`update` 会在下一帧看到 `close_requested`，配合标志直接放行。
+    pub fn request_quit() -> bool {
+        QUIT_REQUESTED.store(true, Ordering::SeqCst);
+        let Some(hwnd) = find() else {
+            return false;
+        };
+        // SAFETY: 同上；PostMessageW 只是投递，不等待处理
+        unsafe {
+            ShowWindow(hwnd, SW_SHOW);
+            PostMessageW(hwnd, WM_CLOSE, 0, 0);
+        }
+        true
+    }
+
+    /// 托盘是否已经点过「退出」
+    pub fn quit_requested() -> bool {
+        QUIT_REQUESTED.load(Ordering::SeqCst)
+    }
+}
+
+/// 非 Windows 平台（Linux 精简构建不含 GUI）的占位，保持调用方不用写 `cfg`
+#[cfg(not(windows))]
+pub mod panel {
+    pub fn show() -> bool {
+        false
+    }
+    pub fn request_quit() -> bool {
+        false
+    }
+    pub fn quit_requested() -> bool {
+        false
     }
 }
 
@@ -120,5 +268,15 @@ mod tests {
             Icon::from_rgba(short, side, side).is_err(),
             "字节数与宽高对不上时必须报错，而不是画出一张花屏图标"
         );
+    }
+
+    /// 找窗口靠标题匹配，标题写错就等于托盘全废。这里把两处「同一个字符串」
+    /// 的不变式钉在编译期可查的位置：`gui::run` 里的标题必须与 `panel::PANEL_TITLE` 相同。
+    #[test]
+    fn panel_title_matches_the_window_title() {
+        // 这个常量在 gui::run 里传给 eframe::run_native；两边不一致托盘就找不到窗口
+        assert_eq!(crate::gui::WINDOW_TITLE, "Arona 管理面板");
+        #[cfg(windows)]
+        assert_eq!(super::panel::PANEL_TITLE, crate::gui::WINDOW_TITLE);
     }
 }

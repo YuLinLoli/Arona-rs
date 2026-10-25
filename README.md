@@ -164,8 +164,8 @@ Linux 版**只有命令行模式**（不含管理面板），启动后就是一�
 配置与数据布局与 Windows 完全一致。
 
 ```bash
-tar -xzf arona-rs-1.5.1-linux-x64-compat.tar.gz
-cd arona-rs-1.5.1-linux-x64-compat
+tar -xzf arona-rs-1.5.2-linux-x64-compat.tar.gz
+cd arona-rs-1.5.2-linux-x64-compat
 ./arona-rs                 # 前台运行，Ctrl+C 停止
 ```
 
@@ -649,7 +649,7 @@ installer/               Windows 安装包：arona-rs.iss、intro.txt、defaults
 crate-type = ["cdylib", "rlib"]   # cdylib 出动态库；rlib 那份只给 cargo test 用
 
 [dependencies]
-arona = { package = "arona-rs", version = "1.5.1", default-features = false }
+arona = { package = "arona-rs", version = "1.5.2", default-features = false }
 # 同源联调改成 path：arona = { package = "arona-rs", path = "../Arona-rs/crates/arona", default-features = false }
 ```
 
