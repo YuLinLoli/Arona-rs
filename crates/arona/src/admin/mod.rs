@@ -90,24 +90,33 @@ pub fn plugin_rows(plugin: &str) -> Vec<(i64, crate::views::ViewRow)> {
 pub struct Field {
     pub path: String,
     pub value: serde_yaml::Value,
+    /// 插件写在配置模板里的说明（`ConfigSection::render` 生成的那行注释）。
+    ///
+    /// 空串表示插件没写——不是"没解析到"：框架不去编造说明，宁可空着。
+    pub comment: String,
 }
 
-/// 摊平某插件配置里的标量叶子，给 GUI 生成控件。
+/// 摊平某插件配置里的可编辑项，给 GUI 生成控件。
 ///
-/// 框架仍然不认识任何插件的键名，这里只有两条框架自己的规矩：
+/// 框架仍然不认识任何插件的键名，这里只有三条框架自己的规矩：
 ///
-/// 1. 只摊标量（布尔 / 数字 / 字符串），表与数组交给插件的指令或手改 YAML——
-///    没有类型信息就没有可信的控件；含换行的字符串也挡掉，单行框会把多行模板改坏。
+/// 1. 摊标量（布尔 / 数字 / 字符串）与**元素全是标量的数组**。表、以及数组里套表/套数组的，
+///    还是没有控件——没有类型信息就没有可信的编辑方式；含换行的字符串也挡掉，
+///    单行框会把多行模板改坏。
 /// 2. **键名像凭据的那一个叶子一律不摊**（`cookie`/`token`/`secret`/`password`/`key`/`appid`/`ticket`）。
 ///    这条是框架的安全线不是插件语义：这类值一旦显示出来就会进截图与录屏。
 ///    挡的是那一个键本身，不牵连兄弟——`account.cookie` 不上屏，`account.uid` 照改。
+/// 3. 每一项都带上它那条注释（来自 `plugin_config::plugin_comments`），GUI 把它显示在控件旁边。
+///    用户不该对着 `greet_hour` 猜它是几点。
 pub fn plugin_fields(plugin: &str) -> Vec<Field> {
     let mut out = Vec::new();
     let Some(sections) = crate::config::plugin_config::plugin_sections(plugin) else {
         return out;
     };
+    // 注释是另一份来源（磁盘原文）：一次读完，逐个 path 去查，不必每项都读一遍文件
+    let comments = crate::config::plugin_config::plugin_comments(plugin);
     for (section, value) in sections {
-        flatten_fields(&section, &value, &mut out);
+        flatten_fields(&section, &value, &comments, &mut out);
     }
     out
 }
@@ -121,7 +130,25 @@ fn is_credential(key: &str) -> bool {
     .any(|needle| low.contains(needle))
 }
 
-fn flatten_fields(prefix: &str, node: &serde_yaml::Value, out: &mut Vec<Field>) {
+/// 数组能不能在界面上逐条编辑：元素必须全是标量。
+///
+/// 空数组也算——"现在没有，但可以往里加"正是 `greet_groups: []` 这种配置最常见的用法。
+fn is_editable_list(items: &[serde_yaml::Value]) -> bool {
+    items.iter().all(|item| {
+        !matches!(
+            item,
+            serde_yaml::Value::Mapping(_) | serde_yaml::Value::Sequence(_)
+        )
+    })
+}
+
+fn flatten_fields(
+    prefix: &str,
+    node: &serde_yaml::Value,
+    comments: &std::collections::BTreeMap<String, String>,
+    out: &mut Vec<Field>,
+) {
+    let comment = || comments.get(prefix).cloned().unwrap_or_default();
     match node {
         serde_yaml::Value::Mapping(map) => {
             for (key, value) in map {
@@ -129,17 +156,27 @@ fn flatten_fields(prefix: &str, node: &serde_yaml::Value, out: &mut Vec<Field>) 
                 if is_credential(name) {
                     continue;
                 }
-                flatten_fields(&format!("{prefix}.{name}"), value, out);
+                flatten_fields(&format!("{prefix}.{name}"), value, comments, out);
             }
         }
-        // 空值与列表不给控件：填错了没有类型可校验，列表更是整段结构
-        serde_yaml::Value::Null | serde_yaml::Value::Sequence(_) => {}
+        // 空值不给控件：填错了没有类型可校验
+        serde_yaml::Value::Null => {}
+        serde_yaml::Value::Sequence(items) => {
+            if is_editable_list(items) {
+                out.push(Field {
+                    path: prefix.to_string(),
+                    value: node.clone(),
+                    comment: comment(),
+                });
+            }
+        }
         scalar => {
             let is_multiline = scalar.as_str().is_some_and(|text| text.contains('\n'));
             if !is_multiline {
                 out.push(Field {
                     path: prefix.to_string(),
                     value: scalar.clone(),
+                    comment: comment(),
                 });
             }
         }
@@ -905,10 +942,11 @@ template:
 "#,
         )
         .unwrap();
+        let no_comments = std::collections::BTreeMap::new();
         let mut out = Vec::new();
-        flatten_fields("image", &tree["image"], &mut out);
-        flatten_fields("account", &tree["account"], &mut out);
-        flatten_fields("template", &tree["template"], &mut out);
+        flatten_fields("image", &tree["image"], &no_comments, &mut out);
+        flatten_fields("account", &tree["account"], &no_comments, &mut out);
+        flatten_fields("template", &tree["template"], &no_comments, &mut out);
         let paths: Vec<&str> = out.iter().map(|f| f.path.as_str()).collect();
         assert!(paths.contains(&"image.quality"), "{paths:?}");
         assert!(paths.contains(&"image.drawEnable"), "{paths:?}");
@@ -918,15 +956,51 @@ template:
         assert!(paths.contains(&"account.uid"), "{paths:?}");
         assert!(paths.contains(&"account.nickname"), "{paths:?}");
         assert!(!paths.iter().any(|p| p.contains("cookie")), "{paths:?}");
-        // 多行模板、数组、空值都没有控件
+        // 多行模板与空值没有控件
         assert!(!paths.contains(&"template.one"), "{paths:?}");
-        assert!(!paths.contains(&"template.list"), "{paths:?}");
         assert!(!paths.contains(&"template.nothing"), "{paths:?}");
+        // 元素全是标量的数组**可以**编辑（`greet_groups: []` 那种列表就是靠它增删）
+        assert!(paths.contains(&"template.list"), "{paths:?}");
         assert!(
             !out.iter()
                 .any(|f| format!("{:?}", f.value).contains("SECRETCOOKIE")),
             "凭据值漏进来了"
         );
+    }
+
+    /// 每一项都要带上插件写的那条说明——GUI 把它显示在控件上方，
+    /// 用户不该对着一串英文键名猜它是干什么的。
+    #[test]
+    fn fields_carry_the_plugin_comment() {
+        let tree: serde_yaml::Value =
+            serde_yaml::from_str("hour: 9\ngroups: []\nname: 老师\n").unwrap();
+        let mut comments = std::collections::BTreeMap::new();
+        comments.insert("demo.hour".to_string(), "每天几点问好".to_string());
+        comments.insert("demo.groups".to_string(), "要主动问好的群".to_string());
+        let mut out = Vec::new();
+        flatten_fields("demo", &tree, &comments, &mut out);
+
+        let by_path = |path: &str| out.iter().find(|field| field.path == path).unwrap();
+        assert_eq!(by_path("demo.hour").comment, "每天几点问好");
+        assert_eq!(by_path("demo.groups").comment, "要主动问好的群");
+        // 没写注释的项留空串，不编造
+        assert_eq!(by_path("demo.name").comment, "");
+    }
+
+    /// 数组里套结构就不给控件：没有类型信息，逐条编辑只会写坏数据
+    #[test]
+    fn arrays_of_structures_are_left_alone() {
+        let tree: serde_yaml::Value = serde_yaml::from_str(
+            "items:\n  - name: a\n    weight: 1\n  - name: b\n    weight: 2\nempty: []\n",
+        )
+        .unwrap();
+        let no_comments = std::collections::BTreeMap::new();
+        let mut out = Vec::new();
+        flatten_fields("demo", &tree, &no_comments, &mut out);
+        let paths: Vec<&str> = out.iter().map(|field| field.path.as_str()).collect();
+        assert!(!paths.contains(&"demo.items"), "{paths:?}");
+        // 空数组反而是最该给控件的（`greet_groups: []` 就是往空列表里加东西）
+        assert!(paths.contains(&"demo.empty"), "{paths:?}");
     }
 
     /// 写回只改那一条路径，同区其它键必须原样留着

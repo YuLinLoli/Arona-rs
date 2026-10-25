@@ -92,14 +92,14 @@ dependencies = [
 
 [[package]]
 name = "arona-host"
-version = "1.5.3"
+version = "1.6.0"
 dependencies = [
  "arona-rs",
 ]
 
 [[package]]
 name = "arona-rs"
-version = "1.5.3"
+version = "1.6.0"
 dependencies = [
  "ab_glyph",
  "axum",

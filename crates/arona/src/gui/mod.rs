@@ -551,6 +551,18 @@ impl NoteText for () {
 }
 
 /// 管理面板状态
+/// 插件配置页里正在就地编辑的那一条列表元素。
+///
+/// 不用 `ui.memory` 存：编辑态要跨帧活下来，而且同一时刻只该有一条在编辑，
+/// 放在界面结构体里最直观（换插件、换页面时 Take 一下就清干净了）。
+struct ListEdit {
+    /// 配置项的键路径（如 `hello.greet_groups`）；同名的列表才认这条编辑态
+    path: String,
+    index: usize,
+    /// 编辑中的文本
+    draft: String,
+}
+
 struct AronaGui {
     rt: tokio::runtime::Handle,
     tx: Sender<Msg>,
@@ -585,6 +597,10 @@ struct AronaGui {
     plugin_filter: String,
     /// 「启用群」里那个待添加的群号输入框（填进去写的是 config.groups，机器人没在的群也能先填）
     plugin_group_input: String,
+    /// 插件配置里正在就地编辑的列表条目
+    list_edit: Option<ListEdit>,
+    /// 插件配置里各列表的「新增」输入框内容，键是配置项路径
+    list_inputs: std::collections::BTreeMap<String, String>,
     // OneBot 连接
     onebot: Option<OneBotConfig>,
     onebot_error: Option<String>,
@@ -681,6 +697,8 @@ impl AronaGui {
             selected_plugin: None,
             plugin_filter: String::new(),
             plugin_group_input: String::new(),
+            list_edit: None,
+            list_inputs: std::collections::BTreeMap::new(),
             onebot: None,
             onebot_error: None,
             new_type: ConnectionType::WebSocket,
@@ -1784,53 +1802,87 @@ impl AronaGui {
     /// 键名像凭据的那一类根本到不了这里——`admin::plugin_fields` 就挡掉了。
     fn plugin_config_card(&mut self, ui: &mut egui::Ui, dark: bool, plugin: &str) {
         let fields = admin::plugin_fields(plugin);
-        let mut edit: Option<(String, serde_yaml::Value)> = None;
+        let mut write: Option<(String, serde_yaml::Value)> = None;
+        // 编辑态先取出来，闭包里用局部变量改，闭包结束再放回去——
+        // `card_row` 的闭包已经借了 `&mut self`，直接在里面摸字段容易和别的借用打架
+        let mut list_edit = self.list_edit.take();
+        let mut list_inputs = std::mem::take(&mut self.list_inputs);
+
         card_row(ui, dark, |ui| {
             section_title(ui, "配置");
             ui.weak(
                 "这一区由插件自己声明，框架只按值的类型给控件；键名像凭据的一律不显示。\
-                 改完立即写进该插件的配置文件并热生效，注释仍由插件的模板生成。",
+                 每项上面的灰字是插件自己写的说明。改完立即写进该插件的配置文件并热生效。",
             );
-            ui.add_space(4.0);
+            ui.add_space(8.0);
             if fields.is_empty() {
                 ui.weak("这个插件没有可以在这里改的配置项（要么全是结构，要么都挡掉了）。");
                 return;
             }
-            egui::Grid::new(format!("plugin_fields_{plugin}"))
-                .num_columns(3)
-                .spacing([10.0, 6.0])
-                .show(ui, |ui| {
-                    for field in &fields {
-                        ui.label(&field.path);
-                        if let Some(next) = field_edit(ui, egui::Id::new(&field.path), &field.value)
-                        {
-                            edit = Some((field.path.clone(), next));
+
+            for (index, field) in fields.iter().enumerate() {
+                if index > 0 {
+                    ui.add_space(10.0);
+                }
+
+                // —— 第一行：键路径 + 类型提示（色板也挂这儿，不占输入框的位置）——
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(&field.path)
+                            .strong()
+                            .color(accent(dark)),
+                    );
+                    ui.add_space(6.0);
+                    ui.weak(field_kind_hint(&field.value));
+                    if let serde_yaml::Value::String(text) = &field.value {
+                        if let Some(color) = swatch_color(text) {
+                            let (rect, _) = ui
+                                .allocate_exact_size(egui::vec2(46.0, 14.0), egui::Sense::hover());
+                            ui.painter().rect_filled(rect, 3.0, color);
                         }
-                        // 第三列只放色板（颜色串才有），其余留空，保证键名与输入框对齐
-                        match &field.value {
-                            serde_yaml::Value::String(text) => {
-                                if let Some(color) = swatch_color(text) {
-                                    let (rect, _) = ui.allocate_exact_size(
-                                        egui::vec2(46.0, 16.0),
-                                        egui::Sense::hover(),
-                                    );
-                                    ui.painter().rect_filled(rect, 3.0, color);
-                                } else {
-                                    ui.label("");
-                                }
-                            }
-                            _ => {
-                                ui.label("");
-                            }
-                        }
-                        ui.end_row();
                     }
                 });
+
+                // —— 第二行：插件写的说明。没有就不占地方，不编造 ——
+                if !field.comment.is_empty() {
+                    let hint = ui.visuals().weak_text_color();
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(&field.comment).size(11.5).color(hint),
+                        )
+                        .wrap(),
+                    );
+                }
+                ui.add_space(4.0);
+
+                // —— 第三行：控件。宽度给满，字符串配置才看得见里面写了什么 ——
+                let width = ui.available_width();
+                match &field.value {
+                    serde_yaml::Value::Sequence(_) => {
+                        if let Some(next) = list_editor(ui, field, &mut list_edit, &mut list_inputs)
+                        {
+                            write = Some((field.path.clone(), next));
+                        }
+                    }
+                    scalar => {
+                        if let Some(next) =
+                            field_editor(ui, egui::Id::new(&field.path), scalar, width)
+                        {
+                            write = Some((field.path.clone(), next));
+                        }
+                    }
+                }
+            }
         });
-        if let Some((path, value)) = edit {
+
+        self.list_edit = list_edit;
+        self.list_inputs = list_inputs;
+        if let Some((path, value)) = write {
             self.note(admin::set_plugin_field(plugin, &path, value));
             // 值是从文件里读出来的，写完重取一遍，界面上才不会停在旧值上
             self.plugins = admin::plugin_list();
+            // 列表被改写后，那条正在编辑的下标就可能指错了位置，直接收起来
+            self.list_edit = None;
         }
     }
 
@@ -2186,21 +2238,44 @@ fn int_edit<T: IntField>(
 ///
 /// 数字保持原来的整数/小数形状写回：文件里是 `30` 就别改写成 `30.0`，
 /// 否则插件那边的强类型读取（`as_i64`）会突然拿不到值。
-fn field_edit(
+/// 配置项值的中文类型提示（跟在键名后面）
+fn field_kind_hint(value: &serde_yaml::Value) -> String {
+    match value {
+        serde_yaml::Value::Bool(_) => "开关".to_string(),
+        serde_yaml::Value::Number(number) if number.is_i64() || number.is_u64() => {
+            "整数".to_string()
+        }
+        serde_yaml::Value::Number(_) => "小数".to_string(),
+        serde_yaml::Value::String(_) => "文本".to_string(),
+        serde_yaml::Value::Sequence(items) => format!("列表 · {} 项", items.len()),
+        _ => String::new(),
+    }
+}
+
+/// 按值的类型给控件，`width` 是这一行可用的宽度。
+///
+/// 与 [`field_edit`] 的差别只有"宽度可控"：配置里那些前缀、路径、模板常常比 220 点长，
+/// 固定宽度等于让人盲改——这正是之前被吐槽"看不见里面是什么配置"的原因。
+fn field_editor(
     ui: &mut egui::Ui,
     id: egui::Id,
     value: &serde_yaml::Value,
+    width: f32,
 ) -> Option<serde_yaml::Value> {
     match value {
         serde_yaml::Value::Bool(current) => {
             let mut next = *current;
-            ui.checkbox(&mut next, "")
+            // 勾选框后面带上文字：光一个空盒子，用户不知道勾上代表开还是关。
+            // 标签按**当前**状态取，先算好再借出去——不能在同一行里既读又可变借。
+            let label = if *current { "开" } else { "关" };
+            ui.checkbox(&mut next, label)
                 .changed()
                 .then_some(serde_yaml::Value::Bool(next))
         }
         serde_yaml::Value::Number(current) => {
             let shown = current.to_string();
-            let text = text_edit(ui, id, &shown);
+            // 数字不必整行，拉太长反而让人以为要填一大串
+            let text = text_edit_sized(ui, id, &shown, width.min(200.0));
             if text == shown || text.is_empty() {
                 return None;
             }
@@ -2216,16 +2291,187 @@ fn field_edit(
             }
         }
         serde_yaml::Value::String(current) => {
-            let text = text_edit(ui, id, current);
+            // 文本占满整行：这类值最需要"看得全"
+            let text = text_edit_sized(ui, id, current, width.max(280.0));
             (text != *current).then(|| serde_yaml::Value::String(text))
         }
         _ => None,
     }
 }
 
+/// 列表配置项的编辑器：逐条「编辑 / 删除」，底部一个输入框「插入」。
+///
+/// 返回**整个数组**（写回走 `set_plugin_field` 的整段赋值，元素没有单独的路径）。
+/// 编辑态与输入框内容由调用方持有：它们要跨帧活着，而这里是纯布局函数。
+fn list_editor(
+    ui: &mut egui::Ui,
+    field: &admin::Field,
+    edit: &mut Option<ListEdit>,
+    inputs: &mut std::collections::BTreeMap<String, String>,
+) -> Option<serde_yaml::Value> {
+    let path = field.path.as_str();
+    let items: Vec<serde_yaml::Value> = field.value.as_sequence().cloned().unwrap_or_default();
+    // 这一帧要做的改动：Some(数组) = 用新数组覆盖整项
+    let mut change: Option<serde_yaml::Value> = None;
+
+    if items.is_empty() {
+        ui.weak("（还是空的，下面输入一条再点「插入」）");
+    }
+    for (index, item) in items.iter().enumerate() {
+        let editing = edit
+            .as_ref()
+            .is_some_and(|state| state.path == path && state.index == index);
+        if editing {
+            ui.horizontal(|ui| {
+                let mut draft = edit
+                    .as_ref()
+                    .map(|state| state.draft.clone())
+                    .unwrap_or_default();
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut draft)
+                        .hint_text("改完点「保存」，回车也行")
+                        .desired_width((ui.available_width() - 130.0).max(140.0)),
+                );
+                if let Some(state) = edit.as_mut() {
+                    state.draft = draft.clone();
+                }
+                let enter =
+                    response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                if ui.button("保存").clicked() || enter {
+                    let sample = items.first();
+                    let mut next = items.clone();
+                    next[index] = list_item_from_text(&draft, sample);
+                    change = serde_yaml::to_value(next).ok();
+                    *edit = None;
+                }
+                if ui.button("取消").clicked() {
+                    *edit = None;
+                }
+            });
+        } else {
+            ui.horizontal(|ui| {
+                // 序号让"第几条"有明确所指，尤其删到一半的时候
+                ui.weak(format!("{}.", index + 1));
+                let text = item_text(item);
+                // 整段文字本身可点：点一下就进编辑态。比只能点右边那个小按钮顺手，
+                // 也正好对上"列表项点开来编辑"的直觉；长值截断，悬停给全文。
+                let label = ui
+                    .add(
+                        egui::Label::new(&text)
+                            .sense(egui::Sense::click())
+                            .truncate(),
+                    )
+                    .on_hover_text(format!("{text}\n（点一下编辑这一条）"));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("删除").clicked() {
+                        let mut next = items.clone();
+                        next.remove(index);
+                        change = serde_yaml::to_value(next).ok();
+                    }
+                    if ui.button("编辑").clicked() || label.clicked() {
+                        *edit = Some(ListEdit {
+                            path: path.to_string(),
+                            index,
+                            draft: text.clone(),
+                        });
+                    }
+                });
+            });
+        }
+    }
+
+    // —— 新增一行 ——
+    ui.horizontal(|ui| {
+        let mut text = inputs.get(path).cloned().unwrap_or_default();
+        let response = ui.add(
+            egui::TextEdit::singleline(&mut text)
+                .hint_text("输入一条，点「插入」（回车也行）")
+                .desired_width((ui.available_width() - 80.0).max(140.0)),
+        );
+        let enter = response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+        inputs.insert(path.to_string(), text.clone());
+        if (ui.button("插入").clicked() || enter) && !text.trim().is_empty() {
+            let sample = items.first();
+            let mut next = items.clone();
+            next.push(list_item_from_text(&text, sample));
+            change = serde_yaml::to_value(next).ok();
+            inputs.insert(path.to_string(), String::new());
+        }
+    });
+
+    change
+}
+
+/// 列表元素显示成什么文字。
+///
+/// 不用 `Value` 的 `Display`：它给字符串加引号（`"123456"`），列表里看着像脏数据。
+fn item_text(value: &serde_yaml::Value) -> String {
+    match value {
+        serde_yaml::Value::String(text) if text.is_empty() => "（空字符串）".to_string(),
+        serde_yaml::Value::String(text) => text.clone(),
+        serde_yaml::Value::Null => "（空）".to_string(),
+        serde_yaml::Value::Bool(flag) => flag.to_string(),
+        serde_yaml::Value::Number(number) => number.to_string(),
+        // 走到这里说明数组里混进了表/数组——`plugin_fields` 已经挡掉了，留个兜底不至于空白
+        other => format!("{other:?}"),
+    }
+}
+
+/// 把输入框里的一行文本变成列表元素。
+///
+/// 类型**跟随已有元素**：数组里已经有数字就按数字解析，全是字符串就当字符串。
+/// 空数组没有样本，按"看起来像什么就存什么"：整数→数字、true/false→布尔、其余→字符串。
+/// 这条不是抠细节：群号列表要是被存成 `"123456"`，插件那边 `as_i64()` 直接读不到，
+/// 表现是"配了群号但机器人从不发"。
+fn list_item_from_text(text: &str, sample: Option<&serde_yaml::Value>) -> serde_yaml::Value {
+    let text = text.trim();
+    match sample {
+        Some(serde_yaml::Value::Bool(_)) => {
+            serde_yaml::Value::Bool(parse_bool(text).unwrap_or(false))
+        }
+        Some(serde_yaml::Value::Number(_)) => number_item(text),
+        Some(serde_yaml::Value::String(_)) => serde_yaml::Value::String(text.to_string()),
+        _ => {
+            if let Ok(number) = text.parse::<i64>() {
+                return serde_yaml::Value::from(number);
+            }
+            if let Some(flag) = parse_bool(text) {
+                return serde_yaml::Value::Bool(flag);
+            }
+            serde_yaml::Value::String(text.to_string())
+        }
+    }
+}
+
+/// 按"数字优先"解析一个列表元素：整数 → 小数 → 实在不是数字就退回字符串
+fn number_item(text: &str) -> serde_yaml::Value {
+    if let Ok(int) = text.parse::<i64>() {
+        return serde_yaml::Value::from(int);
+    }
+    if let Ok(float) = text.parse::<f64>() {
+        if float.is_finite() {
+            if let Ok(value) = serde_yaml::to_value(float) {
+                return value;
+            }
+        }
+    }
+    serde_yaml::Value::String(text.to_string())
+}
+
+/// 只认明确的布尔写法，别把随便一个词当 false
+fn parse_bool(text: &str) -> Option<bool> {
+    match text.to_ascii_lowercase().as_str() {
+        "true" | "yes" | "on" | "是" => Some(true),
+        "false" | "no" | "off" | "否" => Some(false),
+        _ => None,
+    }
+}
+
 /// 单行文本框：编辑期间用 `ui.memory` 里的临时值，避免"打了一半被判非法又跳回原值"。
 /// 与 [`int_edit`] 同一套路子——配置项被误改很难发现，所以不给拖拽。
-fn text_edit(ui: &mut egui::Ui, id: egui::Id, value: &str) -> String {
+///
+/// `width` 由调用方决定：插件配置页给整行宽，短字段（端口、超时）给一个窄的。
+fn text_edit_sized(ui: &mut egui::Ui, id: egui::Id, value: &str, width: f32) -> String {
     let text_id = id.with("text");
     let mut text = ui
         .memory(|memory| memory.data.get_temp::<String>(text_id))
@@ -2233,7 +2479,7 @@ fn text_edit(ui: &mut egui::Ui, id: egui::Id, value: &str) -> String {
     let response = ui.add(
         egui::TextEdit::singleline(&mut text)
             .id(text_id)
-            .desired_width(220.0),
+            .desired_width(width),
     );
     if !response.has_focus() && text != value {
         text = value.to_string();
@@ -4350,11 +4596,14 @@ mod tests {
         assert_eq!(swatch_color("#gggggg"), None);
     }
 
-    /// 「配置」那一块的版面在 420 宽里排得下：键路径、值、色板三列都不许被挤没
+    /// 「配置」那一块的版面：键名、说明、控件都要排得下，而且**控件要占满整行**——
+    /// 固定 220 点宽的时候，长一点的模板/前缀根本看不见写了什么，只能盲改。
     #[test]
-    fn a_config_row_stays_readable_at_a_narrow_width() {
+    fn a_config_row_fills_the_width_without_overflowing() {
         let ctx = egui::Context::default();
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(420.0, 300.0));
+        // 面板里给控件算出来的宽度（面板边距之后剩下的）
+        let mut measured = 0.0f32;
         let output = ctx.run(
             egui::RawInput {
                 screen_rect: Some(screen),
@@ -4362,28 +4611,18 @@ mod tests {
             },
             |context| {
                 egui::CentralPanel::default().show(context, |ui| {
-                    egui::Grid::new("probe")
-                        .num_columns(3)
-                        .spacing([10.0, 6.0])
-                        .show(ui, |ui| {
-                            ui.label("image.cardColor");
-                            let color = serde_yaml::Value::String("#B4FFFFFF".to_string());
-                            let _ = field_edit(ui, egui::Id::new("cardColor"), &color);
-                            let (rect, _) = ui
-                                .allocate_exact_size(egui::vec2(46.0, 16.0), egui::Sense::hover());
-                            if let Some(painted) = swatch_color("#B4FFFFFF") {
-                                ui.painter().rect_filled(rect, 3.0, painted);
-                            }
-                            ui.end_row();
-                            ui.label("image.drawEnable");
-                            let _ = field_edit(
-                                ui,
-                                egui::Id::new("drawEnable"),
-                                &serde_yaml::Value::Bool(true),
-                            );
-                            ui.label("");
-                            ui.end_row();
-                        });
+                    // 复刻 plugin_config_card 的一块：键名 -> 说明 -> 整宽控件
+                    ui.label(egui::RichText::new("image.cardColor").strong());
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new("卡片主色，形如 #AARRGGBB").size(11.5),
+                        )
+                        .wrap(),
+                    );
+                    let width = ui.available_width();
+                    measured = width;
+                    let value = serde_yaml::Value::String("#B4FFFFFF".to_string());
+                    let _ = field_editor(ui, egui::Id::new("cardColor"), &value, width);
                 });
             },
         );
@@ -4398,12 +4637,65 @@ mod tests {
         assert!(laid.contains("image.cardColor"), "键路径被挤掉了：{laid:?}");
         assert!(
             laid.contains("#B4FFFFFF"),
-            "颜色值那一格没显示出来：{laid:?}"
+            "长值必须整段可见（老的 220 宽会截在这里）：{laid:?}"
         );
-        assert!(
-            laid.contains("image.drawEnable"),
-            "第二行的键名没排上：{laid:?}"
+        assert!(laid.contains("卡片主色"), "说明文字没排上：{laid:?}");
+        // 420 宽的窗口减去面板边距，控件仍应拿到 300 以上；若还是 220 就说明没铺满
+        assert!(measured > 300.0, "控件宽度只有 {measured}，没占满整行");
+    }
+
+    /// 列表配置项真的把「编辑 / 删除 / 插入」三件套画出来了，值也在。
+    /// 这类只在版面里才看得见的东西，靠字符串拼法测不出来。
+    #[test]
+    fn list_editor_draws_items_and_the_three_controls() {
+        let laid = render_list_editor("[123456, 654321]");
+        assert!(laid.contains("123456"), "列表值没画出来：{laid:?}");
+        assert!(laid.contains("654321"), "{laid:?}");
+        assert!(laid.contains("编辑"), "缺「编辑」按钮：{laid:?}");
+        assert!(laid.contains("删除"), "缺「删除」按钮：{laid:?}");
+        assert!(laid.contains("插入"), "缺「插入」按钮：{laid:?}");
+    }
+
+    /// 空列表不是一片空白：要明确说"还是空的"，并保留插入入口
+    #[test]
+    fn empty_list_still_offers_the_insert_row() {
+        let laid = render_list_editor("[]");
+        assert!(laid.contains("还是空的"), "空列表缺提示：{laid:?}");
+        assert!(laid.contains("插入"), "空列表也得能插入：{laid:?}");
+    }
+
+    /// 跑一遍列表编辑器的布局，把排版里的文字拼起来
+    fn render_list_editor(yaml: &str) -> String {
+        let ctx = egui::Context::default();
+        let field = admin::Field {
+            path: "demo.groups".to_string(),
+            value: serde_yaml::from_str(yaml).expect("测试用的 YAML 应当合法"),
+            comment: "要主动问好的群".to_string(),
+        };
+        let mut edit: Option<ListEdit> = None;
+        let mut inputs = std::collections::BTreeMap::new();
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(700.0, 400.0),
+                )),
+                ..Default::default()
+            },
+            |context| {
+                egui::CentralPanel::default().show(context, |ui| {
+                    let _ = list_editor(ui, &field, &mut edit, &mut inputs);
+                });
+            },
         );
+        output
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::epaint::Shape::Text(shape) => Some(shape.galley.text().to_string()),
+                _ => None,
+            })
+            .collect()
     }
 
     /// 预览确实排得进那块 300 宽的左侧面板：多行 label 在 egui 里要自己折行，

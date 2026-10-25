@@ -168,8 +168,8 @@ Linux 版**只有命令行模式**（不含管理面板），启动后就是一�
 配置与数据布局与 Windows 完全一致。
 
 ```bash
-tar -xzf arona-rs-1.5.3-linux-x64-compat.tar.gz
-cd arona-rs-1.5.3-linux-x64-compat
+tar -xzf arona-rs-1.6.0-linux-x64-compat.tar.gz
+cd arona-rs-1.6.0-linux-x64-compat
 ./arona-rs                 # 前台运行，Ctrl+C 停止
 ```
 
@@ -386,10 +386,17 @@ Windows 上含 GUI 的产物使用 windows 子系统，GUI 模式不会多出控
   ② 「功能开关」—— 每个功能一行，主开关在这里，展开后是该插件出现的每个群单独「关不关这项」；
   ③ 「启用的群」—— 逐群勾选该插件在本群用不用，下面那个输入框可以**先填群号预添加**（机器人还没在那个群也可以填，等它被拉进去就按这里的设置响应；这条写的是 `groups`，所以同时对所有插件开放那个群）；
   ④ 「订阅条目」—— 这个插件在各群上报的条目，字由插件给，框架只搬运。
-  ⑤ 「配置」—— 该插件 `config/<插件>/arona.yml` 里的标量项直接改：布尔给勾选框、数字与字符串给文本框、
-  颜色串旁边再一块色板，改完写回原文件并热生效（注释仍由插件自己的模板生成）。框架仍然不认识任何键名，
-  只做三件事：给标量控件、跳过表/数组/多行字符串、**键名含 `cookie`/`token`/`secret`/`password`/`key`/`appid`/`ticket`
-  的那一个叶子不显示也不给控件**（凭据一上屏就会进截图与录屏）。要改的是结构仍然走插件自己的指令或手改 YAML。
+  ⑤ 「配置」—— 该插件 `config/<插件>/arona.yml` 里的项直接改，**每一项由三部分组成**：
+  键路径 + 插件自己写的说明（就是配置文件里那行注释，灰字显示在下面）+ 占满整行的控件。
+  布尔给勾选框（带「开 / 关」字样）、数字给窄框、字符串给整行宽输入框（长模板、路径才看得全），
+  颜色串旁边再挂一块色板。
+  **列表项逐条编辑**：每条显示序号与当前值，点文字或「编辑」就地改成输入框（回车或「保存」提交），
+  右侧「删除」移除该条；底部输入框填好点「插入」（回车也行）加到末尾。新元素类型跟随已有元素
+  （群号列表不会因为你手快写成字符串而失效），空列表则按「看起来像什么就存什么」推断。
+  改完立即写回原文件并热生效（注释仍由插件自己的模板生成）。框架仍然不认识任何键名，只做三件事：
+  给标量/标量列表控件、跳过表与「数组里套结构」与多行字符串、**键名含
+  `cookie`/`token`/`secret`/`password`/`key`/`appid`/`ticket` 的那一个叶子不显示也不给控件**
+  （凭据一上屏就会进截图与录屏）。要改的是结构仍然走插件自己的指令或手改 YAML。
 - 取消整体启用的勾选即停用：写进 `config/arona.yml` 的 `disabled_plugins`，热生效 —— 插件 `stop()`（定时任务一并取消）、不再装配、不接收任何消息与事件；配置和数据原样保留，重新勾选就恢复。
 - 功能开关有两级：`disabled_features`（全局，所有群加私聊都不响应）与 `group_settings.<群>.disabled_features`（只在那个群减）。
   全局是主开关，群名单不能把它关掉的 key 在某个群里翻案。
@@ -653,7 +660,7 @@ installer/               Windows 安装包：arona-rs.iss、intro.txt、defaults
 crate-type = ["cdylib", "rlib"]   # cdylib 出动态库；rlib 那份只给 cargo test 用
 
 [dependencies]
-arona = { package = "arona-rs", version = "1.5.3", default-features = false }
+arona = { package = "arona-rs", version = "1.6.0", default-features = false }
 # 同源联调改成 path：arona = { package = "arona-rs", path = "../Arona-rs/crates/arona", default-features = false }
 ```
 

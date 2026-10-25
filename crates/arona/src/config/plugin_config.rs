@@ -465,6 +465,110 @@ pub fn plugin_section_value(plugin: &str, key: &str) -> Option<Value> {
     store().value_of(plugin, key)
 }
 
+/// 插件配置文件里每个键的说明文字（`键路径 → 注释`），给 GUI 当配置项备注。
+///
+/// ## 为什么要回头去读文件
+///
+/// `serde_yaml` 不保留注释，而**这些注释是插件写给用户的唯一解释**：
+/// `greet_hour` 是几点？`outbound_prefix` 加了会怎样？`greet_groups` 留空代表什么？
+/// 全写在 `ConfigSection::render` 生成的注释行里。GUI 现在能把它们跟控件摆在一起，
+/// 用户就不用对着一串英文键名猜。
+///
+/// 走文件而不是扩展 `ConfigSection`：那个 trait 是插件实现的，加一个方法等于要求所有
+/// 插件重编（跨 dll 边界的契约变更）。注释本来就在磁盘上，读一遍比动契约便宜得多。
+///
+/// ## 认哪些写法
+///
+/// 只认框架自己生成的布局（也是手写 YAML 的常见写法）：
+/// - 注释行紧贴键的**上一行**，中间不能隔空行
+/// - 同一行末尾的 ` # …` 也算
+/// - 连续多行注释用换行拼起来；`# ==== 标题 ====` 这种分隔线只当段落边界，不进正文
+/// - 缩进决定层级，路径用 `.` 连接——与 [`crate::admin::plugin_fields`] 的 path 对齐
+pub fn plugin_comments(plugin: &str) -> BTreeMap<String, String> {
+    let path = config_file(plugin);
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return BTreeMap::new();
+    };
+    parse_comments(&text)
+}
+
+/// [`plugin_comments`] 的纯函数版本（单测直接喂文本）
+fn parse_comments(text: &str) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    // 当前嵌套路径：(这一层的缩进, 键名)
+    let mut stack: Vec<(usize, String)> = Vec::new();
+    // 紧贴下一行的注释（还没归属到任何键）
+    let mut pending: Option<String> = None;
+
+    for raw in text.lines() {
+        let line = raw.trim_end();
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() {
+            // 空行断开「紧贴」关系：隔一行的注释不该算到下一个键头上
+            pending = None;
+            continue;
+        }
+        if let Some(comment) = trimmed.strip_prefix('#') {
+            let body = comment.trim();
+            if body.is_empty() {
+                continue;
+            }
+            // 分隔线（`==== 标题 ====`）是段落边界：清掉攒了一半的注释，
+            // 否则文件头那一大段说明会粘到第一个区上
+            if is_separator(body) {
+                pending = None;
+                continue;
+            }
+            pending = Some(match pending.take() {
+                Some(prev) => format!("{prev}\n{body}"),
+                None => body.to_string(),
+            });
+            continue;
+        }
+        // 列表元素行（`- 123456`）不是键：既不入栈，也不消耗注释
+        if trimmed == "-" || trimmed.starts_with("- ") {
+            continue;
+        }
+        // 只认 `键:` / `键: 值`。框架生成的键名不带引号与冒号，这里不必处理转义
+        let Some((key, rest)) = trimmed.split_once(':') else {
+            continue;
+        };
+        let key = key.trim();
+        if key.is_empty() {
+            continue;
+        }
+        let indent = line.len() - trimmed.len();
+        // 退栈：同层或更深的兄弟已经结束
+        while stack.last().is_some_and(|(level, _)| *level >= indent) {
+            stack.pop();
+        }
+        let path = stack
+            .iter()
+            .map(|(_, name)| name.as_str())
+            .chain(std::iter::once(key))
+            .collect::<Vec<_>>()
+            .join(".");
+
+        // 上一行注释优先；没有就取行尾注释（手写配置里常见）
+        let inline = rest
+            .split_once(" #")
+            .map(|(_, tail)| tail.trim())
+            .filter(|tail| !tail.is_empty());
+        if let Some(comment) = pending.take().or_else(|| inline.map(str::to_string)) {
+            out.insert(path, comment);
+        }
+
+        stack.push((indent, key.to_string()));
+    }
+    out
+}
+
+/// 是不是 `==== 小标题 ====` / `----` 这种分隔线（只当段落边界，不算说明文字）
+fn is_separator(body: &str) -> bool {
+    let starts_ends = |ch: char| body.starts_with(ch) && body.ends_with(ch) && body.len() > 3;
+    starts_ends('=') || starts_ends('-') || starts_ends('#')
+}
+
 /// 重新读取全部插件配置文件（GUI「重载配置」用）
 pub fn reload_all() {
     store().reload_all();
@@ -774,5 +878,98 @@ mod tests {
         assert!(other.section_value("demo").is_none());
         assert!(other.sections_of(PLUGIN).is_none());
         assert!(other.loaded_plugins().is_empty());
+    }
+
+    /// 真实形态：分隔线、区块说明、逐项注释、空数组、嵌套子键
+    #[test]
+    fn comments_follow_the_generated_layout() {
+        let text = "\
+# ==================== 插件配置: HelloPlugin ====================
+# 插件开发示例：命令/事件/配置/定时任务各来一发
+# 插件 id: hello
+
+# ==================== 示例插件 ====================
+# HelloPlugin 的玩法参数。改完保存即热生效，不必重启机器人。
+hello:
+  # 每天几点向下面的群问好(0-23)
+  greet_hour: 9
+  # 要主动问好的群号，留空表示不主动发
+  greet_groups: []
+  # 给每条出站消息加的前缀，留空表示不加
+  outbound_prefix: ''
+  # 图片这一块
+  image:
+    # 最大边长
+    max_side: 1024
+";
+        let map = parse_comments(text);
+        assert_eq!(
+            map.get("hello").map(String::as_str),
+            Some("HelloPlugin 的玩法参数。改完保存即热生效，不必重启机器人。")
+        );
+        assert_eq!(
+            map.get("hello.greet_hour").map(String::as_str),
+            Some("每天几点向下面的群问好(0-23)")
+        );
+        assert_eq!(
+            map.get("hello.greet_groups").map(String::as_str),
+            Some("要主动问好的群号，留空表示不主动发")
+        );
+        assert_eq!(
+            map.get("hello.image.max_side").map(String::as_str),
+            Some("最大边长")
+        );
+        // 分隔线与文件头那几行不该粘到任何人身上
+        assert!(
+            !map.values().any(|comment| comment.contains("=====")),
+            "分隔线不该进说明文字：{map:?}"
+        );
+    }
+
+    /// 空行断开「紧贴」：隔了一行的注释属于下一段，不能算给下一个键
+    #[test]
+    fn blank_line_breaks_attachment() {
+        let map = parse_comments("# 跑题了\n\nkey: 1\n# 贴着的\nnext: 2\n");
+        assert!(!map.contains_key("key"), "隔空行的注释不该算到 key 上");
+        assert_eq!(map.get("next").map(String::as_str), Some("贴着的"));
+    }
+
+    /// 行尾注释也算；同一行同时有上方注释时以上方为准
+    #[test]
+    fn inline_comment_is_used_when_there_is_no_leading_one() {
+        let map = parse_comments("a: 1 # 行尾说明\n# 上方说明\nb: 2 # 被盖掉\n");
+        assert_eq!(map.get("a").map(String::as_str), Some("行尾说明"));
+        assert_eq!(map.get("b").map(String::as_str), Some("上方说明"));
+    }
+
+    /// 数组元素行（`- xxx`）不是键：既不能自己成为一项，也不能打乱后面的层级
+    #[test]
+    fn sequence_items_do_not_shift_the_paths() {
+        let text = "\
+section:
+  # 群号列表
+  groups:
+    - 123456
+    - 654321
+  # 前缀
+  prefix: 'x'
+";
+        let map = parse_comments(text);
+        assert_eq!(
+            map.get("section.groups").map(String::as_str),
+            Some("群号列表")
+        );
+        assert_eq!(map.get("section.prefix").map(String::as_str), Some("前缀"));
+        assert!(
+            !map.keys().any(|key| key.contains("123456")),
+            "列表元素不该成为配置项：{map:?}"
+        );
+    }
+
+    /// 缩进层级随意（2 空格 / 4 空格 / 用户手改过的）都要能对上
+    #[test]
+    fn indentation_width_does_not_matter() {
+        let map = parse_comments("a:\n    # 四空格\n    b: 1\n");
+        assert_eq!(map.get("a.b").map(String::as_str), Some("四空格"));
     }
 }
