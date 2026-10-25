@@ -541,9 +541,14 @@ pub fn write_snapshot(dir: &Path) -> std::io::Result<PathBuf> {
 pub struct Settings {
     /// 是否启用。默认**关**——生产用户不该被动多开一个端点
     pub enabled: bool,
-    /// 监听端口（固定绑 `127.0.0.1`，不开放改绑地址）
+    /// 监听端口（绑定地址由 [`Settings::lan`] 决定）
     pub port: u16,
-    /// 调试群号：`/debug/to-group` 把摘要发到这里；`0` 表示没配
+    /// 是否允许局域网访问：`true` 绑 `0.0.0.0`，`false` 只绑回环。
+    ///
+    /// 默认 `false`。远程 Agent 读状态需要它；绑非回环地址**必须**有令牌，
+    /// 所以 [`apply`] 会在令牌为空时先生成一个。
+    pub lan: bool,
+    /// 调试群号：`/debug/send-test` 把发送自检消息发到这里；`0` 表示没配
     pub group: i64,
     /// 访问令牌。首次启用时自动生成，GUI 里可以复制
     pub token: String,
@@ -553,9 +558,25 @@ impl Default for Settings {
     fn default() -> Self {
         Settings {
             enabled: false,
-            port: 8787,
+            port: DEFAULT_PORT,
+            lan: false,
             group: 0,
             token: String::new(),
+        }
+    }
+}
+
+impl Settings {
+    /// 该绑哪个地址。
+    ///
+    /// 这一条以前写死在 [`apply`] 里（永远是 `127.0.0.1`），于是 GUI 开的调试口
+    /// 在局域网里**永远连不进来**——远程 Agent 只能干看着。现在由 [`Settings::lan`]
+    /// 决定，默认仍是回环：不主动扩大暴露面，但至少给了条路。
+    pub fn bind(&self) -> String {
+        if self.lan {
+            format!("0.0.0.0:{}", self.port)
+        } else {
+            format!("127.0.0.1:{}", self.port)
         }
     }
 }
@@ -604,9 +625,10 @@ fn save_settings_to(path: &Path, settings: &Settings) -> Result<(), String> {
     }
     let text = format!(
         "# Arona 调试接口（GUI「关于」页也能改）。enabled 只影响这个只读端点，不影响机器人本身；\n\
-         # 端口固定绑 127.0.0.1；group 是发送自检的调试群号（0 表示不配）。\n\
-         enabled: {}\nport: {}\ngroup: {}\ntoken: \"{}\"\n",
-        settings.enabled, settings.port, settings.group, settings.token
+         # lan=true 时绑 0.0.0.0（局域网可访问，必须有 token），false 只绑 127.0.0.1；\n\
+         # group 是发送自检的调试群号（0 表示不配）。\n\
+         enabled: {}\nport: {}\nlan: {}\ngroup: {}\ntoken: \"{}\"\n",
+        settings.enabled, settings.port, settings.lan, settings.group, settings.token
     );
     std::fs::write(path, text).map_err(|err| format!("写 {} 失败: {err}", path.display()))
 }
@@ -666,7 +688,8 @@ pub async fn apply(settings: &Settings) -> Result<String, String> {
         return Ok("调试接口已关闭".to_string());
     }
     let config = ServeConfig {
-        bind: format!("127.0.0.1:{}", settings.port),
+        // 绑哪个地址由设置决定：默认回环，勾了「允许局域网访问」才开 0.0.0.0
+        bind: settings.bind(),
         token: Some(settings.token.clone()),
         log_tail: DEFAULT_LOG_TAIL,
         group: settings.group,
@@ -1195,11 +1218,27 @@ mod tests {
         let settings = Settings {
             enabled: true,
             port: 8899,
+            lan: true,
             group: 123456,
             token: "abcdef123456".to_string(),
         };
         save_settings_to(&path, &settings).expect("写设置失败");
         assert_eq!(load_settings_from(&path), settings);
+
+        // 监听地址跟着 lan 走：true 才是 0.0.0.0
+        assert_eq!(settings.bind(), "0.0.0.0:8899");
+        assert_eq!(
+            Settings {
+                lan: false,
+                ..settings.clone()
+            }
+            .bind(),
+            "127.0.0.1:8899"
+        );
+
+        // 老文件没有 lan 这一行：必须读成「只绑回环」，不能默认对外
+        std::fs::write(&path, "enabled: true\nport: 8899\ngroup: 0\ntoken: \"x\"\n").unwrap();
+        assert!(!load_settings_from(&path).lan, "旧配置不该被读成对外开放");
 
         // 文件不存在 → 默认（且默认必须是「关」）
         let missing = load_settings_from(&dir.join("nope.yml"));

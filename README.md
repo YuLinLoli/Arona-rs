@@ -164,8 +164,8 @@ Linux 版**只有命令行模式**（不含管理面板），启动后就是一�
 配置与数据布局与 Windows 完全一致。
 
 ```bash
-tar -xzf arona-rs-1.5.0-linux-x64-compat.tar.gz
-cd arona-rs-1.5.0-linux-x64-compat
+tar -xzf arona-rs-1.5.1-linux-x64-compat.tar.gz
+cd arona-rs-1.5.1-linux-x64-compat
 ./arona-rs                 # 前台运行，Ctrl+C 停止
 ```
 
@@ -649,7 +649,7 @@ installer/               Windows 安装包：arona-rs.iss、intro.txt、defaults
 crate-type = ["cdylib", "rlib"]   # cdylib 出动态库；rlib 那份只给 cargo test 用
 
 [dependencies]
-arona = { package = "arona-rs", version = "1.5.0", default-features = false }
+arona = { package = "arona-rs", version = "1.5.1", default-features = false }
 # 同源联调改成 path：arona = { package = "arona-rs", path = "../Arona-rs/crates/arona", default-features = false }
 ```
 
@@ -684,7 +684,8 @@ arona::export_arona_plugin!(MyPlugin);
 取成一份 JSON。两种开法，按场景挑：
 
 - **GUI**：「关于」页底部有一块「调试接口」——勾上开关、填端口与调试群，点「确认生效」
-  当场启停，不用重启。设置存在 `config/debug.yml`，下次启动沿用。
+  当场启停，不用重启。设置存在 `config/debug.yml`，下次启动沿用。**要让别的机器（远程 Agent）
+  读，再勾上「允许局域网访问」**，它会把监听从 `127.0.0.1` 换成 `0.0.0.0`。
 - **启动参数**（临时排障）：`--debug-api`（可配 `--debug-bind` / `--debug-token`）。
   参数优先于文件。
 
@@ -739,8 +740,10 @@ curl --noproxy '*' "http://127.0.0.1:8787/debug/snapshot?token=换成你自己�
   不加参数就是生产行为，开了才有端点。
 - **不写进 `arona.yml`**。那个结构体是插件会直接读的类型，加字段就得抬 `ABI_LAYOUT`。
   所以开关与端口单独存在 `config/debug.yml`（GUI 改的就是它），插件一个都不用重编。
-- **默认只绑回环、且要令牌**。GUI 会替你生成一串 64 位令牌；绑到非回环地址却没给
-  `--debug-token` 时**直接拒绝启动**——这份东西能读出全部插件状态与最近日志，不该裸奔在公网上。
+- **默认只绑回环、且要令牌**。GUI 会替你生成一串 64 位令牌；勾「允许局域网访问」（或命令行
+  给 `--debug-bind=0.0.0.0:8787`）才会对外监听，而绑非回环地址却没给 token 时**直接拒绝启动**
+  ——这份东西能读出全部插件状态与最近日志，不该裸奔在公网上。对局域网开放时记得同时开防火墙
+  （`netsh advfirewall firewall add rule name="AronaDebug" dir=in action=allow protocol=TCP localport=8787`）。
 - 端点只读：没有任何"改配置 / 停插件 / 触发任务"的入口。唯一的写动作是往调试群发那条自检消息。
 
 ## 疑难排查

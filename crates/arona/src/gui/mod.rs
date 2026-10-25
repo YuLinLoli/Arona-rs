@@ -601,6 +601,8 @@ struct AronaGui {
     debug_enabled: bool,
     debug_port: String,
     debug_group: String,
+    /// 允许局域网访问（绑 0.0.0.0）。默认关：远程 Agent 需要它，但不该替用户默认开
+    debug_lan: bool,
     /// 令牌明文：GUI 里是唯一能看到完整值的地方（用户要复制给 Agent）
     debug_token: String,
     // 关窗 / 托盘
@@ -688,6 +690,7 @@ impl AronaGui {
             log_max: 500,
             debug_enabled: debug_settings.enabled,
             debug_port: debug_settings.port.to_string(),
+            debug_lan: debug_settings.lan,
             debug_group: if debug_settings.group > 0 {
                 debug_settings.group.to_string()
             } else {
@@ -2664,12 +2667,24 @@ impl AronaGui {
             ui.horizontal(|ui| {
                 ui.checkbox(&mut self.debug_enabled, "启用调试接口");
                 ui.add_space(16.0);
+                ui.checkbox(&mut self.debug_lan, "允许局域网访问")
+                    .on_hover_text(
+                        "勾上后绑 0.0.0.0，同网段的其他机器（比如远程 Agent）才能连进来。\
+                         必须有令牌，且只建议在排障期间开。",
+                    );
+            });
+            ui.horizontal(|ui| {
                 ui.label("端口");
                 ui.add(
                     egui::TextEdit::singleline(&mut self.debug_port)
                         .desired_width(64.0)
                         .hint_text("8787"),
                 );
+                ui.weak(if self.debug_lan {
+                    "监听 0.0.0.0（局域网可访问）"
+                } else {
+                    "仅本机 127.0.0.1"
+                });
             });
             ui.horizontal(|ui| {
                 ui.label("调试群");
@@ -2763,6 +2778,7 @@ impl AronaGui {
         Ok(crate::debug::Settings {
             enabled: self.debug_enabled,
             port,
+            lan: self.debug_lan,
             group,
             token: self.debug_token.trim().to_string(),
         })
