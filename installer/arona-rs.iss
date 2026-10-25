@@ -175,14 +175,20 @@ Source: "{#AppSourceDir}\dxil.dll"; DestDir: "{app}"; Flags: ignoreversion resta
 Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExeName}"; WorkingDir: "{app}"; IconFilename: "{app}\{#AppExeName}"
 Name: "{autoprograms}\{#AppName} 运行目录"; Filename: "{app}"; IconFilename: "{app}\{#AppExeName}"
 Name: "{autoprograms}\{#AppName} 配置目录"; Filename: "{app}\config"; IconFilename: "{app}\{#AppExeName}"
-Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; WorkingDir: "{app}"; IconFilename: "{app}\{#AppExeName}"; Tasks: desktopicon
+; 桌面图标：勾了任务但图标已经存在时不再重建（Check: not DesktopIconExists），
+; 否则每次升级安装都会把用户挪过的位置重置回桌面第一个空位。
+Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; WorkingDir: "{app}"; IconFilename: "{app}\{#AppExeName}"; Tasks: desktopicon; Check: DesktopIconMissing
 
 [InstallDelete]
 ; 旧版本升级时清掉上一份带版本号的 exe，避免目录里堆积多个版本
 Type: files; Name: "{app}\arona-rs-*.exe"
 
 [Run]
-Filename: "{app}\{#AppExeName}"; Description: "{cm:LaunchProgram,{#AppName}}"; WorkingDir: "{app}"; Flags: nowait postinstall skipifsilent
+; runascurrentuser 不能省：安装程序本身是提权的，而 Inno 的默认行为（runasoriginaluser）
+; 会用**未提权的原用户**令牌去启动程序 —— 于是 Arona 一启动就发现自己是普通权限，
+; 立刻再请求一次 UAC。用户看到的就是「装完点运行，连着弹两次管理员确认」。
+; 用当前（已提权的）令牌启动，is_elevated() 直接为真，那一次弹窗就不会发生。
+Filename: "{app}\{#AppExeName}"; Description: "{cm:LaunchProgram,{#AppName}}"; WorkingDir: "{app}"; Flags: nowait postinstall skipifsilent runascurrentuser
 Filename: "{app}\config"; Description: "打开配置目录（onebot.yml / arona.yml 在这里）"; Flags: postinstall shellexec skipifsilent unchecked
 Filename: "{app}\安装说明.txt"; Description: "查看安装说明"; Flags: postinstall shellexec skipifsilent unchecked
 
@@ -194,6 +200,17 @@ var
   RecordedDir: String;
   // 安装前是否结束过正在运行的 Arona-rs（旧 exe / softgl 的 DLL 被占用时替换会失败）
   KilledRunningApp: Boolean;
+
+// 桌面快捷方式是否还不存在。
+//
+// 用来**不要重置用户摆好的位置**：Inno 的 [Icons] 条目每次安装都会重建快捷方式，
+// 重建后它回到默认位置（桌面第一个空位），用户手动挪到别处、分组、改名的图标会被打回原形。
+// 所以写成一个「缺了才建」的函数，[Icons] 里 `Check: DesktopIconMissing`。
+// 不写成 `Check: not DesktopIconExists`，是为了不依赖 Inno 对 Check 表达式的解析。
+function DesktopIconMissing: Boolean;
+begin
+  Result := not FileExists(ExpandConstant('{autodesktop}\{#AppName}.lnk'));
+end;
 
 // 命令行里是否出现某个参数（前缀匹配，大小写不敏感）：/UPDATE、/DIR=...、/SILENT ...
 function CmdLineParamExists(const Name: String): Boolean;

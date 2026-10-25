@@ -42,6 +42,10 @@ impl Tray {
             .ok()?;
         let tray = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
+            // 左键**不弹菜单**：只做「把面板叫回来」。tray-icon 默认是左键也弹菜单，
+            // 结果是点一下既弹菜单又要唤回窗口，两个动作抢焦点，用起来像卡了一下。
+            // 右键仍然弹菜单（打开面板 / 退出）。
+            .with_menu_on_left_click(false)
             .with_tooltip("Arona 管理面板（左键打开，右键菜单）")
             .with_icon(icon)
             .build()

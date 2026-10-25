@@ -155,6 +155,10 @@ HKEY_CURRENT_USER\Software\YuLinLoli\Arona-rs      # 选「为所有用户安装
 - 调试 / 自动化场景可以用环境变量跳过提权：`ARONA_NO_ELEVATE=1`。
 - 不想弹 UAC 又有管理员需求时，也可以手动右键 exe →「以管理员身份运行」；
   程序检测到自己已经提权后不会重复申请。
+- **一次启动只问一次**。拒绝过之后，面板换渲染后端/软件 OpenGL 兜底会重启自己，
+  那些重启出来的进程不会再弹（它们带着「已经问过」的标记）。
+- 安装包安装完勾选「运行 Arona-rs」也不会再弹一次：安装程序自己是提权的，
+  它用**当前令牌**（`runascurrentuser`）拉起主程序，而不是默认的「原用户」令牌。
 - **Linux 上这一段不适用**：没有 UAC，也就没有提权流程。要监听 1024 以下的端口就用
   root 或 `setcap`，其余场景普通用户直接跑即可。
 
@@ -164,8 +168,8 @@ Linux 版**只有命令行模式**（不含管理面板），启动后就是一�
 配置与数据布局与 Windows 完全一致。
 
 ```bash
-tar -xzf arona-rs-1.5.2-linux-x64-compat.tar.gz
-cd arona-rs-1.5.2-linux-x64-compat
+tar -xzf arona-rs-1.5.3-linux-x64-compat.tar.gz
+cd arona-rs-1.5.3-linux-x64-compat
 ./arona-rs                 # 前台运行，Ctrl+C 停止
 ```
 
@@ -649,7 +653,7 @@ installer/               Windows 安装包：arona-rs.iss、intro.txt、defaults
 crate-type = ["cdylib", "rlib"]   # cdylib 出动态库；rlib 那份只给 cargo test 用
 
 [dependencies]
-arona = { package = "arona-rs", version = "1.5.2", default-features = false }
+arona = { package = "arona-rs", version = "1.5.3", default-features = false }
 # 同源联调改成 path：arona = { package = "arona-rs", path = "../Arona-rs/crates/arona", default-features = false }
 ```
 

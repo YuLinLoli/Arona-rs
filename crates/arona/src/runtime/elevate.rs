@@ -19,6 +19,14 @@
 /// 提权重启时附加的标记，用来防止无限重启
 const ELEVATED_FLAG: &str = "--arona-elevated";
 
+/// 「已经问过一次了」的进程级标记（`1` 表示问过）。
+///
+/// 为什么需要它：用户拒绝 UAC 之后程序会以普通权限继续跑，而 GUI 的渲染看门狗、
+/// 软件 OpenGL 兜底都会**重启自己**。那些子进程继承环境变量，但拿不到"用户已经拒绝过"
+/// 这件事，于是每换一次渲染后端就再弹一次管理员确认——用户看到的就是"一直弹窗"。
+/// 提权成功那条路不用它（子进程带 [`ELEVATED_FLAG`]，本来就跳过）。
+const ASKED_ENV: &str = "ARONA_ELEVATE_ASKED";
+
 /// 是否已经以管理员身份运行
 #[cfg(windows)]
 pub fn is_elevated() -> bool {
@@ -40,6 +48,11 @@ pub fn request_admin(args: &[String]) -> bool {
     if env_flag("ARONA_NO_ELEVATE") {
         return false;
     }
+    // 本进程已经问过一次（用户拒绝过），或者这次启动是"被拒绝后重启出来的"：
+    // 都不要再弹。看门狗换后端会重启自己，不挡住就会一次启动问好几遍。
+    if env_flag(ASKED_ENV) {
+        return false;
+    }
     // 已经是被自己拉起来的提权实例：不能再提一次，否则会无限重启
     if args.iter().any(|arg| arg == ELEVATED_FLAG) {
         return false;
@@ -52,6 +65,8 @@ pub fn request_admin(args: &[String]) -> bool {
     match win::relaunch_elevated(args) {
         Ok(()) => true,
         Err(err) => {
+            // 拒绝提权也记一笔（环境变量会被之后重启的子进程继承），免得反复弹
+            mark_asked();
             crate::runtime::log::warning(format!(
                 "申请管理员权限失败({err})，将以普通权限继续运行；需要时请右键“以管理员身份运行”"
             ));
@@ -63,6 +78,14 @@ pub fn request_admin(args: &[String]) -> bool {
         let _ = args;
         false
     }
+}
+
+/// 记下「这次启动已经问过提权了」。
+///
+/// `set_var` 在 2024 edition 是 unsafe（可能与别的线程里的 `getenv` 抢），
+/// 这里只在启动早期、还没有工作线程读环境变量时调用，条件是安全的。
+fn mark_asked() {
+    unsafe { std::env::set_var(ASKED_ENV, "1") };
 }
 
 fn env_flag(name: &str) -> bool {
