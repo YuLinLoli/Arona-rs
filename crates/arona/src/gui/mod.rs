@@ -4182,7 +4182,7 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
     let _ = shutdown_tx.send(());
     runtime.shutdown_timeout(std::time::Duration::from_secs(5));
     // 「升级插件」挂的重启标记：正常收尾之后重新拉起自己，新进程加载的是已换好的 dll
-    if crate::runtime::relaunch::restart_requested() {
+    if crate::plugin::upgrade::restart_requested() {
         crate::runtime::log::info("插件已更新，正在重启框架");
         let _ = crate::runtime::relaunch::spawn_self(&args, &[], &[], &[], &[], &[]);
     }

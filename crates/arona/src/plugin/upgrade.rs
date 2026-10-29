@@ -13,8 +13,28 @@
 //! 流程对用户表现为"选个文件点一下，面板关掉几秒后自己回来，插件已换新"。
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::plugin::manager::PluginManager;
+
+/// 「收尾后重启」标记。
+///
+/// 升级只做「换文件」，真正拉起新进程得等 GUI 主循环正常收尾之后（机器人、连接、
+/// 调试口都先关干净，新进程才不会撞端口）。标记放在这里而不是 GUI 的重启模块：
+/// `runtime::relaunch` 只在带窗口的构建里编译，而升级功能本身（换文件、校验）
+/// 在无窗口的构建里也要能编——之前把标记挂在那边，Linux 的 `--no-default-features`
+/// 构建就直接编不过。
+static RESTART: AtomicBool = AtomicBool::new(false);
+
+/// 请求「收尾后重启」（升级插件用）
+pub fn request_restart() {
+    RESTART.store(true, Ordering::SeqCst);
+}
+
+/// 是否挂着重启请求（GUI 收尾时查这个）
+pub fn restart_requested() -> bool {
+    RESTART.load(Ordering::SeqCst)
+}
 
 /// 把 `new_dll` 替换成 `plugin_id` 的新版本，并请求重启框架。
 ///
@@ -75,7 +95,7 @@ pub fn upgrade_plugin(plugin_id: &str, new_dll: &Path) -> Result<(), String> {
         target.file_name().unwrap_or_default().to_string_lossy()
     ));
     // 挂重启标记：GUI 主循环收尾后据此拉起新进程
-    crate::runtime::relaunch::request_restart();
+    request_restart();
     Ok(())
 }
 

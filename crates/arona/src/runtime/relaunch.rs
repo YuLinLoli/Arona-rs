@@ -9,24 +9,6 @@
 //! 不会再次弹 UAC，也不用担心 `ShellExecuteW("runas")` 在某些环境下的怪行为。
 
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
-
-/// 「升级插件」挂的重启标记。
-///
-/// 升级只做「换文件」，真正拉起新进程得等 GUI 主循环正常收尾之后（机器人、连接、
-/// 调试口都先关干净，新进程才不会撞端口）。挂这个标记，[`crate::gui`] 的收尾代码
-/// 据此在 shutdown 之后 `spawn_self`。
-static RESTART: AtomicBool = AtomicBool::new(false);
-
-/// 请求「收尾后重启」（升级插件用）
-pub fn request_restart() {
-    RESTART.store(true, Ordering::SeqCst);
-}
-
-/// 是否挂着重启请求
-pub fn restart_requested() -> bool {
-    RESTART.load(Ordering::SeqCst)
-}
 
 /// 重新拉起自身（返回 Ok 表示新进程已启动，调用方应尽快结束自己）。
 ///

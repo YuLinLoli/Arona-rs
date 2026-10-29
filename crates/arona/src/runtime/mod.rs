@@ -9,6 +9,8 @@ pub mod chatlog;
 pub mod config;
 pub mod console;
 pub mod crash;
+/// 原生「打开文件」对话框：只有 GUI 的「升级插件」用它
+#[cfg(feature = "gui")]
 pub mod dialog;
 pub mod dispatcher;
 /// 管理员权限申请（Windows UAC 提权）
