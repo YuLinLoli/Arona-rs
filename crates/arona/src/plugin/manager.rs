@@ -18,6 +18,7 @@ use crate::plugin::description::PluginMeta;
 use crate::plugin::scope::PluginScope;
 use crate::runtime::log;
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::{Arc, OnceLock, RwLock, Weak};
 
 /// 插件在管理器里的状态（mirai 的 `PluginBase` 生命周期）
@@ -69,19 +70,26 @@ pub struct ManagedPlugin {
     meta: PluginMeta,
     loader: &'static str,
     instance: Arc<dyn AronaPlugin>,
+    /// 动态插件的 dll 路径（「升级插件」替换的目标）；内置插件为 `None`
+    library_path: Option<PathBuf>,
     state: RwLock<PluginState>,
     scope: Arc<PluginScope>,
     context: RwLock<Option<PluginContext>>,
 }
 
 impl ManagedPlugin {
-    fn new(loader: &'static str, instance: Arc<dyn AronaPlugin>) -> Arc<ManagedPlugin> {
+    fn new(
+        loader: &'static str,
+        instance: Arc<dyn AronaPlugin>,
+        library_path: Option<PathBuf>,
+    ) -> Arc<ManagedPlugin> {
         let meta = instance.meta();
         let scope = Arc::new(PluginScope::new(meta.id));
         Arc::new(ManagedPlugin {
             meta,
             loader,
             instance,
+            library_path,
             state: RwLock::new(PluginState::Loaded),
             scope,
             context: RwLock::new(None),
@@ -103,6 +111,11 @@ impl ManagedPlugin {
 
     pub fn loader(&self) -> &'static str {
         self.loader
+    }
+
+    /// 动态插件的 dll 路径（「升级插件」替换目标）；内置插件为 `None`
+    pub fn library_path(&self) -> Option<&std::path::Path> {
+        self.library_path.as_deref()
     }
 
     pub fn state(&self) -> PluginState {
@@ -167,8 +180,9 @@ impl ManagedPlugin {
 pub trait PluginLoader: Send + Sync {
     /// 装载器名（写进 plugins/<id>/plugin.yml 便于诊断）
     fn name(&self) -> &'static str;
-    /// 交出本装载器发现的全部插件实例
-    fn load(&self) -> Vec<Arc<dyn AronaPlugin>>;
+    /// 交出本装载器发现的全部插件实例与它们的来源文件。
+    /// 动态装载器给 dll 路径（「升级插件」靠它定位要替换的文件），静态装载器给 `None`。
+    fn load(&self) -> Vec<(Arc<dyn AronaPlugin>, Option<PathBuf>)>;
 }
 
 /// 编译进本程序的插件（静态注册）归在这个装载器名下
@@ -247,12 +261,22 @@ impl PluginManager {
 
     /// 登记一个插件实例（host 静态注册路径）
     pub fn register(&self, instance: Arc<dyn AronaPlugin>) -> bool {
-        self.register_from(BUILTIN_LOADER, instance)
+        self.register_from_path(BUILTIN_LOADER, instance, None)
     }
 
     /// 以指定装载器名义登记一个插件实例
     pub fn register_from(&self, loader: &'static str, instance: Arc<dyn AronaPlugin>) -> bool {
-        let managed = ManagedPlugin::new(loader, instance);
+        self.register_from_path(loader, instance, None)
+    }
+
+    /// 登记插件实例并记下它的来源文件（动态插件给 dll 路径）
+    pub fn register_from_path(
+        &self,
+        loader: &'static str,
+        instance: Arc<dyn AronaPlugin>,
+        library_path: Option<PathBuf>,
+    ) -> bool {
+        let managed = ManagedPlugin::new(loader, instance, library_path);
         let mut plugins = self.plugins.write().unwrap();
         if plugins.iter().any(|item| item.id() == managed.id()) {
             log::warning(format!(
@@ -269,8 +293,8 @@ impl PluginManager {
     pub fn load_registered_loaders(&self) -> usize {
         let mut added = 0;
         for loader in self.framework().loaders().drain() {
-            for instance in loader.load() {
-                if self.register_from(loader.name(), instance) {
+            for (instance, path) in loader.load() {
+                if self.register_from_path(loader.name(), instance, path) {
                     added += 1;
                 }
             }

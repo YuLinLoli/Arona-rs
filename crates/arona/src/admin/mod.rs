@@ -258,6 +258,8 @@ pub struct PluginInfo {
     pub config_file: PathBuf,
     /// 数据目录 data/<id>/
     pub data_dir: PathBuf,
+    /// 动态插件的 dll 路径（「升级插件」的替换目标）；内置插件为 `None`
+    pub library_path: Option<PathBuf>,
 }
 
 /// 已注册插件的概览列表
@@ -283,6 +285,9 @@ pub fn plugin_list() -> Vec<PluginInfo> {
                 plugin_dir: paths::plugin_dir(meta.id),
                 config_file: paths::plugin_config_file(meta.id),
                 data_dir: paths::plugin_data_dir(meta.id),
+                library_path: crate::plugin::manager::PluginManager::global()
+                    .find(meta.id)
+                    .and_then(|plugin| plugin.library_path().map(|path| path.to_path_buf())),
             }
         })
         .collect()

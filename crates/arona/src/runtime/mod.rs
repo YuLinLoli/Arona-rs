@@ -9,6 +9,7 @@ pub mod chatlog;
 pub mod config;
 pub mod console;
 pub mod crash;
+pub mod dialog;
 pub mod dispatcher;
 /// 管理员权限申请（Windows UAC 提权）
 pub mod elevate;

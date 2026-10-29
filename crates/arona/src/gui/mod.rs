@@ -908,6 +908,18 @@ impl AronaGui {
         });
     }
 
+    /// 「升级插件」按钮的落点：弹文件对话框 → 校验 + 换文件 → 请求重启。
+    /// 成功时框架几秒后自动重启，面板会自己回来；失败则留一条 toast 说清原因。
+    fn upgrade_plugin(&mut self, id: &str) {
+        match crate::runtime::dialog::pick_dll() {
+            Some(path) => match crate::plugin::upgrade::upgrade_plugin(id, &path) {
+                Ok(()) => self.note(Ok("插件已替换，正在重启框架…".to_string())),
+                Err(err) => self.note(Err::<String, String>(err)),
+            },
+            None => {} // 用户取消
+        }
+    }
+
     fn fetch_groups(&mut self, ctx: &egui::Context) {
         self.loading_groups = true;
         self.groups_error = None;
@@ -1510,6 +1522,7 @@ impl AronaGui {
         section_title(ui, &info.name);
         ui.add_space(6.0);
         let mut toggle: Option<bool> = None;
+        let mut upgrade_clicked = false;
         card_row(ui, dark, |ui| {
             ui.horizontal(|ui| {
                 let mut enabled = info.enabled;
@@ -1539,6 +1552,22 @@ impl AronaGui {
                     } else {
                         info.hooks.join(" / ")
                     });
+                    ui.end_row();
+                    ui.weak("插件文件");
+                    if let Some(path) = &info.library_path {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new(path.display().to_string())
+                                    .monospace()
+                                    .size(12.0),
+                            );
+                            if ui.button("升级插件").clicked() {
+                                upgrade_clicked = true;
+                            }
+                        });
+                    } else {
+                        ui.weak("（内置插件，不通过文件升级）");
+                    }
                     ui.end_row();
                     ui.weak("配置文件");
                     ui.horizontal(|ui| {
@@ -1570,6 +1599,9 @@ impl AronaGui {
             self.note(admin::set_plugin_enabled(&info.id, enabled));
             // 停用会 stop() 掉定时任务、启用会补 configure()+start()：重取列表才看得到
             self.plugins = admin::plugin_list();
+        }
+        if upgrade_clicked {
+            self.upgrade_plugin(&info.id);
         }
 
         // ---- 功能：主开关在插件这一页，逐群那一层只能继续往下关 ----
@@ -4149,6 +4181,11 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
     // 关闭窗口 = 关闭机器人
     let _ = shutdown_tx.send(());
     runtime.shutdown_timeout(std::time::Duration::from_secs(5));
+    // 「升级插件」挂的重启标记：正常收尾之后重新拉起自己，新进程加载的是已换好的 dll
+    if crate::runtime::relaunch::restart_requested() {
+        crate::runtime::log::info("插件已更新，正在重启框架");
+        let _ = crate::runtime::relaunch::spawn_self(&args, &[], &[], &[], &[], &[]);
+    }
     outcome
 }
 
@@ -4525,6 +4562,7 @@ mod tests {
                 plugin_dir: std::path::PathBuf::new(),
                 config_file: std::path::PathBuf::new(),
                 data_dir: std::path::PathBuf::new(),
+                library_path: None,
             }
         }
         let bili = info("动态推送", "bilibili");

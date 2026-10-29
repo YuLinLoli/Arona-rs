@@ -1,6 +1,6 @@
 [package]
 name = "arona-host"
-version = "1.6.0"
+version = "1.6.1"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -11,7 +11,7 @@ name = "arona-rs"
 path = "src/main.rs"
 
 [dependencies]
-arona = { package = "arona-rs", path = "../arona", version = "1.6.0", default-features = false }
+arona = { package = "arona-rs", path = "../arona", version = "1.6.1", default-features = false }
 # 这里不写任何功能插件依赖，也不加插件特性开关：
 # 插件是编译成 dll 的独立 crate，由框架在启动时扫描 plugins/ 目录装载，
 # 宿主装了什么只取决于用户的磁盘，不取决于这次构建。

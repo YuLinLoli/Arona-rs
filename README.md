@@ -168,8 +168,8 @@ Linux 版**只有命令行模式**（不含管理面板），启动后就是一�
 配置与数据布局与 Windows 完全一致。
 
 ```bash
-tar -xzf arona-rs-1.6.0-linux-x64-compat.tar.gz
-cd arona-rs-1.6.0-linux-x64-compat
+tar -xzf arona-rs-1.6.1-linux-x64-compat.tar.gz
+cd arona-rs-1.6.1-linux-x64-compat
 ./arona-rs                 # 前台运行，Ctrl+C 停止
 ```
 
@@ -382,7 +382,10 @@ Windows 上含 GUI 的产物使用 windows 子系统，GUI 模式不会多出控
 **插件管理**
 - 左栏：搜索插件名或 id，`●`/`○` 标记是否整体启用，「刷新」重取一份清单。列的是**本次启动装载成功**的插件：
   `plugins/` 里的 dll 过了工具链握手才会出现在这里，被拒载的那些只在日志里留原因，面板不给占位。
-- 右栏五块：① 名称 / 版本 / 整体启用勾选框、说明、插件 id、订阅的 OneBot 事件钩子、配置文件与数据目录（带「打开」按钮）；
+- 右栏五块：① 名称 / 版本 / 整体启用勾选框、说明、插件 id、订阅的 OneBot 事件钩子、配置文件与数据目录（带「打开」按钮），
+  以及**「插件文件」那行的「升级插件」按钮**——点它选一个本地 dll，框架先做工具链握手体检，
+  通过就把新文件换进 `plugins/` 原路径、正常收尾后**自动重启**，面板几秒后自己回来、插件已换新；
+  内置插件没有文件，这一行显示「不通过文件升级」。
   ② 「功能开关」—— 每个功能一行，主开关在这里，展开后是该插件出现的每个群单独「关不关这项」；
   ③ 「启用的群」—— 逐群勾选该插件在本群用不用，下面那个输入框可以**先填群号预添加**（机器人还没在那个群也可以填，等它被拉进去就按这里的设置响应；这条写的是 `groups`，所以同时对所有插件开放那个群）；
   ④ 「订阅条目」—— 这个插件在各群上报的条目，字由插件给，框架只搬运。
@@ -660,7 +663,7 @@ installer/               Windows 安装包：arona-rs.iss、intro.txt、defaults
 crate-type = ["cdylib", "rlib"]   # cdylib 出动态库；rlib 那份只给 cargo test 用
 
 [dependencies]
-arona = { package = "arona-rs", version = "1.6.0", default-features = false }
+arona = { package = "arona-rs", version = "1.6.1", default-features = false }
 # 同源联调改成 path：arona = { package = "arona-rs", path = "../Arona-rs/crates/arona", default-features = false }
 ```
 

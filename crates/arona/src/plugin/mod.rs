@@ -28,6 +28,7 @@ pub mod dynamic;
 pub mod health;
 pub mod manager;
 pub mod scope;
+pub mod upgrade;
 
 use crate::runtime::log;
 use std::future::Future;
@@ -171,6 +172,8 @@ pub fn state_of(id: &str) -> Option<PluginState> {
 /// 单个插件失败只记日志，不影响其余插件。
 pub fn install_all() -> Result<(), String> {
     ensure_dynamic_loader();
+    // 清掉上次「升级插件」留下的 .bak（那时旧进程还占着句柄删不掉，现在早退了）
+    dynamic::cleanup_stale(&crate::runtime::paths::plugins_dir());
     manager().load_registered_loaders();
     for (id, reason) in manager().install_all() {
         log::error(format!("插件 {id} 登记失败: {reason}"));

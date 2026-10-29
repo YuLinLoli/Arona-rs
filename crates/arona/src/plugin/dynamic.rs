@@ -84,6 +84,44 @@ fn is_plugin_library(path: &Path) -> bool {
             .is_some_and(|ext| ext.eq_ignore_ascii_case(library_extension()))
 }
 
+/// 试加载一个 dll、只跑握手、不取实例也不常驻——给「升级插件」在**替换前**做体检。
+///
+/// 价值在于别让用户重启后才发现换进去的是个坏文件：通过这一关，说明它是本框架能认的
+/// 插件、ABI 与工具链都对得上，替换后重启大概率一次成功。
+///
+/// # Safety
+/// `path` 必须指向可信的本地文件（见 [`instantiate`]）。
+pub unsafe fn validate(path: &Path) -> Result<(), String> {
+    let library =
+        unsafe { libloading::Library::new(path) }.map_err(|err| format!("无法加载模块: {err}"))?;
+    // 不 mem::forget：体检完就 FreeLibrary，这里没有取实例，卸载是安全的
+    unsafe { handshake(&library) }
+}
+
+/// 删掉「升级插件」留下的 `.bak` 残留。
+///
+/// 替换时旧 dll 被 rename 成 `xxx.dll.bak`（已加载的 dll 在 Windows 上不能删/覆盖，
+/// 但能改名），新文件写入原路径。旧进程退出后 `.bak` 的句柄才释放，所以清理只能在
+/// **下一次启动早期**做——那时旧进程早没了。
+pub fn cleanup_stale(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            cleanup_stale(&path);
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if name.ends_with(".bak") {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
 /// 扫描 `plugins/` 目录的装载器
 pub struct DynamicPluginLoader;
 
@@ -92,7 +130,7 @@ impl PluginLoader for DynamicPluginLoader {
         DYNAMIC_LOADER
     }
 
-    fn load(&self) -> Vec<Arc<dyn AronaPlugin>> {
+    fn load(&self) -> Vec<(Arc<dyn AronaPlugin>, Option<std::path::PathBuf>)> {
         let dir = paths::plugins_dir();
         let candidates = discover(&dir);
         if candidates.is_empty() {
@@ -113,7 +151,8 @@ impl PluginLoader for DynamicPluginLoader {
                         meta.version,
                         path.file_name().unwrap_or_default().to_string_lossy()
                     ));
-                    loaded.push(plugin);
+                    // 把 dll 路径一并交出去：「升级插件」要靠它定位要替换的文件
+                    loaded.push((plugin, Some(path)));
                 }
                 Err(reason) => log::error(format!(
                     "跳过插件 {} —— {reason}",
