@@ -932,6 +932,22 @@ impl AronaGui {
         }
     }
 
+    /// 「安装插件」：选一个**尚未安装**的 dll，落到 `plugins/<文件名去后缀>/`，
+    /// 重启后由目录扫描装载。成功后与升级同一套排期关窗重启。
+    fn install_plugin(&mut self) {
+        match crate::runtime::dialog::pick_dll() {
+            Some(path) => match crate::plugin::upgrade::install_plugin(&path) {
+                Ok(()) => {
+                    self.note(Ok("插件已安装，正在重启框架…".to_string()));
+                    self.restart_at =
+                        Some(std::time::Instant::now() + std::time::Duration::from_secs(2));
+                }
+                Err(err) => self.note(Err::<String, String>(err)),
+            },
+            None => {} // 用户取消
+        }
+    }
+
     fn fetch_groups(&mut self, ctx: &egui::Context) {
         self.loading_groups = true;
         self.groups_error = None;
@@ -1448,9 +1464,15 @@ impl AronaGui {
     fn plugin_list_panel(&mut self, ui: &mut egui::Ui) {
         section_title(ui, "插件列表");
         ui.add_space(8.0);
-        if ui.button("刷新").clicked() {
-            self.plugins = admin::plugin_list();
-        }
+        ui.horizontal(|ui| {
+            if ui.button("刷新").clicked() {
+                self.plugins = admin::plugin_list();
+            }
+            // 装一个还没登记的新插件：选 dll → ABI 体检 → plugins/<文件名>/ → 重启加载
+            if ui.button("安装插件").clicked() {
+                self.install_plugin();
+            }
+        });
         ui.add_space(2.0);
         ui.add(
             egui::TextEdit::singleline(&mut self.plugin_filter)

@@ -43,6 +43,11 @@ pub fn restart_requested() -> bool {
 /// 这一步只做「校验 + 换文件 + 挂重启标记」，不负责真正拉起新进程——
 /// 重启发生在 [`crate::gui`] 主循环正常收尾之后（见 `relaunch::request_restart`），
 /// 保证旧进程的机器人、连接、调试口都先关干净，新进程不会撞端口。
+///
+/// **文件名沿用新上传的**：用户手里的 dll 带版本号（`xxx-0.4.12.dll`），升级后
+/// 目录里就该叫这个名，而不是把新内容塞回旧名字——旧名混着旧版本号只会误导。
+/// 旧文件（仍被本进程加载着）rename 成 `.bak`，重启后由启动期的
+/// [`crate::plugin::dynamic::cleanup_stale`] 删掉。
 pub fn upgrade_plugin(plugin_id: &str, new_dll: &Path) -> Result<(), String> {
     let manager = PluginManager::global();
     let plugin = manager
@@ -76,7 +81,16 @@ pub fn upgrade_plugin(plugin_id: &str, new_dll: &Path) -> Result<(), String> {
         manager.disable(&plugin);
     }
 
-    // —— 换文件 ——
+    // —— 换文件：新文件用**它自己的名字**落进插件目录 ——
+    let plugin_dir = target
+        .parent()
+        .ok_or_else(|| format!("插件路径异常（没有父目录）：{}", target.display()))?
+        .to_path_buf();
+    let new_target = plugin_dir.join(
+        new_dll
+            .file_name()
+            .ok_or_else(|| format!("选中的文件名异常：{}", new_dll.display()))?,
+    );
     let bak = {
         let mut name = target.as_os_str().to_owned();
         name.push(".bak");
@@ -85,21 +99,67 @@ pub fn upgrade_plugin(plugin_id: &str, new_dll: &Path) -> Result<(), String> {
     // 上次升级的残留（那次进程早已退出，句柄已放，现在能删）
     let _ = std::fs::remove_file(&bak);
     std::fs::rename(&target, &bak).map_err(|err| format!("改名旧插件失败：{err}"))?;
-    if let Err(err) = std::fs::copy(new_dll, &target) {
-        // 拷失败了就把旧的改回来，别让插件消失
+    if let Err(err) = std::fs::copy(new_dll, &new_target) {
+        // 拷失败就把旧的改回来，别让插件消失（名字不同就删掉写了一半的新文件）
         let _ = std::fs::rename(&bak, &target);
+        if new_target != target {
+            let _ = std::fs::remove_file(&new_target);
+        }
         return Err(format!("写入新插件失败：{err}"));
     }
 
     // —— 清目录：留下这次升级选中的文件即可（用户明确要求）——
-    wipe_plugin_dir_except(&target, &crate::runtime::paths::plugins_dir());
+    wipe_plugin_dir_except(&new_target, &crate::runtime::paths::plugins_dir());
 
     crate::runtime::log::info_green(format!(
         "插件「{}」的新文件已就位（{}），正在重启框架",
         plugin.meta().name,
-        target.file_name().unwrap_or_default().to_string_lossy()
+        new_target.file_name().unwrap_or_default().to_string_lossy()
     ));
     // 挂重启标记：GUI 主循环收尾后据此拉起新进程
+    request_restart();
+    Ok(())
+}
+
+/// 安装一个**新**插件：校验 ABI → 落到 `plugins/<文件名去后缀>/` → 请求重启。
+///
+/// 与 [`upgrade_plugin`] 的差别：没有已登记的插件可查路径，目录名取 dll 文件名
+/// 去后缀（推荐布局：每个插件独占一个目录，资源文件放得下）；若是往一个曾有
+/// 插件的目录里重装，[`wipe_plugin_dir_except`] 会把旧的清干净。
+pub fn install_plugin(new_dll: &Path) -> Result<(), String> {
+    if !new_dll.is_file() {
+        return Err("选中的文件不存在".to_string());
+    }
+    let is_dll = new_dll
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("dll"));
+    if !is_dll {
+        return Err("只能选 .dll 文件".to_string());
+    }
+    // SAFETY: new_dll 是用户选出来的本地文件，与本插件同为宿主进程内的可信代码
+    unsafe { crate::plugin::dynamic::validate(new_dll) }
+        .map_err(|reason| format!("不是本框架能用的插件：{reason}"))?;
+
+    let file_name = new_dll
+        .file_name()
+        .ok_or_else(|| format!("选中的文件名异常：{}", new_dll.display()))?;
+    let stem = new_dll
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .ok_or_else(|| format!("选中的文件名异常：{}", new_dll.display()))?;
+    let dir = crate::runtime::paths::plugins_dir().join(stem);
+    std::fs::create_dir_all(&dir).map_err(|err| format!("建插件目录失败：{err}"))?;
+    let target = dir.join(file_name);
+    std::fs::copy(new_dll, &target).map_err(|err| format!("写入插件失败：{err}"))?;
+
+    // 重装进旧目录时把残留清干净；全新目录则只有这一个文件
+    wipe_plugin_dir_except(&target, &crate::runtime::paths::plugins_dir());
+
+    crate::runtime::log::info_green(format!(
+        "插件已安装（{}），正在重启框架",
+        target.file_name().unwrap_or_default().to_string_lossy()
+    ));
     request_restart();
     Ok(())
 }
