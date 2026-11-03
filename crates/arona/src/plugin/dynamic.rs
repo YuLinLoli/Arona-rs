@@ -101,25 +101,98 @@ pub unsafe fn validate(path: &Path) -> Result<(), String> {
 /// 删掉「升级插件」留下的 `.bak` 残留。
 ///
 /// 替换时旧 dll 被 rename 成 `xxx.dll.bak`（已加载的 dll 在 Windows 上不能删/覆盖，
-/// 但能改名），新文件写入原路径。旧进程退出后 `.bak` 的句柄才释放，所以清理只能在
-/// **下一次启动早期**做——那时旧进程早没了。
+/// 但能改名），新文件写入原路径。
+///
+/// **坑在升级重启的交接时序**：新进程跑到这里的几百毫秒里，旧进程可能还没退干净
+/// ——`.bak` 的句柄归旧进程所有（加载中的 dll），这一刻删它必失败。所以删失败的
+/// 不能就这么算了：交给一个后台线程盯一分钟，旧进程一退、句柄一放就补刀；
+/// 真删不掉（进程被强杀时另有占用、杀毒软件扫着）才留给下次启动。
 pub fn cleanup_stale(dir: &Path) {
+    let mut candidates = Vec::new();
+    collect_stale_bak(dir, &mut candidates);
+    if candidates.is_empty() {
+        return;
+    }
+    // 第一遍当场删：早就留下的 .bak 句柄早已释放，一删一个准。
+    // 会失败的只有一种——刚升级完、句柄还握在旧进程手里的新 .bak
+    let mut failed = Vec::new();
+    for path in candidates {
+        if let Err(err) = std::fs::remove_file(&path) {
+            failed.push((path, err.to_string()));
+        }
+    }
+    if failed.is_empty() {
+        return;
+    }
+    let spawned = std::thread::Builder::new()
+        .name("cleanup-stale".into())
+        .spawn(move || {
+            let leftover = delete_with_retry(failed, 30, std::time::Duration::from_secs(2));
+            if leftover.is_empty() {
+                crate::runtime::log::info("上次升级留下的 .bak 已清理完毕");
+            } else {
+                crate::runtime::log::warning(format!(
+                    "仍有 {} 个 .bak 清不掉（被别的进程占用？），留给下次启动：{}",
+                    leftover.len(),
+                    leftover
+                        .iter()
+                        .map(|(path, _)| path.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join("、")
+                ));
+            }
+        })
+        .is_ok();
+    if !spawned {
+        crate::runtime::log::warning("清理线程没能启动，.bak 留给下次启动");
+    }
+}
+
+/// 递归收集目录下的 `*.bak`
+fn collect_stale_bak(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            cleanup_stale(&path);
+            collect_stale_bak(&path, out);
             continue;
         }
-        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        if name.ends_with(".bak") {
-            let _ = std::fs::remove_file(&path);
+        let is_bak = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".bak"));
+        if is_bak {
+            out.push(path);
         }
     }
+}
+
+/// 逐个重试删除，删不掉的留在返回值里。`rounds` 轮、每轮间隔 `interval`。
+/// 拆成独立函数是为了能把轮数/间隔调小来测。
+fn delete_with_retry(
+    mut pending: Vec<(std::path::PathBuf, String)>,
+    rounds: u32,
+    interval: std::time::Duration,
+) -> Vec<(std::path::PathBuf, String)> {
+    for _ in 0..rounds {
+        std::thread::sleep(interval);
+        pending.retain_mut(|(path, last_err)| {
+            // 删成功就出列；删失败把最新一次的错误记下来，日志里说得出原因
+            match std::fs::remove_file(path) {
+                Ok(()) => false,
+                Err(err) => {
+                    *last_err = err.to_string();
+                    true
+                }
+            }
+        });
+        if pending.is_empty() {
+            return Vec::new();
+        }
+    }
+    pending
 }
 
 /// 扫描 `plugins/` 目录的装载器
@@ -359,5 +432,56 @@ mod tests {
             reason.contains("缺少导出符号") || reason.contains("无法加载模块"),
             "握手失败要写明原因: {reason}"
         );
+    }
+}
+
+#[cfg(test)]
+mod stale_cleanup_tests {
+    use super::*;
+
+    /// collect 递归收子目录里的 .bak；别的文件（哪怕是 .BAK 大写之外的东西）不收
+    #[test]
+    fn collect_walks_subdirs_for_bak_only() {
+        let root = std::env::temp_dir().join(format!("arona-collect-{}", std::process::id()));
+        let sub = root.join("bluearchive");
+        std::fs::create_dir_all(&sub).unwrap();
+        let bak = sub.join("plugin-0.4.12.dll.bak");
+        std::fs::write(&bak, b"x").unwrap();
+        std::fs::write(root.join("keep.dll"), b"x").unwrap();
+        std::fs::write(root.join("notes.txt"), b"x").unwrap();
+
+        let mut found = Vec::new();
+        collect_stale_bak(&root, &mut found);
+
+        assert_eq!(found, vec![bak.clone()], "{found:?}");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// 删得掉的当场出列；重试轮数耗尽后剩下的带着最后一次的错误信息返回
+    #[test]
+    fn retry_drains_deletable_files_and_keeps_failures() {
+        let root = std::env::temp_dir().join(format!("arona-retry-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let gone = root.join("gone.dll.bak");
+        std::fs::write(&gone, b"x").unwrap();
+        // 造一个删不掉的：把同名目录占住，remove_file 对目录必失败
+        let stuck_dir = root.join("stuck.dll.bak");
+        std::fs::create_dir_all(&stuck_dir).unwrap();
+
+        let failed = delete_with_retry(
+            vec![
+                (gone.clone(), String::new()),
+                (stuck_dir.clone(), String::new()),
+            ],
+            2,
+            std::time::Duration::from_millis(5),
+        );
+
+        assert_eq!(failed.len(), 1, "只剩删不掉的那个：{failed:?}");
+        assert_eq!(failed[0].0, stuck_dir, "留的是 stuck 那个");
+        assert!(!failed[0].1.is_empty(), "错误信息要有内容");
+        assert!(!gone.exists(), "能删的应该已经删了");
+        assert!(stuck_dir.is_dir(), "删不掉的原样保留");
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }
