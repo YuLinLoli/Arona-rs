@@ -7,8 +7,10 @@
 //! 1. 停用目标插件（收干净命令/订阅/任务）；
 //! 2. 把旧 dll `rename` 成 `.bak`（Windows 上已加载的 dll 不能删/覆盖，但**能改名**）；
 //! 3. 把新 dll 拷进原路径；
-//! 4. 请求重启：框架正常收尾退出，然后自己拉起一个新进程（`relaunch::spawn_self`），
-//!    新进程启动时加载的已经是新文件，顺手清掉 `.bak`。
+//! 4. **清目录**：插件所在文件夹里除新 dll 外全删（老版本拷贝、.bak、旧资源——手动
+//!    上传的插件，目录里常攒多份老版本，`discover()` 同 id 撞车后谁生效全凭运气）；
+//! 5. 请求重启：框架正常收尾退出，然后自己拉起一个新进程（`relaunch::spawn_self`），
+//!    新进程启动时加载的已经是新文件，`.bak` 若因句柄没放清不掉，启动早期再补一刀。
 //!
 //! 流程对用户表现为"选个文件点一下，面板关掉几秒后自己回来，插件已换新"。
 
@@ -89,6 +91,9 @@ pub fn upgrade_plugin(plugin_id: &str, new_dll: &Path) -> Result<(), String> {
         return Err(format!("写入新插件失败：{err}"));
     }
 
+    // —— 清目录：留下这次升级选中的文件即可（用户明确要求）——
+    wipe_plugin_dir_except(&target, &crate::runtime::paths::plugins_dir());
+
     crate::runtime::log::info_green(format!(
         "插件「{}」的新文件已就位（{}），正在重启框架",
         plugin.meta().name,
@@ -99,8 +104,102 @@ pub fn upgrade_plugin(plugin_id: &str, new_dll: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// 换完文件后清空插件所在目录、只留刚选中的这份。
+///
+/// 手动上传的插件，目录里常攒着多份老版本（`-0.1.6.dll`、`-0.1.7.dll`、`.bak`…），
+/// [`crate::plugin::dynamic::discover`] 会挨个加载，同 id 撞车后谁生效全凭排序运气。
+/// 升级正是清理的时机：反正是手动上传的，除了刚选中的这份**全删**（用户原话），
+/// 新文件要不要、是不是更新，[`crate::plugin::dynamic::validate`] 的 ABI 体检已经把关。
+///
+/// 范围分两种：
+/// - dll 在 `plugins/<子目录>/` 里 → 清整个子目录（插件带的资源文件也一起走，用户认可）；
+/// - dll 直接躺在 `plugins/` 根上 → 不能殃及邻居插件，只删**自己的** `.bak`，
+///   其余交给启动时的 [`crate::plugin::dynamic::cleanup_stale`]。
+///
+/// 已加载的旧 dll（刚 rename 成的 `.bak`）句柄还开着，Windows 上可能删不掉——
+/// 删不掉不报错，留给下次启动的 `cleanup_stale` 兜底。
+fn wipe_plugin_dir_except(keep: &Path, plugins_root: &Path) {
+    let Some(dir) = keep.parent() else {
+        return;
+    };
+    // 直接躺在 plugins/ 根上的插件：范围收到「自己的 .bak」，别的全是邻居的
+    let flat = dir == plugins_root;
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path == *keep {
+            continue;
+        }
+        if flat && path.extension().and_then(|ext| ext.to_str()) != Some("bak") {
+            continue;
+        }
+        let result = if path.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        if let Err(err) = result {
+            crate::runtime::log::info(format!(
+                "清理旧文件失败（留给下次启动清理）：{} —— {err}",
+                path.display()
+            ));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// 子目录布局：`plugins/<id>/` 里的老版本、.bak、资源文件全清，只留新 dll。
+    #[test]
+    fn subdir_wipe_keeps_only_the_chosen_file() {
+        let root = std::env::temp_dir().join(format!("arona-wipe-sub-{}", std::process::id()));
+        let dir = root.join("myplugin");
+        std::fs::create_dir_all(&dir).unwrap();
+        let keep = dir.join("myplugin.dll");
+        std::fs::write(&keep, b"new").unwrap();
+        std::fs::write(dir.join("myplugin-0.1.6.dll"), b"old").unwrap();
+        std::fs::write(dir.join("myplugin.dll.bak"), b"old").unwrap();
+        std::fs::write(dir.join("banner.png"), b"res").unwrap();
+        std::fs::create_dir_all(dir.join("lang")).unwrap();
+
+        wipe_plugin_dir_except(&keep, &root);
+
+        let left: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            left,
+            vec!["myplugin.dll".to_string()],
+            "只该留新 dll：{left:?}"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// 根目录布局：只删自己的 .bak，邻居插件与子目录一个字节都不能碰。
+    #[test]
+    fn flat_wipe_only_takes_the_bak() {
+        let root = std::env::temp_dir().join(format!("arona-wipe-flat-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let keep = root.join("myplugin.dll");
+        std::fs::write(&keep, b"new").unwrap();
+        std::fs::write(root.join("myplugin.dll.bak"), b"old").unwrap();
+        std::fs::write(root.join("neighbor.dll"), b"other").unwrap();
+        std::fs::create_dir_all(root.join("otherplugin")).unwrap();
+
+        wipe_plugin_dir_except(&keep, &root);
+
+        assert!(keep.is_file());
+        assert!(!root.join("myplugin.dll.bak").exists(), ".bak 应被删");
+        assert!(root.join("neighbor.dll").is_file(), "邻居插件不能动");
+        assert!(root.join("otherplugin").is_dir(), "邻居子目录不能动");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     /// `.bak` 的命名必须稳定：`foo.dll` -> `foo.dll.bak`。
     /// 这个约定被 cleanup_stale 与 upgrade 两处依赖，改一边另一边就对不上。
     #[test]
