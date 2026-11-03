@@ -637,6 +637,9 @@ struct AronaGui {
     confirm_remember: bool,
     /// 已经决定退出：从这一帧起不再拦截关闭请求
     quitting: bool,
+    /// 「升级插件」成功后的定时关窗：到点走 [`AronaGui::quit_app`] 放行关闭，
+    /// `gui::run` 收尾才会看到重启标记并拉起新进程。None = 没有排期中的重启。
+    restart_at: Option<std::time::Instant>,
     /// 窗口是否收在托盘里（决定要不要释放界面缓存）
     hidden: bool,
     /// 托盘图标；建不起来就是 `None`，面板照常可用
@@ -726,6 +729,7 @@ impl AronaGui {
             confirm_close: false,
             confirm_remember: false,
             quitting: false,
+            restart_at: None,
             hidden: false,
             tray,
         }
@@ -909,11 +913,19 @@ impl AronaGui {
     }
 
     /// 「升级插件」按钮的落点：弹文件对话框 → 校验 + 换文件 → 请求重启。
-    /// 成功时框架几秒后自动重启，面板会自己回来；失败则留一条 toast 说清原因。
+    /// 成功时**排一个 2 秒后的自动关窗**（toast 来得及被看到），关窗放行后
+    /// `gui::run` 的收尾代码据此拉起新进程；失败则留一条 toast 说清原因。
+    ///
+    /// 这里曾有一版只弹 toast 不关窗——而本应用是「点 × 收进托盘」的设计，
+    /// 主循环永远不退出，重启标记就永远没人消费，表现为"升级后永远不重启"。
     fn upgrade_plugin(&mut self, id: &str) {
         match crate::runtime::dialog::pick_dll() {
             Some(path) => match crate::plugin::upgrade::upgrade_plugin(id, &path) {
-                Ok(()) => self.note(Ok("插件已替换，正在重启框架…".to_string())),
+                Ok(()) => {
+                    self.note(Ok("插件已替换，正在重启框架…".to_string()));
+                    self.restart_at =
+                        Some(std::time::Instant::now() + std::time::Duration::from_secs(2));
+                }
                 Err(err) => self.note(Err::<String, String>(err)),
             },
             None => {} // 用户取消
@@ -2543,6 +2555,15 @@ impl eframe::App for AronaGui {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // 关窗请求优先处理：egui 只在那一帧置位，晚一步 `CancelClose` 就变成"点了没反应"
         self.handle_close(ctx);
+        // 「升级插件」排期中的自动重启：到点就走正常退出链，`gui::run` 收尾时拉起新进程
+        if let Some(at) = self.restart_at {
+            if std::time::Instant::now() >= at {
+                self.restart_at = None;
+                self.quit_app(ctx);
+            } else {
+                ctx.request_repaint_after(at - std::time::Instant::now());
+            }
+        }
         // 外观：只在偏好变化时下发，避免每帧改 options 触发额外重绘
         if self.theme_applied != Some(self.theme) {
             self.theme_applied = Some(self.theme);
@@ -4184,7 +4205,10 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
     // 「升级插件」挂的重启标记：正常收尾之后重新拉起自己，新进程加载的是已换好的 dll
     if crate::plugin::upgrade::restart_requested() {
         crate::runtime::log::info("插件已更新，正在重启框架");
-        let _ = crate::runtime::relaunch::spawn_self(&args, &[], &[], &[], &[], &[]);
+        // 失败绝不能吞：用户面前是"关掉就没回来"，日志里必须留一句为什么
+        if let Err(err) = crate::runtime::relaunch::spawn_self(&args, &[], &[], &[], &[], &[]) {
+            crate::runtime::log::error(format!("自动重启失败，请手动启动框架：{err}"));
+        }
     }
     outcome
 }
