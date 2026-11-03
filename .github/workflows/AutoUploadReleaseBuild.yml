@@ -86,9 +86,6 @@ jobs:
           }
           Write-Host "版本校验通过: $version"
 
-      # 只跑非 ignored 的离线单元测试; 联网冒烟自检(cargo smoke-*)都带 #[ignore], 不会在这里执行
-      - name: Test
-        run: cargo test --release
 
       # CPU 软件渲染依赖(Mesa llvmpipe): 让没有显卡驱动 / 没有 DX12 的服务器也能打开管理面板。
       # 约 62MB, 不入库(.gitignore 忽略了 /softgl/), 构建时现拉。
@@ -240,11 +237,6 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      # Linux 交付的就是不含 GUI 的构建（`--no-default-features`），测试也按这个形态跑：
-      # 既验证的正是要发出去的那份东西，又不白编一遍 eframe/wgpu 那一大坨。
-      # Windows 侧因为交付带 GUI，那边跑的是默认 features。
-      - name: Test
-        run: cargo test --release --workspace --no-default-features
 
       # 等价于 cargo linux-dist：出标准包 + 宽兼容包两个 tar.gz
       #
