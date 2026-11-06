@@ -100,5 +100,5 @@ FSF 可能发布新版 AGPL；除非作品声明"或任何更新版本"，否则
 
 - 仓库：<https://github.com/YuLinLoli/Arona-rs>
 - 依据 AGPLv3 第 13 节，通过网络与本机器人交互的用户可从上方的仓库地址获取完整对应源码。
-- 上游原版：<https://github.com/diyigemt/arona>（Copyright (C) 2020-2021 StageGuard / diyigemt）
-- 本移植版：Copyright (C) 2026 YuLinLoli
+- 本框架：Copyright (C) 2026 YuLinLoli（独立开发，非 diyigemt/arona 的移植版；插件结构参考并致谢 Mirai）
+- arona 玩法的移植在本框架的功能插件 BlueArchivePlugin 中：上游 <https://github.com/diyigemt/arona>（Copyright (C) 2020-2021 StageGuard / diyigemt），其版权与 AGPLv3 声明随该插件仓库

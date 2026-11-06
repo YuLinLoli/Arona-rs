@@ -6,7 +6,7 @@
 - 本项目仓库：<https://github.com/YuLinLoli/Arona-rs>
 - 上游原版（Kotlin + Mirai 插件）：<https://github.com/diyigemt/arona>
 - 插件开发文档：[PLUGIN_DEVELOPMENT.md](PLUGIN_DEVELOPMENT.md)，最小可编译样例：[`plugins/hello/`](plugins/hello)
-- 许可证：GNU AGPLv3（见文末「移植声明与许可」）
+- 许可证：GNU AGPLv3（见文末「声明与许可」）
 
 ### 平台
 
@@ -779,13 +779,14 @@ curl --noproxy '*' "http://127.0.0.1:8787/debug/snapshot?token=换成你自己�
   （一条都没有就是根本没装进来；「跳过插件 …」会点名工具链差在哪一项），再到「群管理」页看
   该群/该功能/该插件有没有被关掉，最后看日志里有没有「功能已关闭」或 panic 隔离的记录。
 
-## 移植声明与许可
+## 声明与许可
 
-本项目是 [diyigemt/arona](https://github.com/diyigemt/arona) 的 Rust 移植版：命令行为、配置项、文案与数据结构均移植自该项目的 AGPLv3 源码，取的是它 `standalone` 模块（不依赖 Mirai 的那一条实现路径）里的行为，只移植 OneBot 11 一侧、移除全部 Mirai 相关实现。
+本框架**不是** [diyigemt/arona](https://github.com/diyigemt/arona) 的移植版，只是沿用了这个名字。框架本体（OneBot 11 对接、插件系统、管理面板等）是独立开发的 Rust 实现；插件装载、`plugins/` 目录这些结构参考了 [Mirai](https://github.com/mamoe/mirai) 的设计，在此致谢。
 
-- 上游版权：Copyright (C) 2020-2021 StageGuard / diyigemt，以 GNU AGPLv3 授权
-- 本移植版版权：Copyright (C) 2026 YuLinLoli
+arona 的玩法移植另有其处：**[BlueArchivePlugin](https://github.com/YuLinLoli/BlueArchiveAronaPlugin)**——命令行为、配置项、文案与数据结构均移植自 diyigemt/arona 的 AGPLv3 源码（取它 `standalone` 模块不依赖 Mirai 的那条路径，只保留 OneBot 11 一侧），以 GNU AGPLv3 授权，上游版权：Copyright (C) 2020-2021 StageGuard / diyigemt。
+
+- 本框架版权：Copyright (C) 2026 YuLinLoli
 
 依据 GNU AGPLv3 第 13 条，通过网络与本机器人交互的用户有权获取其对应源码，获取地址即本仓库：<https://github.com/YuLinLoli/Arona-rs>
 
-本项目同样以 **GNU Affero General Public License v3.0** 授权发布，全文见 [LICENSE](LICENSE)；中文说明（非官方译本，仅供参考，以英文原文为准）见 [LICENSE.zh-CN.md](LICENSE.zh-CN.md)。你可以自由使用、修改、分发，但分发衍生作品或将其作为网络服务提供时，必须保留同样的许可与版权声明，并向使用者提供完整对应源码。
+本项目以 **GNU Affero General Public License v3.0** 授权发布，全文见 [LICENSE](LICENSE)；中文说明（非官方译本，仅供参考，以英文原文为准）见 [LICENSE.zh-CN.md](LICENSE.zh-CN.md)。你可以自由使用、修改、分发，但分发衍生作品或将其作为网络服务提供时，必须保留同样的许可与版权声明，并向使用者提供完整对应源码。
